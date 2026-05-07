@@ -20,12 +20,15 @@
 ### Non-goals
 
 - Multi-region / global distribution.
+- Presence (members on a channel, presence enter/update/leave, presence
+  sync, presence history) — out of scope for this design; will be
+  considered separately.
 - Ably-cloud-only product surface: integrations / rules, push notifications,
   Spaces, Chat, LiveObjects/LiveSync, message queues, account/app management
   APIs, statistics endpoints, the `/keys` admin API.
 - Hard durability or HA guarantees beyond what the chosen database provides.
 - Backwards compatibility with arbitrary historical Ably protocol versions —
-  we target one current version.
+  we target v2 and later.
 
 ## 2. External surface
 
@@ -61,10 +64,7 @@ Supported `Action` values:
 | `ATTACHED` (11) | | ✓ | attach ack (see §4) |
 | `DETACH` (12) | ✓ | | client requests channel detach |
 | `DETACHED` (13) | | ✓ | detach ack |
-| `PRESENCE` (14) | ✓ | ✓ | inbound: enter/update/leave; outbound: broadcast to subscribers |
 | `MESSAGE` (15) | ✓ | ✓ | publish + delivery |
-| `SYNC` (16) | | ✓ | presence sync on attach |
-| `AUTH` (17) | ✓ | | re-auth with new token |
 
 ### 2.2 REST
 
@@ -76,8 +76,6 @@ All REST endpoints live under the root and accept either `application/json` or
 |---|---|---|
 | POST | `/channels/{channel}/messages` | publish 1..N messages |
 | GET | `/channels/{channel}/messages` | history (paginated) |
-| GET | `/channels/{channel}/presence` | current presence members |
-| GET | `/channels/{channel}/presence/history` | presence history (paginated) |
 | GET | `/time` | server time (ms since epoch) |
 | GET | `/healthz` | liveness — no auth |
 | GET | `/readyz` | readiness — DB ping in `cluster` mode |
@@ -122,8 +120,7 @@ JWT claims:
   channel name. Character classes (`[a-z]`) and `**` are not supported.
   The `[queue]*` / `[meta]*` resource prefixes do not apply since neither
   queues nor metachannels are in scope.
-- `<op>` is one of `publish`, `subscribe`, `presence`, `history`. `*`
-  matches any op.
+- `<op>` is one of `publish`, `subscribe`, `history`. `*` matches any op.
 
 Every authenticated request resolves to a **capability set**. For each
 operation the server computes the union of granted ops across all matching
@@ -134,14 +131,9 @@ operation is rejected:
 |---|---|
 | WS `ATTACH` flag `SUBSCRIBE` | `subscribe` |
 | WS `ATTACH` flag `PUBLISH` | `publish` |
-| WS `ATTACH` flag `PRESENCE` | `presence` |
-| WS `ATTACH` flag `PRESENCE_SUBSCRIBE` | `subscribe` |
 | WS inbound `MESSAGE` | `publish` (and the attachment must hold the `PUBLISH` mode flag, granted at attach time) |
-| WS inbound `PRESENCE` | `presence` (likewise `PRESENCE` mode flag) |
 | REST `POST .../messages` | `publish` |
 | REST `GET .../messages` | `history` |
-| REST `GET .../presence` | `presence` |
-| REST `GET .../presence/history` | `history` |
 
 `ATTACH` mode resolution: the effective mode set delivered in `ATTACHED.flags`
 is `requested ∩ capability-permitted`. Empty intersection → `ERROR` with
@@ -150,10 +142,9 @@ is `requested ∩ capability-permitted`. Empty intersection → `ERROR` with
 ### 3.2 Client ID
 
 The connection's `clientId` is stamped by the server onto every outbound
-`Message.clientId` and `PresenceMessage.clientId` published by that
-connection. The client cannot override it: inbound `Message` /
-`PresenceMessage` frames whose `clientId` is set to anything other than the
-connection's resolved value are rejected with `NACK`.
+`Message.clientId` published by that connection. The client cannot
+override it: inbound `Message` frames whose `clientId` is set to anything
+other than the connection's resolved value are rejected with `NACK`.
 
 Resolution depends on the credential and the `clientId` query parameter on
 the upgrade (WS) or request (REST):
@@ -213,18 +204,15 @@ any replay or live messages follow it. Its fields:
 
 ### 4.2 Modes
 
-The `ATTACH.flags` bitfield selects the subset of `SUBSCRIBE`, `PUBLISH`,
-`PRESENCE`, `PRESENCE_SUBSCRIBE` the client wants on this attachment. If
-`flags` is absent or zero the server treats it as the full set (matches SDK
-default).
+The `ATTACH.flags` bitfield selects the subset of `SUBSCRIBE`, `PUBLISH`
+the client wants on this attachment. If `flags` is absent or zero the
+server treats it as the full set (matches SDK default).
 
 The effective mode set is `requested ∩ capability-permitted`, where the
 permitted set is derived from the per-op capability mapping in §3:
 
 - `SUBSCRIBE` permitted iff cap grants `subscribe` on the channel.
 - `PUBLISH` permitted iff cap grants `publish`.
-- `PRESENCE` permitted iff cap grants `presence`.
-- `PRESENCE_SUBSCRIBE` permitted iff cap grants `subscribe`.
 
 Empty intersection → the attach is rejected with `ERROR` (`code: 40160`)
 and no channel state is created. Otherwise `ATTACHED.flags` carries the
@@ -233,12 +221,8 @@ effective set.
 Once attached, modes gate frame flow:
 
 - An attachment without `SUBSCRIBE` does not receive `MESSAGE` frames.
-- An attachment without `PRESENCE_SUBSCRIBE` does not receive `PRESENCE` /
-  `SYNC` frames.
 - Inbound `MESSAGE` from an attachment without `PUBLISH` is rejected with
   `NACK`.
-- Inbound `PRESENCE` from an attachment without `PRESENCE` is rejected
-  with `NACK`.
 
 ### 4.3 Replay (`channelSerial` and `rewind`)
 
@@ -306,9 +290,9 @@ for {
 }
 ```
 
-`forward` writes a `MESSAGE` or `PRESENCE` `ProtocolMessage` onto the
-connection's outbound queue; the connection's single writer goroutine
-(§5.2) serialises actual frame writes. There is no per-attachment buffered
+`forward` writes a `MESSAGE` `ProtocolMessage` onto the connection's
+outbound queue; the connection's single writer goroutine (§5.2)
+serialises actual frame writes. There is no per-attachment buffered
 fan-out channel: each attachment proceeds at its own pace.
 
 The starting cursor depends on how the attachment was created:
@@ -353,13 +337,13 @@ is closed with `ERROR` (`code: 50000`).
                        memory / disk / database
 ```
 
-Protocol types (`ProtocolMessage`, `Action`, `Message`, `PresenceMessage`)
-default to importing `github.com/ably/ably-go/ably/proto` where the
-exported types have the fields we need. If we hit friction — missing
-fields, awkward serialisation, types not exported — the package falls
-back to internal definitions in `internal/protocol/`. The fallback is
-mechanical: redefine the affected struct, keep field tags, leave the rest
-of the package on the upstream types.
+Protocol types (`ProtocolMessage`, `Action`, `Message`) default to
+importing `github.com/ably/ably-go/ably/proto` where the exported types
+have the fields we need. If we hit friction — missing fields, awkward
+serialisation, types not exported — the package falls back to internal
+definitions in `internal/protocol/`. The fallback is mechanical:
+redefine the affected struct, keep field tags, leave the rest of the
+package on the upstream types.
 
 Major packages (proposed):
 
@@ -370,7 +354,7 @@ internal/protocol/      # codec wrappers (json/msgpack); fallback type defs if n
 internal/auth/          # key parsing, basic-auth, JWT verify, capability + clientId resolution
 internal/realtime/      # WebSocket upgrade, ConnectionLoop, attachment cursor loop
 internal/rest/          # HTTP handlers + router
-internal/core/          # Channel, ChannelManager, entry list, message/presence semantics
+internal/core/          # Channel, ChannelManager, entry list, message semantics
 internal/storage/       # Storage interface + memory/disk/db backends
 internal/cluster/       # Postgres LISTEN/NOTIFY broker (cluster mode only)
 internal/id/            # connection IDs, message IDs, msgSerial helpers
@@ -433,10 +417,6 @@ A persistently slow attachment that holds onto stale entries will be
 disconnected once its lag exceeds a configurable threshold (`ERROR`
 `code: 50000`).
 
-Presence broadcasts (`PRESENCE` / `SYNC`) ride the same linked list,
-distinguished by the entry's payload type so attachments forward them
-gated by their own mode flags.
-
 ### 5.2 Connection loop
 
 Each WebSocket connection has:
@@ -447,7 +427,7 @@ Each WebSocket connection has:
 - A heartbeat ticker that sends `HEARTBEAT` if idle.
 - An `attachments map[string]*Attachment` keyed by channel name.
 
-Inbound `MESSAGE` and `PRESENCE` are routed to the matching attachment, which
+Inbound `MESSAGE` is routed to the matching attachment, which
 authorises the publish, persists via `Storage.AppendMessages` (or, in
 cluster mode, lets the Postgres `INSERT` + `NOTIFY` round-trip do the
 local append), and replies with `ACK` / `NACK`. Inbound `ATTACH` /
@@ -465,20 +445,12 @@ type Storage interface {
 type ChannelStore interface {
     AppendMessages(ctx context.Context, msgs []core.Message) error
     History(ctx context.Context, q HistoryQuery) (HistoryPage, error)
-
-    PresenceEnter(ctx context.Context, m core.PresenceMessage) error
-    PresenceUpdate(ctx context.Context, m core.PresenceMessage) error
-    PresenceLeave(ctx context.Context, m core.PresenceMessage) error
-    PresenceMembers(ctx context.Context) ([]core.PresenceMessage, error)
-    PresenceHistory(ctx context.Context, q HistoryQuery) (HistoryPage, error)
 }
 ```
 
 ### 6.1 Memory backend
 
-- Per-channel ring buffer for messages (bounded by count *and* age).
-- `map[clientID+connectionID]PresenceMessage` for current members.
-- Append-only slice for presence history (also bounded).
+Per-channel ring buffer for messages, bounded by count *and* age.
 
 ### 6.2 Disk backend
 
@@ -514,18 +486,6 @@ CREATE TABLE messages (
   PRIMARY KEY (channel, msg_serial)
 );
 CREATE INDEX ON messages (channel, timestamp DESC);
-
-CREATE TABLE presence_members (
-  channel       TEXT NOT NULL,
-  conn_id       TEXT NOT NULL,
-  client_id     TEXT NOT NULL,
-  data          BYTEA,
-  encoding      TEXT,
-  updated_at    TIMESTAMPTZ NOT NULL,
-  PRIMARY KEY (channel, conn_id, client_id)
-);
-
-CREATE TABLE presence_history (...similar to messages...);
 ```
 
 Retention is enforced by a periodic background job (delete by `timestamp <
@@ -533,8 +493,8 @@ now() - ttl`) plus a per-channel `max_messages` cap.
 
 The default message TTL is **2 minutes**, matching Ably cloud's default;
 both the TTL and the per-channel message cap are configurable (see §9).
-Presence history follows the same TTL. Operators who want full message
-history for a self-host deployment can set the TTL to a large value.
+Operators who want full message history for a self-host deployment can
+set the TTL to a large value.
 
 ## 7. Pub/Sub
 
@@ -559,8 +519,8 @@ All attachments are on the same node and tail the same list.
 Each node runs a single goroutine on a dedicated Postgres connection
 listening for channel-publish notifications:
 
-- The publishing node `INSERT`s the row into `messages` (or
-  `presence_history`) — this assigns the global `msg_serial` — and emits
+- The publishing node `INSERT`s the row into `messages` — this assigns
+  the global `msg_serial` — and emits
   `NOTIFY ably_channel, '<channel-name>:<row-id>'`.
 - Every listening node (including the publisher) receives the notification,
   fetches the row by id, and calls `channel.Append(msg)` on its local
@@ -584,9 +544,8 @@ fork.
 - **connectionId**: 12-char base64 of random 9 bytes, generated on `CONNECTED`.
   Process-local; never persisted, never recoverable.
 - **clientId**: optional, resolved at auth time per §3.2. The server stamps
-  it onto every outbound `Message.clientId` and `PresenceMessage.clientId`
-  published by this connection, and rejects inbound frames that try to set
-  a different value.
+  it onto every outbound `Message.clientId` published by this connection,
+  and rejects inbound frames that try to set a different value.
 - **msgSerial** (channel): monotonic `BIGINT` from the storage backend
   (sequence/`MAX+1` under transaction, or atomic counter in memory).
 - **Message.id**: `{connId}:{publishMsgSerial}:{messageIndex}` per Ably
@@ -658,8 +617,8 @@ client-supplied `channelSerial`. No connection state crosses nodes.
 - **Integration**: spin up the binary against ably-go's existing test suite
   (or a curated subset) to validate SDK compatibility.
 - **Cluster**: Postgres + 2 server processes in Docker Compose; tests cover
-  cross-node publish, presence sync, and `channelSerial`-based replay on
-  reconnect to a different node.
+  cross-node publish and `channelSerial`-based replay on reconnect to a
+  different node.
 
 There is no existing Ably protocol conformance suite to target; the
 ably-go integration tests are the de-facto external check on SDK
