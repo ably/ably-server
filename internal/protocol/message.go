@@ -2,7 +2,7 @@ package protocol
 
 // ProtocolMessage is one frame on the realtime WebSocket connection.
 type ProtocolMessage struct {
-	Action        Action `json:"action,omitempty"        msgpack:"action,omitempty"`
+	Action        Action `json:"action"                  msgpack:"action"`
 	ID            string `json:"id,omitempty"            msgpack:"id,omitempty"`
 	ConnectionID  string `json:"connectionId,omitempty"  msgpack:"connectionId,omitempty"`
 	Channel       string `json:"channel,omitempty"       msgpack:"channel,omitempty"`

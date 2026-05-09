@@ -34,23 +34,14 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
-func TestHeartbeatJSONIsCompact(t *testing.T) {
+func TestHeartbeatAlwaysCarriesAction(t *testing.T) {
 	hb := &ProtocolMessage{Action: ActionHeartbeat}
 	data, err := Marshal(hb, FormatJSON)
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	// Action 0 (HEARTBEAT) is omitempty, so the JSON form is just `{}`.
-	if got := string(data); got != "{}" {
-		t.Fatalf("heartbeat JSON = %q, want %q", got, "{}")
-	}
-
-	var decoded ProtocolMessage
-	if err := Unmarshal(data, FormatJSON, &decoded); err != nil {
-		t.Fatalf("Unmarshal: %v", err)
-	}
-	if decoded.Action != ActionHeartbeat {
-		t.Fatalf("decoded.Action = %v, want HEARTBEAT", decoded.Action)
+	if got := string(data); got != `{"action":0}` {
+		t.Fatalf("heartbeat JSON = %q, want %q", got, `{"action":0}`)
 	}
 }
 

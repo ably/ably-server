@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -12,7 +11,10 @@ import (
 	"github.com/ably/ably-server/internal/protocol"
 )
 
-// connection is one live WebSocket connection.
+// connection is one live WebSocket connection. It owns two goroutines:
+// the request-handler goroutine runs the read loop, and one goroutine is
+// spawned for the write loop (gorilla/websocket requires a single writer
+// per connection).
 type connection struct {
 	ws                *websocket.Conn
 	format            protocol.Format
@@ -21,16 +23,15 @@ type connection struct {
 	logger            *slog.Logger
 
 	outbound chan *protocol.ProtocolMessage
-
-	closeOnce sync.Once
-	done      chan struct{}
 }
 
-// run drives the connection's read and write loops until either side
-// terminates.
+// run drives the connection until either side terminates. It returns
+// once both loops have exited.
 func (c *connection) run(ctx context.Context) {
-	c.done = make(chan struct{})
-	defer c.close()
+	defer c.ws.Close()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	// CONNECTED is the first frame we emit.
 	c.send(&protocol.ProtocolMessage{
@@ -38,21 +39,21 @@ func (c *connection) run(ctx context.Context) {
 		ConnectionID: c.id,
 	})
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		c.writeLoop(ctx)
+	}()
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); c.readLoop(cancel) }()
-	go func() { defer wg.Done(); c.writeLoop(ctx) }()
-	wg.Wait()
+	c.readLoop()
+	cancel()
+	<-writeDone
 }
 
 // readLoop decodes inbound frames and dispatches on Action. For this
-// iteration's scope it only logs them — once attachments and publish
-// land, this is where they will be routed.
-func (c *connection) readLoop(cancel context.CancelFunc) {
-	defer cancel()
+// iteration it only logs them — once attachments and publish land, this
+// is where they will be routed.
+func (c *connection) readLoop() {
 	for {
 		typ, data, err := c.ws.ReadMessage()
 		if err != nil {
@@ -80,8 +81,7 @@ func (c *connection) readLoop(cancel context.CancelFunc) {
 	}
 }
 
-// writeLoop serialises all outbound frames (gorilla/websocket requires a
-// single writer per connection) and emits HEARTBEAT on idle.
+// writeLoop serialises all outbound frames and emits HEARTBEAT on idle.
 func (c *connection) writeLoop(ctx context.Context) {
 	ticker := time.NewTicker(c.heartbeatInterval)
 	defer ticker.Stop()
@@ -89,9 +89,6 @@ func (c *connection) writeLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			return
-
-		case <-c.done:
 			return
 
 		case msg := <-c.outbound:
@@ -122,22 +119,13 @@ func (c *connection) write(msg *protocol.ProtocolMessage) error {
 	return c.ws.WriteMessage(wsType, data)
 }
 
-// send queues an outbound frame. Used by run() to emit CONNECTED.
+// send queues an outbound frame for the write loop.
 func (c *connection) send(msg *protocol.ProtocolMessage) {
 	select {
 	case c.outbound <- msg:
 	default:
 		c.logger.Warn("outbound buffer full, dropping frame", "action", msg.Action.String())
 	}
-}
-
-func (c *connection) close() {
-	c.closeOnce.Do(func() {
-		if c.done != nil {
-			close(c.done)
-		}
-		_ = c.ws.Close()
-	})
 }
 
 func isExpectedClose(err error) bool {
