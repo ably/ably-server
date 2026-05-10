@@ -1,0 +1,54 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"strings"
+	"testing"
+)
+
+// emptyEnv is a getenv stub that returns "" for every key.
+func emptyEnv(string) string { return "" }
+
+// envWith returns a getenv stub that returns vals[k] for known keys
+// and "" otherwise.
+func envWith(vals map[string]string) func(string) string {
+	return func(k string) string { return vals[k] }
+}
+
+func TestRunRejectsMissingKey(t *testing.T) {
+	var stderr bytes.Buffer
+	code := run(context.Background(), nil, emptyEnv, &stderr)
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "--api-key") {
+		t.Errorf("stderr = %q, want substring %q", stderr.String(), "--api-key")
+	}
+}
+
+func TestRunRejectsMalformedKeyFromFlag(t *testing.T) {
+	var stderr bytes.Buffer
+	code := run(context.Background(), []string{"--api-key=bogus"}, emptyEnv, &stderr)
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "invalid api key") {
+		t.Errorf("stderr = %q, want substring %q", stderr.String(), "invalid api key")
+	}
+}
+
+func TestRunFallsBackToEnv(t *testing.T) {
+	// Flag is absent; the env value must be picked up. We supply a
+	// malformed env value so the parse error proves the env was read
+	// — without starting the server.
+	var stderr bytes.Buffer
+	env := envWith(map[string]string{apiKeyEnv: "bogus"})
+	code := run(context.Background(), nil, env, &stderr)
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "invalid api key") {
+		t.Errorf("stderr = %q, want substring %q", stderr.String(), "invalid api key")
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -23,22 +24,36 @@ import (
 const apiKeyEnv = "ABLY_SERVER_API_KEY"
 
 func main() {
-	listen := flag.String("listen", ":8080", "address for HTTP/WS listener")
-	apiKey := flag.String("api-key", os.Getenv(apiKeyEnv), "API key in appId.keyId:keySecret format (env: "+apiKeyEnv+")")
-	hbInterval := flag.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
-	shutdownGrace := flag.Duration("shutdown-grace", 10*time.Second, "window to disconnect existing connections on SIGTERM")
-	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
-	flag.Parse()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	os.Exit(run(ctx, os.Args[1:], os.Getenv, os.Stderr))
+}
 
-	logger := newLogger(*logLevel)
-	slog.SetDefault(logger)
+// run executes the server and returns the process exit code. All
+// inputs (args, environment, output) are passed in so the function is
+// testable without touching package-level state.
+func run(ctx context.Context, args []string, getenv func(string) string, stderr io.Writer) int {
+	fs := flag.NewFlagSet("ably-server", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	listen := fs.String("listen", ":8080", "address for HTTP/WS listener")
+	apiKey := fs.String("api-key", getenv(apiKeyEnv), "API key in appId.keyId:keySecret format (env: "+apiKeyEnv+")")
+	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
+	shutdownGrace := fs.Duration("shutdown-grace", 10*time.Second, "window to disconnect existing connections on SIGTERM")
+	logLevel := fs.String("log-level", "info", "log level: debug, info, warn, error")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	logger := newLogger(*logLevel, stderr)
 
 	if *apiKey == "" {
-		fatal(logger, fmt.Sprintf("--api-key (or %s) is required", apiKeyEnv))
+		fmt.Fprintf(stderr, "--api-key (or %s) is required\n", apiKeyEnv)
+		return 1
 	}
 	parsedKey, err := auth.ParseAPIKey(*apiKey)
 	if err != nil {
-		fatal(logger, fmt.Sprintf("invalid api key: %v", err))
+		fmt.Fprintf(stderr, "invalid api key: %v\n", err)
+		return 1
 	}
 
 	rt := realtime.NewServer(realtime.Config{
@@ -56,9 +71,6 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	errCh := make(chan error, 1)
 	go func() {
 		logger.Info("listening", "addr", *listen)
@@ -69,25 +81,22 @@ func main() {
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("listener exited", "err", err)
-			os.Exit(1)
+			return 1
 		}
+		return 0
 	case <-ctx.Done():
 		logger.Info("shutdown signal received")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), *shutdownGrace)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			logger.Error("shutdown error", "err", err)
-			os.Exit(1)
+			return 1
 		}
+		return 0
 	}
 }
 
-func fatal(logger *slog.Logger, msg string) {
-	logger.Error(msg)
-	os.Exit(1)
-}
-
-func newLogger(level string) *slog.Logger {
+func newLogger(level string, w io.Writer) *slog.Logger {
 	var lvl slog.Level
 	switch level {
 	case "debug":
@@ -99,5 +108,5 @@ func newLogger(level string) *slog.Logger {
 	default:
 		lvl = slog.LevelInfo
 	}
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: lvl}))
 }
