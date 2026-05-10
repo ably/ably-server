@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -27,7 +28,7 @@ func TestRoundTrip(t *testing.T) {
 			if err := Unmarshal(data, f, &decoded); err != nil {
 				t.Fatalf("Unmarshal: %v", err)
 			}
-			if decoded != *original {
+			if !reflect.DeepEqual(decoded, *original) {
 				t.Fatalf("round-trip mismatch:\n got %+v\nwant %+v", decoded, *original)
 			}
 		})

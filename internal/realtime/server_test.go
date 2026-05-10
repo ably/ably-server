@@ -13,26 +13,29 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/ably/ably-server/internal/auth"
+	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/protocol"
 )
 
 const testKey = "app.key:secret"
 
 // newTestServer constructs an httptest.Server wrapping our realtime
-// Server with a known API key.
-func newTestServer(t *testing.T, hb time.Duration) *httptest.Server {
+// Server with a known API key. The returned Manager is the same one
+// the server is wired with, so tests can publish to channels and
+// observe attachment-driven forwarding.
+func newTestServer(t *testing.T, hb time.Duration) (*httptest.Server, *core.Manager) {
 	t.Helper()
 	parsed, err := auth.ParseAPIKey(testKey)
 	if err != nil {
 		t.Fatalf("parse api key: %v", err)
 	}
-	cfg := Config{
+	rt := NewServer(Config{
 		Key:               parsed,
 		HeartbeatInterval: hb,
-	}
-	srv := httptest.NewServer(NewServer(cfg))
+	})
+	srv := httptest.NewServer(rt)
 	t.Cleanup(srv.Close)
-	return srv
+	return srv, rt.Manager()
 }
 
 // dial connects a WebSocket client to srv with the test key included as
@@ -77,7 +80,7 @@ func readFrame(t *testing.T, ws *websocket.Conn, format protocol.Format, within 
 }
 
 func TestConnectedIsFirstFrame(t *testing.T) {
-	srv := newTestServer(t, time.Hour)
+	srv, _ := newTestServer(t, time.Hour)
 
 	for _, format := range []string{"json", "msgpack"} {
 		t.Run(format, func(t *testing.T) {
@@ -96,7 +99,7 @@ func TestConnectedIsFirstFrame(t *testing.T) {
 }
 
 func TestPeriodicHeartbeat(t *testing.T) {
-	srv := newTestServer(t, 30*time.Millisecond)
+	srv, _ := newTestServer(t, 30*time.Millisecond)
 
 	ws := dial(t, srv, "")
 
@@ -122,7 +125,7 @@ func TestPeriodicHeartbeat(t *testing.T) {
 }
 
 func TestUnsupportedFormatRejectedAtUpgrade(t *testing.T) {
-	srv := newTestServer(t, time.Hour)
+	srv, _ := newTestServer(t, time.Hour)
 
 	u := strings.Replace(srv.URL, "http://", "ws://", 1) + "?key=" + testKey + "&format=protobuf"
 	_, resp, err := websocket.DefaultDialer.DialContext(context.Background(), u, nil)
@@ -142,7 +145,7 @@ func TestUnsupportedFormatRejectedAtUpgrade(t *testing.T) {
 }
 
 func TestInboundFrameDoesNotCrashConnection(t *testing.T) {
-	srv := newTestServer(t, time.Hour)
+	srv, _ := newTestServer(t, time.Hour)
 
 	ws := dial(t, srv, "")
 	first := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
@@ -167,7 +170,7 @@ func TestInboundFrameDoesNotCrashConnection(t *testing.T) {
 }
 
 func TestUpgradeRejectedWithoutCredentials(t *testing.T) {
-	srv := newTestServer(t, time.Hour)
+	srv, _ := newTestServer(t, time.Hour)
 
 	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1)
 	_, resp, err := websocket.DefaultDialer.DialContext(context.Background(), wsURL, nil)
@@ -183,7 +186,7 @@ func TestUpgradeRejectedWithoutCredentials(t *testing.T) {
 }
 
 func TestUpgradeRejectedWithWrongKey(t *testing.T) {
-	srv := newTestServer(t, time.Hour)
+	srv, _ := newTestServer(t, time.Hour)
 
 	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "?key=app.key:wrong"
 	_, resp, err := websocket.DefaultDialer.DialContext(context.Background(), wsURL, nil)
@@ -196,7 +199,7 @@ func TestUpgradeRejectedWithWrongKey(t *testing.T) {
 }
 
 func TestUpgradeAcceptsBasicAuth(t *testing.T) {
-	srv := newTestServer(t, time.Hour)
+	srv, _ := newTestServer(t, time.Hour)
 
 	u, err := url.Parse(srv.URL)
 	if err != nil {
@@ -218,5 +221,164 @@ func TestUpgradeAcceptsBasicAuth(t *testing.T) {
 	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
 	if msg.Action != protocol.ActionConnected {
 		t.Fatalf("first frame Action = %v, want CONNECTED", msg.Action)
+	}
+}
+
+// sendFrame encodes and writes a ProtocolMessage to ws.
+func sendFrame(t *testing.T, ws *websocket.Conn, format protocol.Format, msg *protocol.ProtocolMessage) {
+	t.Helper()
+	data, err := protocol.Marshal(msg, format)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	wsType := websocket.TextMessage
+	if format == protocol.FormatMsgpack {
+		wsType = websocket.BinaryMessage
+	}
+	if err := ws.WriteMessage(wsType, data); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
+// drainConnected reads and discards the initial CONNECTED frame.
+func drainConnected(t *testing.T, ws *websocket.Conn) {
+	t.Helper()
+	first := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if first.Action != protocol.ActionConnected {
+		t.Fatalf("first frame Action = %v, want CONNECTED", first.Action)
+	}
+}
+
+func TestAttachReceivesAttachedAck(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+	ws := dial(t, srv, "")
+	drainConnected(t, ws)
+
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:  protocol.ActionAttach,
+		Channel: "foo",
+	})
+
+	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if msg.Action != protocol.ActionAttached {
+		t.Fatalf("Action = %v, want ATTACHED", msg.Action)
+	}
+	if msg.Channel != "foo" {
+		t.Errorf("Channel = %q, want %q", msg.Channel, "foo")
+	}
+	if msg.ChannelSerial != "0" {
+		t.Errorf("ChannelSerial = %q, want %q (fresh attach at sentinel)", msg.ChannelSerial, "0")
+	}
+}
+
+func TestAttachForwardsPublishedMessages(t *testing.T) {
+	srv, manager := newTestServer(t, time.Hour)
+	ws := dial(t, srv, "")
+	drainConnected(t, ws)
+
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:  protocol.ActionAttach,
+		Channel: "foo",
+	})
+	if msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); msg.Action != protocol.ActionAttached {
+		t.Fatalf("expected ATTACHED, got %v", msg.Action)
+	}
+
+	manager.GetChannel("foo").Append(&protocol.Message{ID: "m1"})
+
+	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if msg.Action != protocol.ActionMessage {
+		t.Fatalf("Action = %v, want MESSAGE", msg.Action)
+	}
+	if msg.Channel != "foo" {
+		t.Errorf("Channel = %q, want %q", msg.Channel, "foo")
+	}
+	if msg.ChannelSerial != "1" {
+		t.Errorf("ChannelSerial = %q, want %q", msg.ChannelSerial, "1")
+	}
+	if len(msg.Messages) != 1 {
+		t.Fatalf("Messages length = %d, want 1", len(msg.Messages))
+	}
+	if msg.Messages[0].ID != "m1" {
+		t.Errorf("Messages[0].ID = %q, want %q", msg.Messages[0].ID, "m1")
+	}
+}
+
+func TestAttachIsIdempotentPerChannel(t *testing.T) {
+	srv, manager := newTestServer(t, time.Hour)
+	ws := dial(t, srv, "")
+	drainConnected(t, ws)
+
+	// Two ATTACHes for the same channel should not start two attachments;
+	// only one ATTACHED is expected, and a subsequent publish produces one
+	// MESSAGE.
+	for range 2 {
+		sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+			Action:  protocol.ActionAttach,
+			Channel: "foo",
+		})
+	}
+
+	if msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); msg.Action != protocol.ActionAttached {
+		t.Fatalf("expected ATTACHED, got %v", msg.Action)
+	}
+
+	manager.GetChannel("foo").Append(&protocol.Message{ID: "m1"})
+
+	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if msg.Action != protocol.ActionMessage {
+		t.Fatalf("Action = %v, want MESSAGE", msg.Action)
+	}
+
+	// No further frames should arrive within a short window.
+	if err := ws.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	if _, _, err := ws.ReadMessage(); err == nil {
+		t.Fatal("received an unexpected extra frame; idempotent attach produced duplicates")
+	}
+}
+
+func TestAttachSupportsMultipleChannels(t *testing.T) {
+	srv, manager := newTestServer(t, time.Hour)
+	ws := dial(t, srv, "")
+	drainConnected(t, ws)
+
+	for _, name := range []string{"foo", "bar"} {
+		sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+			Action:  protocol.ActionAttach,
+			Channel: name,
+		})
+	}
+
+	// Two ATTACHEDs arrive (order is not guaranteed across attachments).
+	got := make(map[string]bool)
+	for range 2 {
+		msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+		if msg.Action != protocol.ActionAttached {
+			t.Fatalf("Action = %v, want ATTACHED", msg.Action)
+		}
+		got[msg.Channel] = true
+	}
+	if !got["foo"] || !got["bar"] {
+		t.Fatalf("ATTACHED channels = %v, want both foo and bar", got)
+	}
+
+	manager.GetChannel("foo").Append(&protocol.Message{ID: "f1"})
+	manager.GetChannel("bar").Append(&protocol.Message{ID: "b1"})
+
+	seen := map[string]string{}
+	for range 2 {
+		msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+		if msg.Action != protocol.ActionMessage {
+			t.Fatalf("Action = %v, want MESSAGE", msg.Action)
+		}
+		if len(msg.Messages) != 1 {
+			t.Fatalf("Messages length = %d, want 1", len(msg.Messages))
+		}
+		seen[msg.Channel] = msg.Messages[0].ID
+	}
+	if seen["foo"] != "f1" || seen["bar"] != "b1" {
+		t.Errorf("seen = %v, want foo:f1, bar:b1", seen)
 	}
 }

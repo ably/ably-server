@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -20,7 +21,7 @@ func isClosed(ch <-chan struct{}) bool {
 
 func TestChannelAppendBuildsList(t *testing.T) {
 	c := newChannel("test")
-	head := c.Tail() // sentinel; notify open, next nil
+	head := c.tail // sentinel; notify open, next nil
 
 	msgs := []*protocol.Message{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}}
 	for _, m := range msgs {
@@ -40,6 +41,9 @@ func TestChannelAppendBuildsList(t *testing.T) {
 		if e.msg.ID != want.ID {
 			t.Fatalf("entry %d: msg.ID = %q, want %q", i, e.msg.ID, want.ID)
 		}
+		if e.serial != int64(i+1) {
+			t.Fatalf("entry %d: serial = %d, want %d", i, e.serial, i+1)
+		}
 	}
 
 	// The final entry's notify is still open — no successor yet.
@@ -48,23 +52,9 @@ func TestChannelAppendBuildsList(t *testing.T) {
 	}
 }
 
-func TestChannelTailIsLatestOpenEntry(t *testing.T) {
-	c := newChannel("test")
-	c.Append(&protocol.Message{ID: "m1"})
-	c.Append(&protocol.Message{ID: "m2"})
-
-	tail := c.Tail()
-	if isClosed(tail.notify) {
-		t.Fatal("tail.notify is closed; expected open")
-	}
-	if tail.msg.ID != "m2" {
-		t.Fatalf("tail.msg.ID = %q, want %q", tail.msg.ID, "m2")
-	}
-}
-
 func TestChannelNotifyWakesWaiter(t *testing.T) {
 	c := newChannel("test")
-	head := c.Tail()
+	head := c.tail
 
 	got := make(chan *entry, 1)
 	go func() {
@@ -89,7 +79,7 @@ func TestChannelNotifyWakesWaiter(t *testing.T) {
 
 func TestChannelNotifyWakesAllWaiters(t *testing.T) {
 	c := newChannel("test")
-	head := c.Tail()
+	head := c.tail
 
 	const waiters = 5
 	woken := make(chan struct{}, waiters)
@@ -114,7 +104,7 @@ func TestChannelNotifyWakesAllWaiters(t *testing.T) {
 
 func TestChannelAppendIsConcurrentSafe(t *testing.T) {
 	c := newChannel("test")
-	head := c.Tail()
+	head := c.tail
 
 	const writers = 10
 	const perWriter = 100
@@ -138,5 +128,87 @@ func TestChannelAppendIsConcurrentSafe(t *testing.T) {
 	}
 	if want := writers * perWriter; count != want {
 		t.Fatalf("reachable entries = %d, want %d", count, want)
+	}
+}
+
+func TestStreamAttachOnEmptyChannelBlocksUntilAppend(t *testing.T) {
+	c := newChannel("test")
+	s := c.Attach()
+
+	if got := s.ChannelSerial(); got != "0" {
+		t.Errorf("initial ChannelSerial = %q, want %q", got, "0")
+	}
+
+	got := make(chan *protocol.Message, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		m, err := s.Next(ctx)
+		if err != nil {
+			t.Errorf("Next: %v", err)
+			return
+		}
+		got <- m
+	}()
+
+	c.Append(&protocol.Message{ID: "m1"})
+
+	select {
+	case m := <-got:
+		if m.ID != "m1" {
+			t.Errorf("Next msg.ID = %q, want %q", m.ID, "m1")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Next did not return within 1s")
+	}
+
+	if got := s.ChannelSerial(); got != "1" {
+		t.Errorf("post-Next ChannelSerial = %q, want %q", got, "1")
+	}
+}
+
+func TestStreamAttachAfterAppendsParksAtTail(t *testing.T) {
+	c := newChannel("test")
+	c.Append(&protocol.Message{ID: "m1"})
+	c.Append(&protocol.Message{ID: "m2"})
+
+	s := c.Attach()
+	if got := s.ChannelSerial(); got != "2" {
+		t.Fatalf("ChannelSerial = %q, want %q", got, "2")
+	}
+
+	// Attaching at the tail means Next blocks until a fresh append.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := s.Next(ctx); err == nil {
+		t.Fatal("Next returned with no fresh append; expected ctx error")
+	}
+
+	// Now publish a third message; Next should observe it.
+	go c.Append(&protocol.Message{ID: "m3"})
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
+	defer cancel2()
+	m, err := s.Next(ctx2)
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if m.ID != "m3" {
+		t.Errorf("msg.ID = %q, want %q", m.ID, "m3")
+	}
+	if got := s.ChannelSerial(); got != "3" {
+		t.Errorf("ChannelSerial = %q, want %q", got, "3")
+	}
+}
+
+func TestStreamNextRespectsContext(t *testing.T) {
+	c := newChannel("test")
+	s := c.Attach()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := s.Next(ctx); err == nil {
+		t.Fatal("Next returned nil error after ctx cancellation")
 	}
 }

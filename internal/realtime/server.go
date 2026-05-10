@@ -10,6 +10,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/ably/ably-server/internal/auth"
+	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/id"
 	"github.com/ably/ably-server/internal/protocol"
 )
@@ -35,6 +36,7 @@ type Config struct {
 // Server is the WebSocket handler. It implements http.Handler.
 type Server struct {
 	authn             *auth.Authenticator
+	manager           *core.Manager
 	heartbeatInterval time.Duration
 	logger            *slog.Logger
 	upgrader          websocket.Upgrader
@@ -52,6 +54,7 @@ func NewServer(cfg Config) *Server {
 	}
 	return &Server{
 		authn:             auth.NewAuthenticator(cfg.Key),
+		manager:           core.NewManager(),
 		heartbeatInterval: hb,
 		logger:            logger,
 		upgrader: websocket.Upgrader{
@@ -62,6 +65,13 @@ func NewServer(cfg Config) *Server {
 			CheckOrigin: func(*http.Request) bool { return true },
 		},
 	}
+}
+
+// Manager returns the per-process Channel manager owned by this
+// Server. Exposed so tests (and any future co-located handler) can
+// reach the same Channel set the realtime connections resolve against.
+func (s *Server) Manager() *core.Manager {
+	return s.manager
 }
 
 // ServeHTTP authenticates the request, upgrades to a WebSocket, and
@@ -93,7 +103,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		id:                connID,
 		heartbeatInterval: s.heartbeatInterval,
 		logger:            s.logger.With("connId", connID),
+		manager:           s.manager,
 		outbound:          make(chan *protocol.ProtocolMessage, 16),
+		attachments:       make(map[string]*attachment),
 	}
 	conn.run(r.Context())
 }

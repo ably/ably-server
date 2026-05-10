@@ -8,21 +8,25 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/protocol"
 )
 
 // connection is one live WebSocket connection. It owns two goroutines:
 // the request-handler goroutine runs the read loop, and one goroutine is
 // spawned for the write loop (gorilla/websocket requires a single writer
-// per connection).
+// per connection). Attachments spawn additional goroutines, one per
+// channel, that push frames onto the connection's outbound channel.
 type connection struct {
 	ws                *websocket.Conn
 	format            protocol.Format
 	id                string
 	heartbeatInterval time.Duration
 	logger            *slog.Logger
+	manager           *core.Manager
 
-	outbound chan *protocol.ProtocolMessage
+	outbound    chan *protocol.ProtocolMessage
+	attachments map[string]*attachment
 }
 
 // run drives the connection until either side terminates. It returns
@@ -33,11 +37,12 @@ func (c *connection) run(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// CONNECTED is the first frame we emit.
-	c.send(&protocol.ProtocolMessage{
-		Action:       protocol.ActionConnected,
-		ConnectionID: c.id,
-	})
+	// CONNECTED is the first frame we emit; buffer is empty here.
+	select {
+	case c.outbound <- &protocol.ProtocolMessage{Action: protocol.ActionConnected, ConnectionID: c.id}:
+	case <-ctx.Done():
+		return
+	}
 
 	writeDone := make(chan struct{})
 	go func() {
@@ -45,15 +50,13 @@ func (c *connection) run(ctx context.Context) {
 		c.writeLoop(ctx)
 	}()
 
-	c.readLoop()
+	c.readLoop(ctx)
 	cancel()
 	<-writeDone
 }
 
-// readLoop decodes inbound frames and dispatches on Action. For this
-// iteration it only logs them — once attachments and publish land, this
-// is where they will be routed.
-func (c *connection) readLoop() {
+// readLoop decodes inbound frames and dispatches on Action.
+func (c *connection) readLoop(ctx context.Context) {
 	for {
 		typ, data, err := c.ws.ReadMessage()
 		if err != nil {
@@ -77,8 +80,34 @@ func (c *connection) readLoop() {
 			c.logger.Warn("decode error", "err", err)
 			continue
 		}
+		c.dispatch(ctx, &msg)
+	}
+}
+
+func (c *connection) dispatch(ctx context.Context, msg *protocol.ProtocolMessage) {
+	switch msg.Action {
+	case protocol.ActionAttach:
+		c.handleAttach(ctx, msg.Channel)
+	default:
 		c.logger.Debug("received frame", "action", msg.Action.String())
 	}
+}
+
+// handleAttach starts an attachment for name if one does not already
+// exist on this connection. The attachment goroutine writes ATTACHED
+// followed by a MESSAGE frame for every subsequent publish.
+func (c *connection) handleAttach(ctx context.Context, name string) {
+	if name == "" {
+		c.logger.Warn("ATTACH with empty channel name; ignoring")
+		return
+	}
+	if _, exists := c.attachments[name]; exists {
+		return
+	}
+	ch := c.manager.GetChannel(name)
+	a := newAttachment(name, ch.Attach(), c.outbound, c.logger.With("channel", name))
+	c.attachments[name] = a
+	go a.run(ctx)
 }
 
 // writeLoop serialises all outbound frames and emits HEARTBEAT on idle.
@@ -117,15 +146,6 @@ func (c *connection) write(msg *protocol.ProtocolMessage) error {
 		wsType = websocket.BinaryMessage
 	}
 	return c.ws.WriteMessage(wsType, data)
-}
-
-// send queues an outbound frame for the write loop.
-func (c *connection) send(msg *protocol.ProtocolMessage) {
-	select {
-	case c.outbound <- msg:
-	default:
-		c.logger.Warn("outbound buffer full, dropping frame", "action", msg.Action.String())
-	}
 }
 
 func isExpectedClose(err error) bool {
