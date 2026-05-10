@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,11 +16,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/realtime"
 )
 
+const apiKeyEnv = "ABLY_SERVER_API_KEY"
+
 func main() {
 	listen := flag.String("listen", ":8080", "address for HTTP/WS listener")
+	apiKey := flag.String("api-key", os.Getenv(apiKeyEnv), "API key in appId.keyId:keySecret format (env: "+apiKeyEnv+")")
 	hbInterval := flag.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	shutdownGrace := flag.Duration("shutdown-grace", 10*time.Second, "window to disconnect existing connections on SIGTERM")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
@@ -28,7 +33,16 @@ func main() {
 	logger := newLogger(*logLevel)
 	slog.SetDefault(logger)
 
+	if *apiKey == "" {
+		fatal(logger, fmt.Sprintf("--api-key (or %s) is required", apiKeyEnv))
+	}
+	parsedKey, err := auth.ParseAPIKey(*apiKey)
+	if err != nil {
+		fatal(logger, fmt.Sprintf("invalid api key: %v", err))
+	}
+
 	rt := realtime.NewServer(realtime.Config{
+		Key:               parsedKey,
 		HeartbeatInterval: *hbInterval,
 		Logger:            logger,
 	})
@@ -66,6 +80,11 @@ func main() {
 			os.Exit(1)
 		}
 	}
+}
+
+func fatal(logger *slog.Logger, msg string) {
+	logger.Error(msg)
+	os.Exit(1)
 }
 
 func newLogger(level string) *slog.Logger {

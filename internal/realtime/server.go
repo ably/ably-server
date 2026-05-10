@@ -2,12 +2,14 @@
 package realtime
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/gorilla/websocket"
 
+	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/id"
 	"github.com/ably/ably-server/internal/protocol"
 )
@@ -18,6 +20,9 @@ const DefaultHeartbeatInterval = 15 * time.Second
 
 // Config holds runtime knobs for the realtime endpoint.
 type Config struct {
+	// Key is the API key the server authenticates requests against.
+	Key auth.APIKey
+
 	// HeartbeatInterval is the cadence of HEARTBEAT frames. Zero
 	// resolves to DefaultHeartbeatInterval.
 	HeartbeatInterval time.Duration
@@ -29,6 +34,7 @@ type Config struct {
 
 // Server is the WebSocket handler. It implements http.Handler.
 type Server struct {
+	authn             *auth.Authenticator
 	heartbeatInterval time.Duration
 	logger            *slog.Logger
 	upgrader          websocket.Upgrader
@@ -45,6 +51,7 @@ func NewServer(cfg Config) *Server {
 		logger = slog.Default()
 	}
 	return &Server{
+		authn:             auth.NewAuthenticator(cfg.Key),
 		heartbeatInterval: hb,
 		logger:            logger,
 		upgrader: websocket.Upgrader{
@@ -57,8 +64,15 @@ func NewServer(cfg Config) *Server {
 	}
 }
 
-// ServeHTTP upgrades to a WebSocket and runs the connection loop.
+// ServeHTTP authenticates the request, upgrades to a WebSocket, and
+// runs the connection loop. Auth failures are returned as HTTP 401
+// before the upgrade.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if err := s.authn.Authenticate(r); err != nil {
+		s.writeAuthError(w, err)
+		return
+	}
+
 	format, err := protocol.FormatFromQuery(r.URL.Query().Get("format"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -82,4 +96,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		outbound:          make(chan *protocol.ProtocolMessage, 16),
 	}
 	conn.run(r.Context())
+}
+
+func (s *Server) writeAuthError(w http.ResponseWriter, err error) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="ably-server"`)
+	switch {
+	case errors.Is(err, auth.ErrNoCredentials):
+		http.Error(w, "no credentials presented", http.StatusUnauthorized)
+	default:
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+	}
 }

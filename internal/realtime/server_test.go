@@ -12,11 +12,31 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/protocol"
 )
 
-// dial wraps an httptest server URL and connects a WebSocket client at
-// the requested format.
+const testKey = "app.key:secret"
+
+// newTestServer constructs an httptest.Server wrapping our realtime
+// Server with a known API key.
+func newTestServer(t *testing.T, hb time.Duration) *httptest.Server {
+	t.Helper()
+	parsed, err := auth.ParseAPIKey(testKey)
+	if err != nil {
+		t.Fatalf("parse api key: %v", err)
+	}
+	cfg := Config{
+		Key:               parsed,
+		HeartbeatInterval: hb,
+	}
+	srv := httptest.NewServer(NewServer(cfg))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// dial connects a WebSocket client to srv with the test key included as
+// `?key=` and the requested format.
 func dial(t *testing.T, srv *httptest.Server, format string) *websocket.Conn {
 	t.Helper()
 	u, err := url.Parse(srv.URL)
@@ -24,11 +44,12 @@ func dial(t *testing.T, srv *httptest.Server, format string) *websocket.Conn {
 		t.Fatalf("parse url: %v", err)
 	}
 	u.Scheme = "ws"
+	q := u.Query()
+	q.Set("key", testKey)
 	if format != "" {
-		q := u.Query()
 		q.Set("format", format)
-		u.RawQuery = q.Encode()
 	}
+	u.RawQuery = q.Encode()
 
 	ws, _, err := websocket.DefaultDialer.DialContext(context.Background(), u.String(), nil)
 	if err != nil {
@@ -56,8 +77,7 @@ func readFrame(t *testing.T, ws *websocket.Conn, format protocol.Format, within 
 }
 
 func TestConnectedIsFirstFrame(t *testing.T) {
-	srv := httptest.NewServer(NewServer(Config{HeartbeatInterval: time.Hour}))
-	defer srv.Close()
+	srv := newTestServer(t, time.Hour)
 
 	for _, format := range []string{"json", "msgpack"} {
 		t.Run(format, func(t *testing.T) {
@@ -76,8 +96,7 @@ func TestConnectedIsFirstFrame(t *testing.T) {
 }
 
 func TestPeriodicHeartbeat(t *testing.T) {
-	srv := httptest.NewServer(NewServer(Config{HeartbeatInterval: 30 * time.Millisecond}))
-	defer srv.Close()
+	srv := newTestServer(t, 30*time.Millisecond)
 
 	ws := dial(t, srv, "")
 
@@ -103,10 +122,9 @@ func TestPeriodicHeartbeat(t *testing.T) {
 }
 
 func TestUnsupportedFormatRejectedAtUpgrade(t *testing.T) {
-	srv := httptest.NewServer(NewServer(Config{HeartbeatInterval: time.Hour}))
-	defer srv.Close()
+	srv := newTestServer(t, time.Hour)
 
-	u := strings.Replace(srv.URL, "http://", "ws://", 1) + "?format=protobuf"
+	u := strings.Replace(srv.URL, "http://", "ws://", 1) + "?key=" + testKey + "&format=protobuf"
 	_, resp, err := websocket.DefaultDialer.DialContext(context.Background(), u, nil)
 	if err == nil {
 		t.Fatal("dial succeeded; expected upgrade rejection")
@@ -124,8 +142,7 @@ func TestUnsupportedFormatRejectedAtUpgrade(t *testing.T) {
 }
 
 func TestInboundFrameDoesNotCrashConnection(t *testing.T) {
-	srv := httptest.NewServer(NewServer(Config{HeartbeatInterval: time.Hour}))
-	defer srv.Close()
+	srv := newTestServer(t, time.Hour)
 
 	ws := dial(t, srv, "")
 	first := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
@@ -146,5 +163,60 @@ func TestInboundFrameDoesNotCrashConnection(t *testing.T) {
 	// Connection should still be alive — closing cleanly should not error.
 	if err := ws.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")); err != nil {
 		t.Fatalf("close write: %v", err)
+	}
+}
+
+func TestUpgradeRejectedWithoutCredentials(t *testing.T) {
+	srv := newTestServer(t, time.Hour)
+
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1)
+	_, resp, err := websocket.DefaultDialer.DialContext(context.Background(), wsURL, nil)
+	if err == nil {
+		t.Fatal("dial succeeded; expected 401")
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %v, want 401", resp)
+	}
+	if got := resp.Header.Get("WWW-Authenticate"); !strings.Contains(got, "Basic") {
+		t.Errorf("WWW-Authenticate = %q, want Basic challenge", got)
+	}
+}
+
+func TestUpgradeRejectedWithWrongKey(t *testing.T) {
+	srv := newTestServer(t, time.Hour)
+
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "?key=app.key:wrong"
+	_, resp, err := websocket.DefaultDialer.DialContext(context.Background(), wsURL, nil)
+	if err == nil {
+		t.Fatal("dial succeeded; expected 401")
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %v, want 401", resp)
+	}
+}
+
+func TestUpgradeAcceptsBasicAuth(t *testing.T) {
+	srv := newTestServer(t, time.Hour)
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	u.Scheme = "ws"
+
+	headers := http.Header{}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.SetBasicAuth("app.key", "secret")
+	headers.Set("Authorization", req.Header.Get("Authorization"))
+
+	ws, _, err := websocket.DefaultDialer.DialContext(context.Background(), u.String(), headers)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer ws.Close()
+
+	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if msg.Action != protocol.ActionConnected {
+		t.Fatalf("first frame Action = %v, want CONNECTED", msg.Action)
 	}
 }
