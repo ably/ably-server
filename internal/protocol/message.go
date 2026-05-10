@@ -1,5 +1,13 @@
 package protocol
 
+// Message is a published message payload — the unit of pub/sub on a
+// channel. The struct will grow as the publish/history surface lands;
+// for now it carries only the fields needed to thread messages through
+// the in-process channel list.
+type Message struct {
+	ID string `json:"id,omitempty" msgpack:"id,omitempty"`
+}
+
 // ProtocolMessage is one frame on the realtime WebSocket connection.
 type ProtocolMessage struct {
 	Action        Action `json:"action"                  msgpack:"action"`
