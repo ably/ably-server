@@ -38,9 +38,7 @@ func (c *connection) run(ctx context.Context) {
 	defer cancel()
 
 	// CONNECTED is the first frame we emit; buffer is empty here.
-	select {
-	case c.outbound <- &protocol.ProtocolMessage{Action: protocol.ActionConnected, ConnectionID: c.id}:
-	case <-ctx.Done():
+	if !c.queue(ctx, &protocol.ProtocolMessage{Action: protocol.ActionConnected, ConnectionID: c.id}) {
 		return
 	}
 
@@ -88,6 +86,8 @@ func (c *connection) dispatch(ctx context.Context, msg *protocol.ProtocolMessage
 	switch msg.Action {
 	case protocol.ActionAttach:
 		c.handleAttach(ctx, msg.Channel)
+	case protocol.ActionMessage:
+		c.handleMessage(ctx, msg)
 	default:
 		c.logger.Debug("received frame", "action", msg.Action.String())
 	}
@@ -108,6 +108,53 @@ func (c *connection) handleAttach(ctx context.Context, name string) {
 	a := newAttachment(name, ch.Attach(), c.outbound, c.logger.With("channel", name))
 	c.attachments[name] = a
 	go a.run(ctx)
+}
+
+// handleMessage publishes the inbound payload to its channel and ACKs
+// (or NACKs) the publisher.
+func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMessage) {
+	if msg.Channel == "" {
+		c.logger.Warn("MESSAGE with empty channel name; rejecting", "msgSerial", msg.MsgSerial)
+		c.queue(ctx, &protocol.ProtocolMessage{
+			Action:    protocol.ActionNack,
+			MsgSerial: msg.MsgSerial,
+		})
+		return
+	}
+	if len(msg.Messages) == 0 {
+		c.logger.Warn("MESSAGE with no payload; rejecting", "msgSerial", msg.MsgSerial)
+		c.queue(ctx, &protocol.ProtocolMessage{
+			Action:    protocol.ActionNack,
+			MsgSerial: msg.MsgSerial,
+		})
+		return
+	}
+
+	ch := c.manager.GetChannel(msg.Channel)
+	for _, m := range msg.Messages {
+		ch.Append(m)
+	}
+
+	// ACK after Append: in the in-memory backend Append cannot fail, but
+	// once storage lands ACK will mean "committed", so we issue it once
+	// the channel state reflects the publish.
+	c.queue(ctx, &protocol.ProtocolMessage{
+		Action:    protocol.ActionAck,
+		MsgSerial: msg.MsgSerial,
+		Count:     len(msg.Messages),
+	})
+}
+
+// queue pushes a frame onto the outbound channel, blocking under
+// backpressure. Returns false if the connection's context has been
+// cancelled.
+func (c *connection) queue(ctx context.Context, msg *protocol.ProtocolMessage) bool {
+	select {
+	case c.outbound <- msg:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // writeLoop serialises all outbound frames and emits HEARTBEAT on idle.

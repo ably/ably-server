@@ -89,6 +89,44 @@ func TestFormatFromQuery(t *testing.T) {
 	}
 }
 
+func TestMessageRoundTrip(t *testing.T) {
+	original := &Message{
+		ID:           "conn:1:0",
+		ClientID:     "alice",
+		ConnectionID: "conn",
+		Name:         "greeting",
+		Data:         "hello world",
+		Encoding:     "utf-8",
+		Timestamp:    1700000000000,
+	}
+
+	for _, f := range []Format{FormatJSON, FormatMsgpack} {
+		t.Run(f.String(), func(t *testing.T) {
+			// Wrap in a ProtocolMessage so we exercise the full publish
+			// shape that lands on the wire.
+			out := &ProtocolMessage{
+				Action:   ActionMessage,
+				Channel:  "foo",
+				Messages: []*Message{original},
+			}
+			data, err := Marshal(out, f)
+			if err != nil {
+				t.Fatalf("Marshal: %v", err)
+			}
+			var decoded ProtocolMessage
+			if err := Unmarshal(data, f, &decoded); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			if len(decoded.Messages) != 1 {
+				t.Fatalf("decoded Messages length = %d, want 1", len(decoded.Messages))
+			}
+			if !reflect.DeepEqual(decoded.Messages[0], original) {
+				t.Fatalf("Message round-trip mismatch:\n got %+v\nwant %+v", decoded.Messages[0], original)
+			}
+		})
+	}
+}
+
 func TestActionString(t *testing.T) {
 	if got := ActionConnected.String(); got != "connected" {
 		t.Errorf("ActionConnected.String() = %q, want %q", got, "connected")

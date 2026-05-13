@@ -382,3 +382,168 @@ func TestAttachSupportsMultipleChannels(t *testing.T) {
 		t.Errorf("seen = %v, want foo:f1, bar:b1", seen)
 	}
 }
+
+func TestPublishAcksAndForwardsToAttachedConnection(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+	ws := dial(t, srv, "")
+	drainConnected(t, ws)
+
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:  protocol.ActionAttach,
+		Channel: "foo",
+	})
+	if msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); msg.Action != protocol.ActionAttached {
+		t.Fatalf("expected ATTACHED, got %v", msg.Action)
+	}
+
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "foo",
+		MsgSerial: 7,
+		Messages:  []*protocol.Message{{ID: "m1"}},
+	})
+
+	// ACK and the echoed MESSAGE race to the outbound chan; either order
+	// is correct.
+	frames := map[protocol.Action]*protocol.ProtocolMessage{}
+	for range 2 {
+		f := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+		frames[f.Action] = f
+	}
+
+	ack := frames[protocol.ActionAck]
+	if ack == nil {
+		t.Fatal("no ACK received")
+	}
+	if ack.MsgSerial != 7 {
+		t.Errorf("ACK.MsgSerial = %d, want 7", ack.MsgSerial)
+	}
+	if ack.Count != 1 {
+		t.Errorf("ACK.Count = %d, want 1", ack.Count)
+	}
+
+	fwd := frames[protocol.ActionMessage]
+	if fwd == nil {
+		t.Fatal("no forwarded MESSAGE received")
+	}
+	if fwd.Channel != "foo" {
+		t.Errorf("forwarded Channel = %q, want %q", fwd.Channel, "foo")
+	}
+	if len(fwd.Messages) != 1 || fwd.Messages[0].ID != "m1" {
+		t.Errorf("forwarded payload = %+v, want one msg with ID m1", fwd.Messages)
+	}
+}
+
+func TestPublishAckCountReflectsBatchSize(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+	ws := dial(t, srv, "")
+	drainConnected(t, ws)
+
+	// No attach: we only care about the ACK here.
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "foo",
+		MsgSerial: 3,
+		Messages:  []*protocol.Message{{ID: "a"}, {ID: "b"}, {ID: "c"}},
+	})
+
+	ack := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if ack.Action != protocol.ActionAck {
+		t.Fatalf("Action = %v, want ACK", ack.Action)
+	}
+	if ack.MsgSerial != 3 {
+		t.Errorf("MsgSerial = %d, want 3", ack.MsgSerial)
+	}
+	if ack.Count != 3 {
+		t.Errorf("Count = %d, want 3", ack.Count)
+	}
+}
+
+func TestPublishWithEmptyChannelIsNacked(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+	ws := dial(t, srv, "")
+	drainConnected(t, ws)
+
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		MsgSerial: 11,
+		Messages:  []*protocol.Message{{ID: "x"}},
+	})
+
+	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if msg.Action != protocol.ActionNack {
+		t.Fatalf("Action = %v, want NACK", msg.Action)
+	}
+	if msg.MsgSerial != 11 {
+		t.Errorf("MsgSerial = %d, want 11", msg.MsgSerial)
+	}
+}
+
+func TestPublishWithNoMessagesIsNacked(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+	ws := dial(t, srv, "")
+	drainConnected(t, ws)
+
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "foo",
+		MsgSerial: 22,
+	})
+
+	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if msg.Action != protocol.ActionNack {
+		t.Fatalf("Action = %v, want NACK", msg.Action)
+	}
+	if msg.MsgSerial != 22 {
+		t.Errorf("MsgSerial = %d, want 22", msg.MsgSerial)
+	}
+}
+
+func TestPublishCrossesConnections(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+
+	// Subscriber attaches first.
+	sub := dial(t, srv, "")
+	drainConnected(t, sub)
+	sendFrame(t, sub, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:  protocol.ActionAttach,
+		Channel: "foo",
+	})
+	if msg := readFrame(t, sub, protocol.FormatJSON, 2*time.Second); msg.Action != protocol.ActionAttached {
+		t.Fatalf("expected ATTACHED on subscriber, got %v", msg.Action)
+	}
+
+	// Publisher (separate connection, no attach).
+	pub := dial(t, srv, "")
+	drainConnected(t, pub)
+	original := &protocol.Message{
+		ID:       "hello",
+		ClientID: "alice",
+		Name:     "greeting",
+		Data:     "world",
+		Encoding: "utf-8",
+	}
+	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "foo",
+		MsgSerial: 1,
+		Messages:  []*protocol.Message{original},
+	})
+
+	if ack := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {
+		t.Fatalf("publisher first frame = %v, want ACK", ack.Action)
+	}
+
+	fwd := readFrame(t, sub, protocol.FormatJSON, 2*time.Second)
+	if fwd.Action != protocol.ActionMessage {
+		t.Fatalf("subscriber Action = %v, want MESSAGE", fwd.Action)
+	}
+	if len(fwd.Messages) != 1 {
+		t.Fatalf("subscriber Messages length = %d, want 1", len(fwd.Messages))
+	}
+	got := fwd.Messages[0]
+	if got.ID != original.ID || got.ClientID != original.ClientID || got.Name != original.Name ||
+		got.Data != original.Data || got.Encoding != original.Encoding {
+		t.Errorf("subscriber payload = %+v, want %+v", got, original)
+	}
+}
