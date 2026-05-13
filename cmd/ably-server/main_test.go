@@ -17,24 +17,24 @@ func envWith(vals map[string]string) func(string) string {
 }
 
 func TestRunRejectsMissingKey(t *testing.T) {
-	var stderr bytes.Buffer
-	code := run(context.Background(), nil, emptyEnv, &stderr)
+	var out bytes.Buffer
+	code := run(context.Background(), nil, emptyEnv, &out)
 	if code != 1 {
 		t.Errorf("exit code = %d, want 1", code)
 	}
-	if !strings.Contains(stderr.String(), "--api-key") {
-		t.Errorf("stderr = %q, want substring %q", stderr.String(), "--api-key")
+	if !strings.Contains(out.String(), "api key is required") {
+		t.Errorf("output = %q, want substring %q", out.String(), "api key is required")
 	}
 }
 
 func TestRunRejectsMalformedKeyFromFlag(t *testing.T) {
-	var stderr bytes.Buffer
-	code := run(context.Background(), []string{"--api-key=bogus"}, emptyEnv, &stderr)
+	var out bytes.Buffer
+	code := run(context.Background(), []string{"--api-key=bogus"}, emptyEnv, &out)
 	if code != 1 {
 		t.Errorf("exit code = %d, want 1", code)
 	}
-	if !strings.Contains(stderr.String(), "invalid api key") {
-		t.Errorf("stderr = %q, want substring %q", stderr.String(), "invalid api key")
+	if !strings.Contains(out.String(), "invalid api key") {
+		t.Errorf("output = %q, want substring %q", out.String(), "invalid api key")
 	}
 }
 
@@ -42,13 +42,13 @@ func TestRunFallsBackToEnv(t *testing.T) {
 	// Flag is absent; the env value must be picked up. We supply a
 	// malformed env value so the parse error proves the env was read
 	// — without starting the server.
-	var stderr bytes.Buffer
+	var out bytes.Buffer
 	env := envWith(map[string]string{apiKeyEnv: "bogus"})
-	code := run(context.Background(), nil, env, &stderr)
+	code := run(context.Background(), nil, env, &out)
 	if code != 1 {
 		t.Errorf("exit code = %d, want 1", code)
 	}
-	if !strings.Contains(stderr.String(), "invalid api key") {
-		t.Errorf("stderr = %q, want substring %q", stderr.String(), "invalid api key")
+	if !strings.Contains(out.String(), "invalid api key") {
+		t.Errorf("output = %q, want substring %q", out.String(), "invalid api key")
 	}
 }

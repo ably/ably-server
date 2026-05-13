@@ -33,13 +33,15 @@ type Config struct {
 	Logger *slog.Logger
 }
 
-// Server is the WebSocket handler. It implements http.Handler.
+// Server owns the realtime endpoint's HTTP routing. It implements
+// http.Handler by delegating to an internal ServeMux.
 type Server struct {
 	authn             *auth.Authenticator
 	manager           *core.Manager
 	heartbeatInterval time.Duration
 	logger            *slog.Logger
 	upgrader          websocket.Upgrader
+	mux               *http.ServeMux
 }
 
 // NewServer constructs a Server.
@@ -52,7 +54,7 @@ func NewServer(cfg Config) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{
+	s := &Server{
 		authn:             auth.NewAuthenticator(cfg.Key),
 		manager:           core.NewManager(),
 		heartbeatInterval: hb,
@@ -65,6 +67,14 @@ func NewServer(cfg Config) *Server {
 			CheckOrigin: func(*http.Request) bool { return true },
 		},
 	}
+	s.mux = http.NewServeMux()
+	s.mux.HandleFunc("/", s.handleWebSocket)
+	return s
+}
+
+// ServeHTTP delegates request routing to the Server's internal mux.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mux.ServeHTTP(w, r)
 }
 
 // Manager returns the per-process Channel manager owned by this
@@ -74,10 +84,10 @@ func (s *Server) Manager() *core.Manager {
 	return s.manager
 }
 
-// ServeHTTP authenticates the request, upgrades to a WebSocket, and
-// runs the connection loop. Auth failures are returned as HTTP 401
+// handleWebSocket authenticates the request, upgrades to a WebSocket,
+// and runs the connection loop. Auth failures are returned as HTTP 401
 // before the upgrade.
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err := s.authn.Authenticate(r); err != nil {
 		s.writeAuthError(w, err)
 		return
