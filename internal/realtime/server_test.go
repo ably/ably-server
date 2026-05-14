@@ -562,3 +562,53 @@ func TestCloseReceivesClosed(t *testing.T) {
 		t.Fatalf("Action = %v, want CLOSED", msg.Action)
 	}
 }
+
+func TestDetachReceivesDetached(t *testing.T) {
+	srv, manager := newTestServer(t, time.Hour)
+	ws := dial(t, srv, "")
+	drainConnected(t, ws)
+
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:  protocol.ActionAttach,
+		Channel: "foo",
+	})
+	if msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); msg.Action != protocol.ActionAttached {
+		t.Fatalf("expected ATTACHED, got %v", msg.Action)
+	}
+
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:  protocol.ActionDetach,
+		Channel: "foo",
+	})
+	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if msg.Action != protocol.ActionDetached {
+		t.Fatalf("Action = %v, want DETACHED", msg.Action)
+	}
+	if msg.Channel != "foo" {
+		t.Errorf("Channel = %q, want %q", msg.Channel, "foo")
+	}
+
+	// Publishing after detach should not forward to this connection.
+	manager.GetChannel("foo").Append(&protocol.Message{ID: "m1"})
+	if err := ws.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	if _, _, err := ws.ReadMessage(); err == nil {
+		t.Fatal("received a frame after DETACHED; expected silence on this channel")
+	}
+}
+
+func TestDetachWithoutAttachIsIdempotent(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+	ws := dial(t, srv, "")
+	drainConnected(t, ws)
+
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:  protocol.ActionDetach,
+		Channel: "never-attached",
+	})
+	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if msg.Action != protocol.ActionDetached {
+		t.Fatalf("Action = %v, want DETACHED", msg.Action)
+	}
+}

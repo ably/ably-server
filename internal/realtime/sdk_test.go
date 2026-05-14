@@ -1,7 +1,9 @@
 package realtime
 
 import (
+	"context"
 	"net"
+	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"testing"
@@ -29,13 +31,11 @@ func realtimeAddr(t *testing.T, srvURL string) (string, int) {
 	return host, port
 }
 
-// TestSDKConnectsAndCloses is a smoke test for SDK compatibility: the
-// ably-go realtime client should reach CONNECTED against ably-server
-// and then transition cleanly to CLOSED on Close().
-func TestSDKConnectsAndCloses(t *testing.T) {
-	srv, _ := newTestServer(t, time.Hour)
+// newSDKClient builds an ably-go realtime client wired at the
+// httptest server and returns it without yet connecting.
+func newSDKClient(t *testing.T, srv *httptest.Server) *ably.Realtime {
+	t.Helper()
 	host, port := realtimeAddr(t, srv.URL)
-
 	client, err := ably.NewRealtime(
 		ably.WithKey(testKey),
 		ably.WithEndpoint(host),
@@ -50,27 +50,72 @@ func TestSDKConnectsAndCloses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRealtime: %v", err)
 	}
+	return client
+}
 
-	connected := make(chan ably.ConnectionStateChange, 1)
-	closed := make(chan ably.ConnectionStateChange, 1)
-	client.Connection.Once(ably.ConnectionEventConnected, func(c ably.ConnectionStateChange) {
-		connected <- c
+// connectSDKClient drives the client to CONNECTED and fails the test
+// on timeout.
+func connectSDKClient(t *testing.T, client *ably.Realtime) {
+	t.Helper()
+	connected := make(chan struct{}, 1)
+	client.Connection.Once(ably.ConnectionEventConnected, func(ably.ConnectionStateChange) {
+		connected <- struct{}{}
 	})
-	client.Connection.Once(ably.ConnectionEventClosed, func(c ably.ConnectionStateChange) {
-		closed <- c
-	})
-
 	client.Connect()
 	select {
 	case <-connected:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("timeout waiting for CONNECTED; current state: %v", client.Connection.State())
 	}
+}
+
+// TestSDKConnectsAndCloses is a smoke test for SDK compatibility: the
+// ably-go realtime client should reach CONNECTED against ably-server
+// and then transition cleanly to CLOSED on Close().
+func TestSDKConnectsAndCloses(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+	client := newSDKClient(t, srv)
+
+	closed := make(chan struct{}, 1)
+	client.Connection.Once(ably.ConnectionEventClosed, func(ably.ConnectionStateChange) {
+		closed <- struct{}{}
+	})
+
+	connectSDKClient(t, client)
 
 	client.Close()
 	select {
 	case <-closed:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("timeout waiting for CLOSED; current state: %v", client.Connection.State())
+	}
+}
+
+// TestSDKAttachAndDetach drives the channel lifecycle through the SDK:
+// Attach should take the channel to ATTACHED and Detach should take it
+// to DETACHED.
+func TestSDKAttachAndDetach(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+	client := newSDKClient(t, srv)
+	t.Cleanup(func() { client.Close() })
+
+	connectSDKClient(t, client)
+
+	ch := client.Channels.Get("foo")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := ch.Attach(ctx); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	if state := ch.State(); state != ably.ChannelStateAttached {
+		t.Errorf("post-Attach state = %v, want ATTACHED", state)
+	}
+
+	if err := ch.Detach(ctx); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+	if state := ch.State(); state != ably.ChannelStateDetached {
+		t.Errorf("post-Detach state = %v, want DETACHED", state)
 	}
 }

@@ -11,27 +11,41 @@ import (
 // attachment is the (connection, channel) pair on this node. It owns
 // one goroutine that walks the channel's Stream and pushes frames
 // (ATTACHED, then MESSAGE per published message) onto the connection's
-// outbound chan.
+// outbound chan. The goroutine exits when the attachment's context is
+// cancelled — either because the connection is closing, or because the
+// client sent a DETACH.
 type attachment struct {
 	channelName string
 	stream      *core.Stream
 	out         chan<- *protocol.ProtocolMessage
 	logger      *slog.Logger
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
-func newAttachment(name string, stream *core.Stream, out chan<- *protocol.ProtocolMessage, logger *slog.Logger) *attachment {
+// newAttachment derives a cancellable context from parent and returns
+// an attachment ready to be run.
+func newAttachment(parent context.Context, name string, stream *core.Stream, out chan<- *protocol.ProtocolMessage, logger *slog.Logger) *attachment {
+	ctx, cancel := context.WithCancel(parent)
 	return &attachment{
 		channelName: name,
 		stream:      stream,
 		out:         out,
 		logger:      logger,
+		ctx:         ctx,
+		cancel:      cancel,
+		done:        make(chan struct{}),
 	}
 }
 
-// run forwards stream messages to the connection until ctx is
-// cancelled.
-func (a *attachment) run(ctx context.Context) {
-	if !a.send(ctx, &protocol.ProtocolMessage{
+// run forwards stream messages to the connection until the
+// attachment's context is cancelled. done is closed on exit.
+func (a *attachment) run() {
+	defer close(a.done)
+
+	if !a.send(&protocol.ProtocolMessage{
 		Action:        protocol.ActionAttached,
 		Channel:       a.channelName,
 		ChannelSerial: a.stream.ChannelSerial(),
@@ -40,11 +54,11 @@ func (a *attachment) run(ctx context.Context) {
 	}
 
 	for {
-		msg, err := a.stream.Next(ctx)
+		msg, err := a.stream.Next(a.ctx)
 		if err != nil {
 			return
 		}
-		if !a.send(ctx, &protocol.ProtocolMessage{
+		if !a.send(&protocol.ProtocolMessage{
 			Action:        protocol.ActionMessage,
 			Channel:       a.channelName,
 			ChannelSerial: a.stream.ChannelSerial(),
@@ -55,13 +69,22 @@ func (a *attachment) run(ctx context.Context) {
 	}
 }
 
+// stop cancels the attachment and waits for its goroutine to exit, so
+// callers can safely queue a DETACHED frame after stop returns
+// knowing no further MESSAGE frames will arrive on the outbound chan.
+func (a *attachment) stop() {
+	a.cancel()
+	<-a.done
+}
+
 // send pushes a frame onto the connection's outbound chan, blocking
-// under backpressure. Returns false if the context is cancelled.
-func (a *attachment) send(ctx context.Context, msg *protocol.ProtocolMessage) bool {
+// under backpressure. Returns false if the attachment's context is
+// cancelled.
+func (a *attachment) send(msg *protocol.ProtocolMessage) bool {
 	select {
 	case a.out <- msg:
 		return true
-	case <-ctx.Done():
+	case <-a.ctx.Done():
 		return false
 	}
 }

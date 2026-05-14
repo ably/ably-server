@@ -86,6 +86,8 @@ func (c *connection) dispatch(ctx context.Context, msg *protocol.ProtocolMessage
 	switch msg.Action {
 	case protocol.ActionAttach:
 		c.handleAttach(ctx, msg.Channel)
+	case protocol.ActionDetach:
+		c.handleDetach(ctx, msg.Channel)
 	case protocol.ActionMessage:
 		c.handleMessage(ctx, msg)
 	case protocol.ActionClose:
@@ -114,9 +116,28 @@ func (c *connection) handleAttach(ctx context.Context, name string) {
 		return
 	}
 	ch := c.manager.GetChannel(name)
-	a := newAttachment(name, ch.Attach(), c.outbound, c.logger.With("channel", name))
+	a := newAttachment(ctx, name, ch.Attach(), c.outbound, c.logger.With("channel", name))
 	c.attachments[name] = a
-	go a.run(ctx)
+	go a.run()
+}
+
+// handleDetach stops the matching attachment (waiting for its goroutine
+// to exit so no further MESSAGE frames slip past the DETACHED ack) and
+// queues DETACHED. DETACH for a channel with no live attachment is
+// idempotent — we still ack so the client can transition cleanly.
+func (c *connection) handleDetach(ctx context.Context, name string) {
+	if name == "" {
+		c.logger.Warn("DETACH with empty channel name; ignoring")
+		return
+	}
+	if a, ok := c.attachments[name]; ok {
+		a.stop()
+		delete(c.attachments, name)
+	}
+	c.queue(ctx, &protocol.ProtocolMessage{
+		Action:  protocol.ActionDetached,
+		Channel: name,
+	})
 }
 
 // handleMessage publishes the inbound payload to its channel and ACKs
