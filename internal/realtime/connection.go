@@ -88,9 +88,18 @@ func (c *connection) dispatch(ctx context.Context, msg *protocol.ProtocolMessage
 		c.handleAttach(ctx, msg.Channel)
 	case protocol.ActionMessage:
 		c.handleMessage(ctx, msg)
+	case protocol.ActionClose:
+		c.handleClose(ctx)
 	default:
 		c.logger.Debug("received frame", "action", msg.Action.String())
 	}
+}
+
+// handleClose responds to a client-initiated CLOSE with CLOSED. The
+// client then closes its end of the WebSocket, which causes readLoop's
+// ReadMessage to return and the connection to terminate normally.
+func (c *connection) handleClose(ctx context.Context) {
+	c.queue(ctx, &protocol.ProtocolMessage{Action: protocol.ActionClosed})
 }
 
 // handleAttach starts an attachment for name if one does not already

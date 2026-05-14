@@ -547,3 +547,18 @@ func TestPublishCrossesConnections(t *testing.T) {
 		t.Errorf("subscriber payload = %+v, want %+v", got, original)
 	}
 }
+
+func TestCloseReceivesClosed(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+	ws := dial(t, srv, "")
+	drainConnected(t, ws)
+
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action: protocol.ActionClose,
+	})
+
+	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if msg.Action != protocol.ActionClosed {
+		t.Fatalf("Action = %v, want CLOSED", msg.Action)
+	}
+}
