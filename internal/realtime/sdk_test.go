@@ -91,6 +91,53 @@ func TestSDKConnectsAndCloses(t *testing.T) {
 	}
 }
 
+// TestSDKPublishAndSubscribe drives publish/subscribe through the SDK:
+// after attach a Publish should ACK successfully and the message
+// should arrive at a Subscribe handler on the same connection (echo).
+func TestSDKPublishAndSubscribe(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+	client := newSDKClient(t, srv)
+	t.Cleanup(func() { client.Close() })
+
+	connectSDKClient(t, client)
+
+	ch := client.Channels.Get("foo")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := ch.Attach(ctx); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	if state := ch.State(); state != ably.ChannelStateAttached {
+		t.Fatalf("post-Attach state = %v, want ATTACHED", state)
+	}
+
+	received := make(chan *ably.Message, 1)
+	unsubscribe, err := ch.Subscribe(ctx, "greet", func(msg *ably.Message) {
+		received <- msg
+	})
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer unsubscribe()
+
+	if err := ch.Publish(ctx, "greet", "hello"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	select {
+	case msg := <-received:
+		if msg.Name != "greet" {
+			t.Errorf("msg.Name = %q, want %q", msg.Name, "greet")
+		}
+		if msg.Data != "hello" {
+			t.Errorf("msg.Data = %v (%T), want %q", msg.Data, msg.Data, "hello")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for subscribed message")
+	}
+}
+
 // TestSDKAttachAndDetach drives the channel lifecycle through the SDK:
 // Attach should take the channel to ATTACHED and Detach should take it
 // to DETACHED.
