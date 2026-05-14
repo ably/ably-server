@@ -138,6 +138,60 @@ func TestSDKPublishAndSubscribe(t *testing.T) {
 	}
 }
 
+// TestSDKFanout verifies that a message published on a channel by one
+// connected client is delivered to every other subscribed client.
+func TestSDKFanout(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+
+	const n = 3
+	clients := make([]*ably.Realtime, n)
+	received := make([]chan *ably.Message, n)
+	for i := range n {
+		clients[i] = newSDKClient(t, srv)
+		received[i] = make(chan *ably.Message, 1)
+	}
+	t.Cleanup(func() {
+		for _, c := range clients {
+			c.Close()
+		}
+	})
+
+	for _, c := range clients {
+		connectSDKClient(t, c)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	for i, c := range clients {
+		ch := c.Channels.Get("fanout")
+		recv := received[i]
+		if _, err := ch.Subscribe(ctx, "ping", func(msg *ably.Message) {
+			recv <- msg
+		}); err != nil {
+			t.Fatalf("client %d Subscribe: %v", i, err)
+		}
+	}
+
+	if err := clients[0].Channels.Get("fanout").Publish(ctx, "ping", "broadcast"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	for i, recv := range received {
+		select {
+		case msg := <-recv:
+			if msg.Name != "ping" {
+				t.Errorf("client %d msg.Name = %q, want %q", i, msg.Name, "ping")
+			}
+			if msg.Data != "broadcast" {
+				t.Errorf("client %d msg.Data = %v, want %q", i, msg.Data, "broadcast")
+			}
+		case <-time.After(5 * time.Second):
+			t.Errorf("client %d: timeout waiting for message", i)
+		}
+	}
+}
+
 // TestSDKAttachAndDetach drives the channel lifecycle through the SDK:
 // Attach should take the channel to ATTACHED and Detach should take it
 // to DETACHED.
