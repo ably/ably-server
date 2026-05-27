@@ -283,17 +283,19 @@ for {
     select {
     case <-a.e.notify:
         a.e = a.e.next
-        a.forward(a.e.msg) // gated by mode flags
+        a.forward(a.e.cm) // gated by mode flags
     case <-a.ctx.Done():
         return
     }
 }
 ```
 
-`forward` writes a `MESSAGE` `ProtocolMessage` onto the connection's
-outbound queue; the connection's single writer goroutine (§5.2)
-serialises actual frame writes. There is no per-attachment buffered
-fan-out channel: each attachment proceeds at its own pace.
+`forward` writes one `MESSAGE` `ProtocolMessage` per ChannelMessage onto
+the connection's outbound queue, with `ChannelSerial =
+cm.ChannelSerial` and `Messages = cm.Messages`. The connection's single
+writer goroutine (§5.2) serialises actual frame writes. There is no
+per-attachment buffered fan-out channel: each attachment proceeds at
+its own pace.
 
 The starting cursor depends on how the attachment was created:
 
@@ -365,30 +367,41 @@ internal/id/            # connection IDs, message IDs, msgSerial helpers
 A `Channel` is a per-node, per-name structure holding the live message
 list. It has **no goroutine of its own**: concurrency is serialised by a
 mutex around append. Attachments tail the list at their own pace, with no
-fan-out channels and no per-attachment buffering.
+fan-out channels and no per-attachment buffering. Each list entry is one
+ChannelMessage (§8) — an atomic publish carrying one or more Messages.
 
 ```go
 type entry struct {
-    msg    *Message
-    notify chan struct{} // closed once next is set
+    cm     *ChannelMessage  // one atomic publish
+    notify chan struct{}    // closed once next is set
     next   *entry
 }
 
 type Channel struct {
     name string
+    gen  *serial.Generator  // mints channelSerials for this channel
 
     mu   sync.Mutex
-    tail *entry           // most recent entry
+    tail *entry             // most recent entry
 }
 
-func (c *Channel) Append(msg *Message) {
+// Append publishes one atomic batch as a single ChannelMessage. The
+// caller passes raw Messages; Channel mints the channelSerial, stamps
+// each msg.Serial = "<channelSerial>:<idx>", and links the resulting
+// ChannelMessage as a single entry.
+func (c *Channel) Append(msgs ...*Message) {
     c.mu.Lock()
     defer c.mu.Unlock()
-    e := &entry{msg: msg, notify: make(chan struct{})}
-    if c.tail != nil {
-        c.tail.next = e
-        close(c.tail.notify) // wake all attachments parked on the prior tail
+    channelSerial := c.gen.Mint()
+    for i, m := range msgs {
+        m.Serial = serial.MessageSerial(channelSerial, i)
     }
+    e := &entry{
+        cm:     &ChannelMessage{ChannelSerial: channelSerial, Messages: msgs},
+        notify: make(chan struct{}),
+    }
+    c.tail.next = e
+    close(c.tail.notify)
     c.tail = e
 }
 
@@ -428,7 +441,8 @@ Each WebSocket connection has:
 - An `attachments map[string]*Attachment` keyed by channel name.
 
 Inbound `MESSAGE` is routed to the matching attachment, which
-authorises the publish, persists via `Storage.AppendMessages` (or, in
+authorises the publish, builds a ChannelMessage from the inbound
+`messages[]`, persists via `Storage.AppendChannelMessage` (or, in
 cluster mode, lets the Postgres `INSERT` + `NOTIFY` round-trip do the
 local append), and replies with `ACK` / `NACK`. Inbound `ATTACH` /
 `DETACH` are handled by the connection itself, calling into
@@ -443,7 +457,7 @@ type Storage interface {
 }
 
 type ChannelStore interface {
-    AppendMessages(ctx context.Context, msgs []core.Message) error
+    AppendChannelMessage(ctx context.Context, cm *protocol.ChannelMessage) error
     History(ctx context.Context, q HistoryQuery) (HistoryPage, error)
 }
 ```
@@ -463,16 +477,17 @@ layer's schema to the Postgres cluster backend.
 Layout:
 
 - One top-level bucket per channel, named `ch/<channel-name>`.
-- Inside each channel bucket, a `messages` sub-bucket keyed by the
-  message's channel serial (see §8 — a lexicographically-sortable
-  string of the form `<timestamp>-<counter>@<seriesId>:<idx>`), so
-  bbolt's natural byte-order iteration yields messages in publish
-  order. Values are the encoded `protocol.Message` blob (msgpack).
+- Inside each channel bucket, a `messages` sub-bucket keyed by
+  `channelSerial` (see §8 — the atomic-publish identifier
+  `<timestamp>-<counter>@<seriesId>`). Values are the encoded
+  `protocol.ChannelMessage` blob (msgpack), which carries the channel
+  serial and the slice of contained messages. bbolt's natural
+  byte-order iteration yields ChannelMessages in publish order.
 - An `ids` sub-bucket maps `Message.id` (client-supplied idempotency
-  key) to the `serial` it was assigned, so a repeat publish within the
-  retention window can short-circuit and return the original serial
-  without re-appending. Entries are dropped by the same sweep that
-  trims `messages` past TTL — idempotency is bounded by message
+  key) to the `channelSerial` it landed in, so a repeat publish within
+  the retention window can short-circuit and return the original
+  serial without re-appending. Entries are dropped by the same sweep
+  that trims `messages` past TTL — idempotency is bounded by message
   retention.
 - A `meta` sub-bucket holds the channel's last-issued
   `(timestamp, counter)` pair so a fresh process resumes serial
@@ -480,9 +495,10 @@ Layout:
 
 Retention is enforced by a background sweep goroutine that, per
 channel, walks the ordered `messages` keys from oldest forward and
-deletes anything past the message TTL or beyond the per-channel cap.
-Because keys are serial-ordered and writes are append-only, the sweep
-stops at the first non-expired key per channel.
+deletes anything past the message TTL or beyond the per-channel cap
+(the cap counts ChannelMessages, since each is the unit of an atomic
+publish). Because keys are serial-ordered and writes are append-only,
+the sweep stops at the first non-expired key per channel.
 
 bbolt has no native TTL, no secondary indexes, and a single-writer
 model — all of which suit this use case: short-lived data, one writer
@@ -508,25 +524,38 @@ CREATE TABLE channels (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE messages (
-  channel    TEXT        NOT NULL,
-  serial     TEXT        NOT NULL,        -- "<ts>-<ctr>@<series>:<idx>" (§8)
-  id         TEXT,                        -- client-supplied idempotency key
-  client_id  TEXT,
-  conn_id    TEXT,
-  name       TEXT,
-  data       BYTEA,
-  encoding   TEXT,
-  extras     JSONB,
-  timestamp  TIMESTAMPTZ NOT NULL,
-  PRIMARY KEY (channel, serial)
+-- One row per atomic publish (the ChannelMessage unit, §5/§8).
+CREATE TABLE channel_messages (
+  channel        TEXT        NOT NULL,
+  channel_serial TEXT        NOT NULL,    -- "<ts>-<ctr>@<series>" (§8)
+  timestamp      TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (channel, channel_serial)
 );
-CREATE INDEX ON messages (channel, timestamp DESC);
+CREATE INDEX ON channel_messages (channel, timestamp DESC);
+
+-- One row per individual Message within a ChannelMessage.
+CREATE TABLE messages (
+  channel        TEXT NOT NULL,
+  channel_serial TEXT NOT NULL,           -- FK → channel_messages
+  idx            INT  NOT NULL,           -- position within the batch
+  id             TEXT,                    -- client-supplied idempotency key
+  client_id      TEXT,
+  conn_id        TEXT,
+  name           TEXT,
+  data           BYTEA,
+  encoding       TEXT,
+  extras         JSONB,
+  PRIMARY KEY (channel, channel_serial, idx),
+  FOREIGN KEY (channel, channel_serial)
+    REFERENCES channel_messages (channel, channel_serial) ON DELETE CASCADE
+);
 CREATE UNIQUE INDEX ON messages (channel, id) WHERE id IS NOT NULL;
 ```
 
-Retention is enforced by a periodic background job (delete by `timestamp <
-now() - ttl`) plus a per-channel `max_messages` cap.
+Retention is enforced by a periodic background job that deletes rows
+from `channel_messages` where `timestamp < now() - ttl` (the
+`messages` rows cascade), plus a per-channel cap counted in
+ChannelMessages.
 
 The default message TTL is **2 minutes**, matching Ably cloud's default;
 both the TTL and the per-channel message cap are configurable (see §9).
@@ -546,13 +575,16 @@ directly.
 There is no pub/sub abstraction. A publish is a direct sequence:
 
 1. Authorise.
-2. If the publish carries a client-supplied `Message.id`, look it up
-   in storage for this channel; on hit, return the stored `serial`
-   and stop.
-3. Mint the canonical channel serial (§8 timeserial) for the publish.
-4. `Storage.AppendMessages` — persists with that serial (and the
-   `id`, if any, in the channel's idempotency index).
-5. `channel.Append(msg)` on the in-process Channel.
+2. If any message in the publish carries a client-supplied
+   `Message.id`, look it up in storage for this channel; on hit,
+   return the stored `channelSerial` and stop.
+3. Mint a single `channelSerial` (§8) for the publish, then build a
+   `ChannelMessage{channelSerial, messages}` stamping each contained
+   `Message.serial = channelSerial + ":" + idx`.
+4. `Storage.AppendChannelMessage` — persists the ChannelMessage as
+   one unit and indexes any contained `Message.id` against the
+   channelSerial.
+5. `channel.Append(channelMessage)` on the in-process Channel.
 
 All attachments are on the same node and tail the same list.
 
@@ -595,12 +627,19 @@ fork.
   `ACK`/`NACK` so the SDK can address publish acknowledgements. Distinct
   from `channelSerial` below — this is the wire field for publish flow
   control, not the canonical message ordering identifier.
-- **channelSerial** (canonical timeserial): a lexicographically-sortable
-  string assigned by the server when a publish lands on a channel,
-  modelled on Ably cloud's internal format:
+- **ChannelMessage**: the atomic unit of a publish — one inbound
+  REST request, or one `MESSAGE` frame carrying `messages[]`, lands
+  on a channel as exactly one ChannelMessage containing one or more
+  contained Messages. It is also the unit subscribers observe on the
+  wire (one outbound `MESSAGE` frame per ChannelMessage) and the
+  unit storage persists.
+- **channelSerial** (atomic-publish identifier): a
+  lexicographically-sortable string assigned by the server when a
+  ChannelMessage lands on a channel, modelled on Ably cloud's
+  internal format:
 
   ```
-  <timestamp>-<counter>@<seriesId>:<idx>
+  <timestamp>-<counter>@<seriesId>
   ```
 
   - `timestamp` — current wall-clock time in milliseconds, zero-padded
@@ -611,33 +650,38 @@ fork.
   - `seriesId` — a fixed-length random string generated at process
     start; disambiguates serials minted in the same millisecond on
     different nodes in cluster mode.
-  - `idx` — zero-padded 3-digit index within an atomic publish; all
-    messages in a single REST publish (or one `MESSAGE` frame carrying
-    `messages[]`) share the same `<ts>-<ctr>@<series>` prefix and
-    differ only by `idx`.
 
-  On `ATTACHED` it carries the **confirmed attach point** — the serial
-  from which the client's subscription begins. On each subsequent
-  `MESSAGE`, the serial of that message. The client retains the most
-  recent serial it has seen and sends it back on a future `ATTACH` to
-  request continuation from that point (see §4.3).
+  channelSerials are the discrete attach/resume points in a channel's
+  stream. On `ATTACHED` the wire field carries the confirmed attach
+  point — the channelSerial from which the client's subscription
+  begins. On each subsequent outbound `MESSAGE` frame, it carries the
+  channelSerial of the ChannelMessage being delivered. The client
+  retains the most recent channelSerial it has seen and sends it back
+  on a future `ATTACH` to request continuation from that point (see
+  §4.3).
 
-  Lexicographic comparison of serials matches publish order, which lets
-  the disk backend (bbolt) and cluster backend (Postgres) use the
-  serial directly as the primary key without a separate ordering
-  column.
-- **Message.serial**: the server-assigned timeserial for an individual
-  message — same format as `channelSerial` above (`<ts>-<ctr>@<series>:<idx>`
-  with the message's own `idx`). The `channelSerial` carried on an
-  outbound `MESSAGE` frame is the `Message.serial` of the message it
-  delivers.
+  Lexicographic comparison of channelSerials matches publish order,
+  which lets the disk backend (bbolt) and cluster backend (Postgres)
+  use channelSerial directly as the primary key without a separate
+  ordering column.
+- **Message.serial**: the server-assigned identifier for an
+  individual message within a ChannelMessage:
+
+  ```
+  <channelSerial>:<idx>
+  ```
+
+  where `idx` is a zero-padded 3-digit position within the
+  ChannelMessage (`000` for a single-message publish). All messages
+  in a batch share the channelSerial prefix and differ only by `idx`.
 - **Message.id**: optional, **client-supplied** identifier used for
   idempotent publishing. If present, the server enforces uniqueness
   per channel within the message retention window: a second publish
-  carrying an `id` already seen on that channel returns the original
-  publish's `serial` and is *not* re-appended. If absent, the server
-  treats every publish as new. `id` is opaque to the server — clients
-  typically use a UUID or a deterministic hash of payload + intent.
+  whose ChannelMessage contains an `id` already seen on this channel
+  returns the original publish's `channelSerial` and is *not*
+  re-appended. If absent, the server treats every publish as new.
+  `id` is opaque to the server — clients typically use a UUID or a
+  deterministic hash of payload + intent.
 
 Replay on `ATTACH` is a bounded history read from storage between the
 client-supplied `channelSerial` and the channel's current head, streamed
