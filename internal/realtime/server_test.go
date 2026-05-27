@@ -3,6 +3,7 @@ package realtime
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -29,13 +30,13 @@ func newTestServer(t *testing.T, hb time.Duration) (*httptest.Server, *core.Mana
 	if err != nil {
 		t.Fatalf("parse api key: %v", err)
 	}
-	rt := NewServer(Config{
-		Key:               parsed,
-		HeartbeatInterval: hb,
-	})
-	srv := httptest.NewServer(rt)
+	manager := core.NewManager()
+	rt := NewServer(parsed, manager, hb, slog.New(slog.DiscardHandler))
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", rt.HandleWebSocket)
+	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return srv, rt.Manager()
+	return srv, manager
 }
 
 // dial connects a WebSocket client to srv with the test key included as

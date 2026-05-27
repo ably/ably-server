@@ -18,7 +18,9 @@ import (
 	"time"
 
 	"github.com/ably/ably-server/internal/auth"
+	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/realtime"
+	"github.com/ably/ably-server/internal/rest"
 )
 
 const apiKeyEnv = "ABLY_SERVER_API_KEY"
@@ -56,14 +58,19 @@ func run(ctx context.Context, args []string, getenv func(string) string, out io.
 		return 1
 	}
 
-	rt := realtime.NewServer(realtime.Config{
-		Key:               parsedKey,
-		HeartbeatInterval: *hbInterval,
-		Logger:            logger,
-	})
+	manager := core.NewManager()
+	rt := realtime.NewServer(parsedKey, manager, *hbInterval, logger)
+	rs := rest.NewServer(parsedKey, manager, logger)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", rt.HandleWebSocket)
+	mux.HandleFunc("POST /channels/{name}/messages", rs.HandlePublish)
+	mux.HandleFunc("GET /time", rs.HandleTime)
+	mux.HandleFunc("GET /healthz", rs.HandleHealthz)
+	mux.HandleFunc("GET /readyz", rs.HandleReadyz)
 
 	srv := &http.Server{
-		Handler:           rt,
+		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
