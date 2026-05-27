@@ -40,8 +40,10 @@ func newAttachment(parent context.Context, name string, stream *core.Stream, out
 	}
 }
 
-// run forwards stream messages to the connection until the
-// attachment's context is cancelled. done is closed on exit.
+// run forwards stream ChannelMessages to the connection until the
+// attachment's context is cancelled. done is closed on exit. One
+// MESSAGE frame is emitted per ChannelMessage, carrying the whole
+// batch in Messages[] under the batch's ChannelSerial.
 func (a *attachment) run() {
 	defer close(a.done)
 
@@ -54,15 +56,15 @@ func (a *attachment) run() {
 	}
 
 	for {
-		msg, err := a.stream.Next(a.ctx)
+		cm, err := a.stream.Next(a.ctx)
 		if err != nil {
 			return
 		}
 		if !a.send(&protocol.ProtocolMessage{
 			Action:        protocol.ActionMessage,
 			Channel:       a.channelName,
-			ChannelSerial: a.stream.ChannelSerial(),
-			Messages:      []*protocol.Message{msg},
+			ChannelSerial: cm.ChannelSerial,
+			Messages:      cm.Messages,
 		}) {
 			return
 		}

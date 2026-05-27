@@ -1,14 +1,16 @@
 package protocol
 
-// Message is a published message payload — the unit of pub/sub on a
-// channel.
+// Message is a published message payload — one Message within a
+// ChannelMessage atomic publish (see DESIGN.md §8).
 //
-// ID and Serial are *not* the same identifier (see DESIGN.md §8):
+// ID and Serial are distinct identifiers:
 //   - ID is client-supplied and optional; it carries idempotency intent
 //     so the server can reject duplicate publishes within the retention
 //     window.
-//   - Serial is server-assigned on publish and is the canonical channel
-//     ordering identifier (`<ts>-<ctr>@<series>:<idx>`).
+//   - Serial is server-assigned on publish in the form
+//     `<channelSerial>:<idx>`, where channelSerial is the containing
+//     ChannelMessage's serial and idx is this Message's position
+//     within that batch.
 type Message struct {
 	ID           string `json:"id,omitempty"           msgpack:"id,omitempty"`
 	Serial       string `json:"serial,omitempty"       msgpack:"serial,omitempty"`
@@ -18,6 +20,19 @@ type Message struct {
 	Data         any    `json:"data,omitempty"         msgpack:"data,omitempty"`
 	Encoding     string `json:"encoding,omitempty"     msgpack:"encoding,omitempty"`
 	Timestamp    int64  `json:"timestamp,omitempty"    msgpack:"timestamp,omitempty"`
+}
+
+// ChannelMessage is one atomic publish on a channel: a server-assigned
+// channelSerial (the discrete attach/resume point in the channel's
+// stream) plus the one or more Messages published in that batch.
+//
+// One publish (REST request or inbound MESSAGE frame) maps to exactly
+// one ChannelMessage; subscribers receive ChannelMessages as the
+// atomic delivery unit (one outbound MESSAGE frame per ChannelMessage).
+// Storage persists ChannelMessages keyed by ChannelSerial.
+type ChannelMessage struct {
+	ChannelSerial string     `json:"channelSerial,omitempty" msgpack:"channelSerial,omitempty"`
+	Messages      []*Message `json:"messages,omitempty"      msgpack:"messages,omitempty"`
 }
 
 // ProtocolMessage is one frame on the realtime WebSocket connection.

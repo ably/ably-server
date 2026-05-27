@@ -10,19 +10,20 @@ import (
 	"github.com/ably/ably-server/internal/serial"
 )
 
-// entry is a node in a Channel's linked list of published messages.
-// Streams tail the list at their own pace; entry.notify is closed once
+// entry is a node in a Channel's linked list of ChannelMessages. Each
+// entry is one atomic publish carrying one or more Messages. Streams
+// tail the list at their own pace; entry.notify is closed once
 // entry.next has been set, which wakes all parked streams. The list is
 // grow-only — older entries become eligible for GC once no stream
 // retains a reference.
 type entry struct {
-	msg    *protocol.Message
+	cm     *protocol.ChannelMessage
 	notify chan struct{}
 	next   *entry
 }
 
-// Channel holds the live message list for one channel name. It owns
-// no goroutine; concurrency is serialised by mu around append.
+// Channel holds the live ChannelMessage list for one channel name. It
+// owns no goroutine; concurrency is serialised by mu around append.
 type Channel struct {
 	name string
 	gen  *serial.Generator
@@ -32,7 +33,7 @@ type Channel struct {
 }
 
 // newChannel constructs a Channel. The list starts with a sentinel
-// entry (no msg) so Attach is safe before any Append.
+// entry (no ChannelMessage) so Attach is safe before any Append.
 func newChannel(name string, gen *serial.Generator) *Channel {
 	return &Channel{
 		name: name,
@@ -46,14 +47,12 @@ func (c *Channel) Name() string {
 	return c.name
 }
 
-// Append publishes one or more messages to the channel as a single
-// atomic publish: all messages share one `<ts>-<ctr>@<series>` serial
-// prefix and differ only by their `:idx` suffix. Each message's
-// Serial field is stamped in place. Streams parked on the previous
-// tail wake on the first appended entry and walk forward through
-// the rest.
+// Append publishes one atomic batch: it mints a single channelSerial,
+// stamps each contained Message.Serial = "<channelSerial>:<idx>", and
+// links the resulting ChannelMessage as a single entry. Streams
+// parked on the previous tail wake when the new entry is linked.
 //
-// A no-op when called with no arguments.
+// A no-op when called with no messages.
 func (c *Channel) Append(msgs ...*protocol.Message) {
 	if len(msgs) == 0 {
 		return
@@ -61,18 +60,21 @@ func (c *Channel) Append(msgs ...*protocol.Message) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	serials := c.gen.Batch(len(msgs))
+	channelSerial := c.gen.Mint()
 	for i, m := range msgs {
-		m.Serial = serials[i]
-		e := &entry{msg: m, notify: make(chan struct{})}
-		c.tail.next = e
-		close(c.tail.notify)
-		c.tail = e
+		m.Serial = serial.MessageSerial(channelSerial, i)
 	}
+	e := &entry{
+		cm:     &protocol.ChannelMessage{ChannelSerial: channelSerial, Messages: msgs},
+		notify: make(chan struct{}),
+	}
+	c.tail.next = e
+	close(c.tail.notify)
+	c.tail = e
 }
 
 // Attach returns a Stream positioned at the current tail. The Stream's
-// first Next call blocks until the next message is appended.
+// first Next call blocks until the next ChannelMessage is appended.
 func (c *Channel) Attach() *Stream {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -86,24 +88,25 @@ type Stream struct {
 	cursor *entry
 }
 
-// ChannelSerial returns the cursor's current position in wire form —
-// the serial of the last delivered message, or an empty string if the
-// stream is parked at the sentinel (no message delivered yet).
+// ChannelSerial returns the cursor's current position — the
+// channelSerial of the last delivered ChannelMessage, or an empty
+// string if the stream is parked at the sentinel (no ChannelMessage
+// delivered yet).
 func (s *Stream) ChannelSerial() string {
-	if s.cursor.msg == nil {
+	if s.cursor.cm == nil {
 		return ""
 	}
-	return s.cursor.msg.Serial
+	return s.cursor.cm.ChannelSerial
 }
 
-// Next blocks until the next message is available, advances the cursor
-// to that entry, and returns the message. Returns ctx.Err() if the
-// context is cancelled.
-func (s *Stream) Next(ctx context.Context) (*protocol.Message, error) {
+// Next blocks until the next ChannelMessage is available, advances
+// the cursor to that entry, and returns the ChannelMessage. Returns
+// ctx.Err() if the context is cancelled.
+func (s *Stream) Next(ctx context.Context) (*protocol.ChannelMessage, error) {
 	select {
 	case <-s.cursor.notify:
 		s.cursor = s.cursor.next
-		return s.cursor.msg, nil
+		return s.cursor.cm, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}

@@ -41,12 +41,14 @@ func TestChannelAppendBuildsList(t *testing.T) {
 	head := c.tail // sentinel; notify open, next nil
 
 	msgs := []*protocol.Message{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}}
+	// Each Append is its own publish — one ChannelMessage per call.
 	for _, m := range msgs {
 		c.Append(m)
 	}
 
-	// Walk forward from the sentinel; verify each msg in order and that
-	// every message has a non-empty, monotonically-ordered Serial.
+	// Walk forward from the sentinel; verify each ChannelMessage in
+	// order and that every channelSerial is non-empty and
+	// monotonically ordered.
 	e := head
 	prev := ""
 	for i, want := range msgs {
@@ -57,16 +59,22 @@ func TestChannelAppendBuildsList(t *testing.T) {
 			t.Fatalf("entry %d: next is nil", i)
 		}
 		e = e.next
-		if e.msg.ID != want.ID {
-			t.Fatalf("entry %d: msg.ID = %q, want %q", i, e.msg.ID, want.ID)
+		if e.cm == nil {
+			t.Fatalf("entry %d: cm is nil", i)
 		}
-		if e.msg.Serial == "" {
-			t.Fatalf("entry %d: msg.Serial is empty", i)
+		if len(e.cm.Messages) != 1 {
+			t.Fatalf("entry %d: Messages length = %d, want 1", i, len(e.cm.Messages))
 		}
-		if e.msg.Serial <= prev {
-			t.Fatalf("entry %d: serial %q not greater than previous %q", i, e.msg.Serial, prev)
+		if e.cm.Messages[0].ID != want.ID {
+			t.Fatalf("entry %d: msg.ID = %q, want %q", i, e.cm.Messages[0].ID, want.ID)
 		}
-		prev = e.msg.Serial
+		if e.cm.ChannelSerial == "" {
+			t.Fatalf("entry %d: ChannelSerial is empty", i)
+		}
+		if e.cm.ChannelSerial <= prev {
+			t.Fatalf("entry %d: channelSerial %q not greater than previous %q", i, e.cm.ChannelSerial, prev)
+		}
+		prev = e.cm.ChannelSerial
 	}
 
 	// The final entry's notify is still open — no successor yet.
@@ -75,30 +83,45 @@ func TestChannelAppendBuildsList(t *testing.T) {
 	}
 }
 
-func TestChannelAppendStampsSerialOnMessage(t *testing.T) {
+func TestChannelAppendStampsChannelSerialAndMessageSerial(t *testing.T) {
 	c := newTestChannel("test")
 	m := &protocol.Message{ID: "m1"}
 	c.Append(m)
-	if m.Serial != "00000000001000-000@testseries0:000" {
-		t.Errorf("m.Serial = %q, want %q", m.Serial, "00000000001000-000@testseries0:000")
+
+	tail := c.tail
+	wantCS := "00000000001000-000@testseries0"
+	if tail.cm.ChannelSerial != wantCS {
+		t.Errorf("ChannelSerial = %q, want %q", tail.cm.ChannelSerial, wantCS)
+	}
+	wantMS := "00000000001000-000@testseries0:000"
+	if m.Serial != wantMS {
+		t.Errorf("m.Serial = %q, want %q", m.Serial, wantMS)
 	}
 }
 
-func TestChannelAppendBatchSharesPrefix(t *testing.T) {
+func TestChannelAppendBatchSharesChannelSerial(t *testing.T) {
 	c := newTestChannel("test")
 	a := &protocol.Message{ID: "a"}
 	b := &protocol.Message{ID: "b"}
 	d := &protocol.Message{ID: "d"}
 	c.Append(a, b, d)
 
-	want := []string{
+	wantCS := "00000000001000-000@testseries0"
+	if c.tail.cm.ChannelSerial != wantCS {
+		t.Errorf("ChannelSerial = %q, want %q", c.tail.cm.ChannelSerial, wantCS)
+	}
+	if len(c.tail.cm.Messages) != 3 {
+		t.Fatalf("Messages length = %d, want 3", len(c.tail.cm.Messages))
+	}
+
+	wantSerials := []string{
 		"00000000001000-000@testseries0:000",
 		"00000000001000-000@testseries0:001",
 		"00000000001000-000@testseries0:002",
 	}
 	for i, m := range []*protocol.Message{a, b, d} {
-		if m.Serial != want[i] {
-			t.Errorf("msg %d Serial = %q, want %q", i, m.Serial, want[i])
+		if m.Serial != wantSerials[i] {
+			t.Errorf("msg %d Serial = %q, want %q", i, m.Serial, wantSerials[i])
 		}
 	}
 }
@@ -120,8 +143,8 @@ func TestChannelNotifyWakesWaiter(t *testing.T) {
 		if e == nil {
 			t.Fatal("waiter woke with nil next")
 		}
-		if e.msg.ID != "m1" {
-			t.Fatalf("waiter saw msg.ID = %q, want %q", e.msg.ID, "m1")
+		if e.cm.Messages[0].ID != "m1" {
+			t.Fatalf("waiter saw msg.ID = %q, want %q", e.cm.Messages[0].ID, "m1")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("waiter did not wake within 1s")
@@ -172,7 +195,8 @@ func TestChannelAppendIsConcurrentSafe(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Walk the list from the sentinel; every Append must be reachable.
+	// Walk the list from the sentinel; every Append must be reachable
+	// as one ChannelMessage entry.
 	count := 0
 	for e := head; e.next != nil; e = e.next {
 		count++
@@ -187,34 +211,37 @@ func TestStreamAttachOnEmptyChannelBlocksUntilAppend(t *testing.T) {
 	s := c.Attach()
 
 	if got := s.ChannelSerial(); got != "" {
-		t.Errorf("initial ChannelSerial = %q, want empty (no message delivered yet)", got)
+		t.Errorf("initial ChannelSerial = %q, want empty (no ChannelMessage delivered yet)", got)
 	}
 
-	got := make(chan *protocol.Message, 1)
+	got := make(chan *protocol.ChannelMessage, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		m, err := s.Next(ctx)
+		cm, err := s.Next(ctx)
 		if err != nil {
 			t.Errorf("Next: %v", err)
 			return
 		}
-		got <- m
+		got <- cm
 	}()
 
 	c.Append(&protocol.Message{ID: "m1"})
 
 	select {
-	case m := <-got:
-		if m.ID != "m1" {
-			t.Errorf("Next msg.ID = %q, want %q", m.ID, "m1")
+	case cm := <-got:
+		if len(cm.Messages) != 1 {
+			t.Fatalf("delivered Messages length = %d, want 1", len(cm.Messages))
+		}
+		if cm.Messages[0].ID != "m1" {
+			t.Errorf("Next msg.ID = %q, want %q", cm.Messages[0].ID, "m1")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Next did not return within 1s")
 	}
 
 	if got := s.ChannelSerial(); got == "" {
-		t.Error("post-Next ChannelSerial is empty; want the delivered message's serial")
+		t.Error("post-Next ChannelSerial is empty; want the delivered ChannelMessage's channelSerial")
 	}
 }
 
@@ -226,7 +253,7 @@ func TestStreamAttachAfterAppendsParksAtTail(t *testing.T) {
 	s := c.Attach()
 	atTail := s.ChannelSerial()
 	if atTail == "" {
-		t.Fatal("ChannelSerial after appends is empty; want the tail message's serial")
+		t.Fatal("ChannelSerial after appends is empty; want the tail ChannelMessage's channelSerial")
 	}
 
 	// Attaching at the tail means Next blocks until a fresh append.
@@ -241,15 +268,15 @@ func TestStreamAttachAfterAppendsParksAtTail(t *testing.T) {
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
 	defer cancel2()
-	m, err := s.Next(ctx2)
+	cm, err := s.Next(ctx2)
 	if err != nil {
 		t.Fatalf("Next: %v", err)
 	}
-	if m.ID != "m3" {
-		t.Errorf("msg.ID = %q, want %q", m.ID, "m3")
+	if cm.Messages[0].ID != "m3" {
+		t.Errorf("msg.ID = %q, want %q", cm.Messages[0].ID, "m3")
 	}
 	if got := s.ChannelSerial(); got == "" || got <= atTail {
-		t.Errorf("ChannelSerial after Next = %q, want a serial greater than %q", got, atTail)
+		t.Errorf("ChannelSerial after Next = %q, want a channelSerial greater than %q", got, atTail)
 	}
 }
 
@@ -262,5 +289,41 @@ func TestStreamNextRespectsContext(t *testing.T) {
 
 	if _, err := s.Next(ctx); err == nil {
 		t.Fatal("Next returned nil error after ctx cancellation")
+	}
+}
+
+func TestStreamNextReturnsAtomicBatchAsOneChannelMessage(t *testing.T) {
+	c := newTestChannel("test")
+	s := c.Attach()
+
+	// One Append with 3 messages is one ChannelMessage delivered as a
+	// single Next return.
+	go c.Append(
+		&protocol.Message{ID: "a"},
+		&protocol.Message{ID: "b"},
+		&protocol.Message{ID: "c"},
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	cm, err := s.Next(ctx)
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if len(cm.Messages) != 3 {
+		t.Fatalf("Messages length = %d, want 3", len(cm.Messages))
+	}
+	for i, want := range []string{"a", "b", "c"} {
+		if cm.Messages[i].ID != want {
+			t.Errorf("msg %d ID = %q, want %q", i, cm.Messages[i].ID, want)
+		}
+	}
+
+	// A subsequent Next should park (no more entries until the next
+	// Append).
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel2()
+	if _, err := s.Next(ctx2); err == nil {
+		t.Fatal("Next returned without a fresh Append; expected ctx error")
 	}
 }

@@ -35,53 +35,35 @@ func TestNewSeriesIDIsRandom(t *testing.T) {
 	}
 }
 
-func TestBatchSingleMessageFormat(t *testing.T) {
+func TestMintFormat(t *testing.T) {
 	g := NewGenerator("abcdefghij", fixedClock(1726585978590))
-	out := g.Batch(1)
-	if len(out) != 1 {
-		t.Fatalf("len = %d, want 1", len(out))
-	}
-	want := "01726585978590-000@abcdefghij:000"
-	if out[0] != want {
-		t.Errorf("got %q, want %q", out[0], want)
+	got := g.Mint()
+	want := "01726585978590-000@abcdefghij"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
-func TestBatchAtomicShareTimestampCounterSeries(t *testing.T) {
+func TestMintSameMillisecondAdvancesCounter(t *testing.T) {
 	g := NewGenerator("abcdefghij", fixedClock(1726585978590))
-	out := g.Batch(3)
-	if len(out) != 3 {
-		t.Fatalf("len = %d, want 3", len(out))
+	first := g.Mint()
+	second := g.Mint()
+	if !strings.HasSuffix(first, "-000@abcdefghij") {
+		t.Errorf("first = %q, want suffix -000@abcdefghij", first)
 	}
-	prefix := "01726585978590-000@abcdefghij"
-	for i, s := range out {
-		want := prefix + ":" + []string{"000", "001", "002"}[i]
-		if s != want {
-			t.Errorf("[%d] = %q, want %q", i, s, want)
-		}
+	if !strings.HasSuffix(second, "-001@abcdefghij") {
+		t.Errorf("second = %q, want suffix -001@abcdefghij", second)
 	}
 }
 
-func TestBatchSameMillisecondAdvancesCounter(t *testing.T) {
-	g := NewGenerator("abcdefghij", fixedClock(1726585978590))
-	first := g.Batch(1)[0]
-	second := g.Batch(1)[0]
-	if !strings.HasSuffix(first, "-000@abcdefghij:000") {
-		t.Errorf("first = %q, want suffix -000@abcdefghij:000", first)
-	}
-	if !strings.HasSuffix(second, "-001@abcdefghij:000") {
-		t.Errorf("second = %q, want suffix -001@abcdefghij:000", second)
-	}
-}
-
-func TestBatchNewMillisecondResetsCounter(t *testing.T) {
+func TestMintNewMillisecondResetsCounter(t *testing.T) {
 	g := NewGenerator("abcdefghij", stepClock(1000))
-	a := g.Batch(1)[0]
-	b := g.Batch(1)[0]
-	if !strings.HasSuffix(a, "-000@abcdefghij:000") {
+	a := g.Mint()
+	b := g.Mint()
+	if !strings.HasSuffix(a, "-000@abcdefghij") {
 		t.Errorf("a = %q, want counter 000", a)
 	}
-	if !strings.HasSuffix(b, "-000@abcdefghij:000") {
+	if !strings.HasSuffix(b, "-000@abcdefghij") {
 		t.Errorf("b = %q, want counter 000", b)
 	}
 	if a >= b {
@@ -89,36 +71,36 @@ func TestBatchNewMillisecondResetsCounter(t *testing.T) {
 	}
 }
 
-func TestBatchCounterCarriesWhenExhausted(t *testing.T) {
+func TestMintCounterCarriesWhenExhausted(t *testing.T) {
 	g := NewGenerator("abcdefghij", fixedClock(1000))
 	for range maxCounter + 1 {
-		g.Batch(1)
+		g.Mint()
 	}
 	// One more should overflow the counter and advance the synthetic
 	// timestamp.
-	over := g.Batch(1)[0]
-	want := "00000000001001-000@abcdefghij:000"
+	over := g.Mint()
+	want := "00000000001001-000@abcdefghij"
 	if over != want {
 		t.Errorf("got %q, want %q", over, want)
 	}
 }
 
-func TestBatchClockRegressionStaysMonotonic(t *testing.T) {
+func TestMintClockRegressionStaysMonotonic(t *testing.T) {
 	ts := int64(2000)
 	g := NewGenerator("abcdefghij", func() int64 { return ts })
-	a := g.Batch(1)[0]
+	a := g.Mint()
 	ts = 1000 // clock went backwards
-	b := g.Batch(1)[0]
+	b := g.Mint()
 	if a >= b {
 		t.Errorf("monotonicity broken under clock regression: a=%q b=%q", a, b)
 	}
 }
 
-func TestBatchLexicographicOrderingMatchesPublishOrder(t *testing.T) {
+func TestMintLexicographicOrderingMatchesPublishOrder(t *testing.T) {
 	g := NewGenerator("abcdefghij", stepClock(5000))
 	prev := ""
 	for range 50 {
-		got := g.Batch(1)[0]
+		got := g.Mint()
 		if got <= prev {
 			t.Fatalf("not monotonic: %q <= %q", got, prev)
 		}
@@ -126,17 +108,7 @@ func TestBatchLexicographicOrderingMatchesPublishOrder(t *testing.T) {
 	}
 }
 
-func TestBatchNegativeOrZero(t *testing.T) {
-	g := NewGenerator("abcdefghij", fixedClock(1000))
-	if out := g.Batch(0); out != nil {
-		t.Errorf("Batch(0) = %v, want nil", out)
-	}
-	if out := g.Batch(-3); out != nil {
-		t.Errorf("Batch(-3) = %v, want nil", out)
-	}
-}
-
-func TestBatchIsConcurrentSafe(t *testing.T) {
+func TestMintIsConcurrentSafe(t *testing.T) {
 	g := NewGenerator("abcdefghij", stepClock(10000))
 	const workers = 20
 	const perWorker = 50
@@ -148,13 +120,44 @@ func TestBatchIsConcurrentSafe(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range perWorker {
-				out := g.Batch(1)
-				if _, dup := seen.LoadOrStore(out[0], struct{}{}); dup {
-					t.Errorf("duplicate serial: %q", out[0])
+				got := g.Mint()
+				if _, dup := seen.LoadOrStore(got, struct{}{}); dup {
+					t.Errorf("duplicate channelSerial: %q", got)
 					return
 				}
 			}
 		}()
 	}
 	wg.Wait()
+}
+
+func TestMessageSerial(t *testing.T) {
+	cs := "01726585978590-000@abcdefghij"
+	cases := []struct {
+		idx  int
+		want string
+	}{
+		{0, "01726585978590-000@abcdefghij:000"},
+		{5, "01726585978590-000@abcdefghij:005"},
+		{42, "01726585978590-000@abcdefghij:042"},
+		{999, "01726585978590-000@abcdefghij:999"},
+	}
+	for _, tc := range cases {
+		got := MessageSerial(cs, tc.idx)
+		if got != tc.want {
+			t.Errorf("MessageSerial(%q, %d) = %q, want %q", cs, tc.idx, got, tc.want)
+		}
+	}
+}
+
+func TestMessageSerialOrdersWithinBatch(t *testing.T) {
+	cs := "01726585978590-000@abcdefghij"
+	prev := MessageSerial(cs, 0)
+	for i := 1; i < 10; i++ {
+		got := MessageSerial(cs, i)
+		if got <= prev {
+			t.Errorf("not monotonic: %q <= %q", got, prev)
+		}
+		prev = got
+	}
 }

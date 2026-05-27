@@ -1,22 +1,30 @@
 // Package serial implements Ably's lexicographically-sortable
 // timeserial format used for the canonical channel ordering identifier
-// (`Message.Serial`, `ProtocolMessage.ChannelSerial`).
+// (`ChannelMessage.ChannelSerial`, `Message.Serial`).
 //
-// Format (see DESIGN.md §8):
+// Two forms (see DESIGN.md §8):
 //
-//	<timestamp>-<counter>@<seriesId>:<idx>
-//	|14 digits | 3 digit |10 chars | 3 digit
+//	channelSerial:  <timestamp>-<counter>@<seriesId>
+//	                |14 digits | 3 digit |10 chars
+//
+//	Message.serial: <channelSerial>:<idx>
+//	                                |3 digit
 //
 //   - timestamp — wall-clock ms since epoch, zero-padded to 14 digits.
 //   - counter   — increments when multiple serials are minted in the
 //     same millisecond; resets to 000 when the timestamp advances.
 //   - seriesId  — random per-process identifier; disambiguates serials
 //     minted in the same millisecond on different nodes.
-//   - idx       — index within an atomic publish batch (all messages
-//     in one publish share `<ts>-<ctr>@<series>` and differ by idx).
+//   - idx       — index of a Message within its containing
+//     ChannelMessage (atomic publish).
 //
-// Lexicographic comparison of the full string matches publish order,
-// which is what lets storage backends (bbolt, Postgres) use the serial
+// channelSerials are the discrete attach/resume points in a channel's
+// stream — one per atomic publish. Individual Message.serials append
+// the in-batch idx so each Message in a multi-message publish gets a
+// distinct identifier.
+//
+// Lexicographic comparison of channelSerials matches publish order,
+// which is what lets storage backends (bbolt, Postgres) use them
 // directly as an ordered primary key.
 package serial
 
@@ -69,16 +77,10 @@ func NewGenerator(seriesID string, now func() int64) *Generator {
 	return &Generator{seriesID: seriesID, now: now}
 }
 
-// Batch mints n consecutive serials sharing a single
-// `<ts>-<ctr>@<series>` prefix, with idx 0..n-1. Returns nil if n <= 0.
-//
-// All n serials are issued atomically — this is the unit of an "atomic
-// publish" (one REST request, or one inbound MESSAGE frame carrying
-// multiple messages).
-func (g *Generator) Batch(n int) []string {
-	if n <= 0 {
-		return nil
-	}
+// Mint returns one fresh channelSerial — `<ts>-<ctr>@<series>` — for
+// an atomic publish. Callers stamp individual Message serials by
+// appending ":<idx>" via MessageSerial.
+func (g *Generator) Mint() string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -98,10 +100,13 @@ func (g *Generator) Batch(n int) []string {
 		}
 	}
 
-	prefix := fmt.Sprintf("%0*d-%0*d@%s", timestampWidth, g.lastTs, counterWidth, g.lastCounter, g.seriesID)
-	out := make([]string, n)
-	for i := range n {
-		out[i] = fmt.Sprintf("%s:%0*d", prefix, idxWidth, i)
-	}
-	return out
+	return fmt.Sprintf("%0*d-%0*d@%s", timestampWidth, g.lastTs, counterWidth, g.lastCounter, g.seriesID)
+}
+
+// MessageSerial returns the per-Message identifier for the message at
+// position idx within the ChannelMessage identified by channelSerial.
+//
+// Format: `<channelSerial>:<idx>` with idx zero-padded to 3 digits.
+func MessageSerial(channelSerial string, idx int) string {
+	return fmt.Sprintf("%s:%0*d", channelSerial, idxWidth, idx)
 }

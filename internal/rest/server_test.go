@@ -96,10 +96,14 @@ func TestPublishJSONSingleMessage(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	got, err := stream.Next(ctx)
+	cm, err := stream.Next(ctx)
 	if err != nil {
 		t.Fatalf("Next: %v", err)
 	}
+	if len(cm.Messages) != 1 {
+		t.Fatalf("Messages length = %d, want 1", len(cm.Messages))
+	}
+	got := cm.Messages[0]
 	if got.Name != "greet" || got.Data != "world" {
 		t.Errorf("got = %+v, want greet/world", got)
 	}
@@ -119,13 +123,19 @@ func TestPublishJSONArrayBody(t *testing.T) {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusCreated)
 	}
 
+	// A single publish (array body) lands as one ChannelMessage
+	// carrying both messages.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
+	cm, err := stream.Next(ctx)
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if len(cm.Messages) != len(msgs) {
+		t.Fatalf("Messages length = %d, want %d", len(cm.Messages), len(msgs))
+	}
 	for i, want := range msgs {
-		got, err := stream.Next(ctx)
-		if err != nil {
-			t.Fatalf("msg %d Next: %v", i, err)
-		}
+		got := cm.Messages[i]
 		if got.Name != want.Name || got.Data != want.Data {
 			t.Errorf("msg %d = %+v, want %+v", i, got, want)
 		}
@@ -147,10 +157,14 @@ func TestPublishMsgpack(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	got, err := stream.Next(ctx)
+	cm, err := stream.Next(ctx)
 	if err != nil {
 		t.Fatalf("Next: %v", err)
 	}
+	if len(cm.Messages) != 1 {
+		t.Fatalf("Messages length = %d, want 1", len(cm.Messages))
+	}
+	got := cm.Messages[0]
 	if got.Name != "ping" || got.Data != "pong" {
 		t.Errorf("got = %+v, want ping/pong", got)
 	}

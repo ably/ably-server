@@ -295,16 +295,18 @@ func TestAttachForwardsPublishedMessages(t *testing.T) {
 		t.Errorf("Channel = %q, want %q", msg.Channel, "foo")
 	}
 	if msg.ChannelSerial == "" {
-		t.Error("ChannelSerial is empty; want the delivered message's serial")
-	}
-	if msg.ChannelSerial != msg.Messages[0].Serial {
-		t.Errorf("frame.ChannelSerial = %q, msg.Serial = %q; want equal", msg.ChannelSerial, msg.Messages[0].Serial)
+		t.Error("ChannelSerial is empty; want the delivered ChannelMessage's channelSerial")
 	}
 	if len(msg.Messages) != 1 {
 		t.Fatalf("Messages length = %d, want 1", len(msg.Messages))
 	}
 	if msg.Messages[0].ID != "m1" {
 		t.Errorf("Messages[0].ID = %q, want %q", msg.Messages[0].ID, "m1")
+	}
+	// Message.Serial = channelSerial + ":000" for a single-message publish.
+	wantMsgSerial := msg.ChannelSerial + ":000"
+	if msg.Messages[0].Serial != wantMsgSerial {
+		t.Errorf("Messages[0].Serial = %q, want %q", msg.Messages[0].Serial, wantMsgSerial)
 	}
 }
 
