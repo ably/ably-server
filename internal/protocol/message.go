@@ -2,8 +2,16 @@ package protocol
 
 // Message is a published message payload — the unit of pub/sub on a
 // channel.
+//
+// ID and Serial are *not* the same identifier (see DESIGN.md §8):
+//   - ID is client-supplied and optional; it carries idempotency intent
+//     so the server can reject duplicate publishes within the retention
+//     window.
+//   - Serial is server-assigned on publish and is the canonical channel
+//     ordering identifier (`<ts>-<ctr>@<series>:<idx>`).
 type Message struct {
 	ID           string `json:"id,omitempty"           msgpack:"id,omitempty"`
+	Serial       string `json:"serial,omitempty"       msgpack:"serial,omitempty"`
 	ClientID     string `json:"clientId,omitempty"     msgpack:"clientId,omitempty"`
 	ConnectionID string `json:"connectionId,omitempty" msgpack:"connectionId,omitempty"`
 	Name         string `json:"name,omitempty"         msgpack:"name,omitempty"`

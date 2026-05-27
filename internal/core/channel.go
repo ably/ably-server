@@ -4,10 +4,10 @@ package core
 
 import (
 	"context"
-	"strconv"
 	"sync"
 
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/serial"
 )
 
 // entry is a node in a Channel's linked list of published messages.
@@ -17,7 +17,6 @@ import (
 // retains a reference.
 type entry struct {
 	msg    *protocol.Message
-	serial int64
 	notify chan struct{}
 	next   *entry
 }
@@ -26,17 +25,18 @@ type entry struct {
 // no goroutine; concurrency is serialised by mu around append.
 type Channel struct {
 	name string
+	gen  *serial.Generator
 
-	mu         sync.Mutex
-	tail       *entry // never nil: a sentinel is installed at construction
-	nextSerial int64
+	mu   sync.Mutex
+	tail *entry // never nil: a sentinel is installed at construction
 }
 
 // newChannel constructs a Channel. The list starts with a sentinel
-// entry (serial 0, no msg) so Attach is safe before any Append.
-func newChannel(name string) *Channel {
+// entry (no msg) so Attach is safe before any Append.
+func newChannel(name string, gen *serial.Generator) *Channel {
 	return &Channel{
 		name: name,
+		gen:  gen,
 		tail: &entry{notify: make(chan struct{})},
 	}
 }
@@ -46,21 +46,29 @@ func (c *Channel) Name() string {
 	return c.name
 }
 
-// Append publishes msg to the channel. All streams parked on the
-// previous tail's notify are woken; a fresh attachment from this point
-// on parks on the new tail instead.
-func (c *Channel) Append(msg *protocol.Message) {
+// Append publishes one or more messages to the channel as a single
+// atomic publish: all messages share one `<ts>-<ctr>@<series>` serial
+// prefix and differ only by their `:idx` suffix. Each message's
+// Serial field is stamped in place. Streams parked on the previous
+// tail wake on the first appended entry and walk forward through
+// the rest.
+//
+// A no-op when called with no arguments.
+func (c *Channel) Append(msgs ...*protocol.Message) {
+	if len(msgs) == 0 {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.nextSerial++
-	e := &entry{
-		msg:    msg,
-		serial: c.nextSerial,
-		notify: make(chan struct{}),
+
+	serials := c.gen.Batch(len(msgs))
+	for i, m := range msgs {
+		m.Serial = serials[i]
+		e := &entry{msg: m, notify: make(chan struct{})}
+		c.tail.next = e
+		close(c.tail.notify)
+		c.tail = e
 	}
-	c.tail.next = e
-	close(c.tail.notify)
-	c.tail = e
 }
 
 // Attach returns a Stream positioned at the current tail. The Stream's
@@ -79,10 +87,13 @@ type Stream struct {
 }
 
 // ChannelSerial returns the cursor's current position in wire form —
-// the serial of the last delivered message (or the attach point if
-// none has been delivered yet).
+// the serial of the last delivered message, or an empty string if the
+// stream is parked at the sentinel (no message delivered yet).
 func (s *Stream) ChannelSerial() string {
-	return strconv.FormatInt(s.cursor.serial, 10)
+	if s.cursor.msg == nil {
+		return ""
+	}
+	return s.cursor.msg.Serial
 }
 
 // Next blocks until the next message is available, advances the cursor

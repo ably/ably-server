@@ -267,8 +267,8 @@ func TestAttachReceivesAttachedAck(t *testing.T) {
 	if msg.Channel != "foo" {
 		t.Errorf("Channel = %q, want %q", msg.Channel, "foo")
 	}
-	if msg.ChannelSerial != "0" {
-		t.Errorf("ChannelSerial = %q, want %q (fresh attach at sentinel)", msg.ChannelSerial, "0")
+	if msg.ChannelSerial != "" {
+		t.Errorf("ChannelSerial = %q, want empty (fresh attach with no delivered messages)", msg.ChannelSerial)
 	}
 }
 
@@ -294,8 +294,11 @@ func TestAttachForwardsPublishedMessages(t *testing.T) {
 	if msg.Channel != "foo" {
 		t.Errorf("Channel = %q, want %q", msg.Channel, "foo")
 	}
-	if msg.ChannelSerial != "1" {
-		t.Errorf("ChannelSerial = %q, want %q", msg.ChannelSerial, "1")
+	if msg.ChannelSerial == "" {
+		t.Error("ChannelSerial is empty; want the delivered message's serial")
+	}
+	if msg.ChannelSerial != msg.Messages[0].Serial {
+		t.Errorf("frame.ChannelSerial = %q, msg.Serial = %q; want equal", msg.ChannelSerial, msg.Messages[0].Serial)
 	}
 	if len(msg.Messages) != 1 {
 		t.Fatalf("Messages length = %d, want 1", len(msg.Messages))

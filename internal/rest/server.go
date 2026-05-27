@@ -75,9 +75,7 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ch := s.manager.GetChannel(name)
-	for _, m := range msgs {
-		ch.Append(m)
-	}
+	ch.Append(msgs...)
 	w.WriteHeader(http.StatusCreated)
 }
 

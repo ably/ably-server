@@ -161,9 +161,7 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 	}
 
 	ch := c.manager.GetChannel(msg.Channel)
-	for _, m := range msg.Messages {
-		ch.Append(m)
-	}
+	ch.Append(msg.Messages...)
 
 	// ACK after Append: in the in-memory backend Append cannot fail, but
 	// once storage lands ACK will mean "committed", so we issue it once

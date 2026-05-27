@@ -3,11 +3,28 @@ package core
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/serial"
 )
+
+// stepClock returns a clock func that advances by 1 ms on every call,
+// starting at start.
+func stepClock(start int64) func() int64 {
+	var ts atomic.Int64
+	ts.Store(start - 1)
+	return func() int64 { return ts.Add(1) }
+}
+
+// newTestChannel returns a Channel with a deterministic generator —
+// fixed seriesId and a monotonic stepping clock — so tests can assert
+// on serial values directly.
+func newTestChannel(name string) *Channel {
+	return newChannel(name, serial.NewGenerator("testseries0", stepClock(1000)))
+}
 
 // isClosed reports whether ch is closed (non-blocking).
 func isClosed(ch <-chan struct{}) bool {
@@ -20,7 +37,7 @@ func isClosed(ch <-chan struct{}) bool {
 }
 
 func TestChannelAppendBuildsList(t *testing.T) {
-	c := newChannel("test")
+	c := newTestChannel("test")
 	head := c.tail // sentinel; notify open, next nil
 
 	msgs := []*protocol.Message{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}}
@@ -28,8 +45,10 @@ func TestChannelAppendBuildsList(t *testing.T) {
 		c.Append(m)
 	}
 
-	// Walk forward from the sentinel; verify each msg in order.
+	// Walk forward from the sentinel; verify each msg in order and that
+	// every message has a non-empty, monotonically-ordered Serial.
 	e := head
+	prev := ""
 	for i, want := range msgs {
 		if !isClosed(e.notify) {
 			t.Fatalf("entry %d: notify not closed", i)
@@ -41,9 +60,13 @@ func TestChannelAppendBuildsList(t *testing.T) {
 		if e.msg.ID != want.ID {
 			t.Fatalf("entry %d: msg.ID = %q, want %q", i, e.msg.ID, want.ID)
 		}
-		if e.serial != int64(i+1) {
-			t.Fatalf("entry %d: serial = %d, want %d", i, e.serial, i+1)
+		if e.msg.Serial == "" {
+			t.Fatalf("entry %d: msg.Serial is empty", i)
 		}
+		if e.msg.Serial <= prev {
+			t.Fatalf("entry %d: serial %q not greater than previous %q", i, e.msg.Serial, prev)
+		}
+		prev = e.msg.Serial
 	}
 
 	// The final entry's notify is still open — no successor yet.
@@ -52,8 +75,36 @@ func TestChannelAppendBuildsList(t *testing.T) {
 	}
 }
 
+func TestChannelAppendStampsSerialOnMessage(t *testing.T) {
+	c := newTestChannel("test")
+	m := &protocol.Message{ID: "m1"}
+	c.Append(m)
+	if m.Serial != "00000000001000-000@testseries0:000" {
+		t.Errorf("m.Serial = %q, want %q", m.Serial, "00000000001000-000@testseries0:000")
+	}
+}
+
+func TestChannelAppendBatchSharesPrefix(t *testing.T) {
+	c := newTestChannel("test")
+	a := &protocol.Message{ID: "a"}
+	b := &protocol.Message{ID: "b"}
+	d := &protocol.Message{ID: "d"}
+	c.Append(a, b, d)
+
+	want := []string{
+		"00000000001000-000@testseries0:000",
+		"00000000001000-000@testseries0:001",
+		"00000000001000-000@testseries0:002",
+	}
+	for i, m := range []*protocol.Message{a, b, d} {
+		if m.Serial != want[i] {
+			t.Errorf("msg %d Serial = %q, want %q", i, m.Serial, want[i])
+		}
+	}
+}
+
 func TestChannelNotifyWakesWaiter(t *testing.T) {
-	c := newChannel("test")
+	c := newTestChannel("test")
 	head := c.tail
 
 	got := make(chan *entry, 1)
@@ -78,7 +129,7 @@ func TestChannelNotifyWakesWaiter(t *testing.T) {
 }
 
 func TestChannelNotifyWakesAllWaiters(t *testing.T) {
-	c := newChannel("test")
+	c := newTestChannel("test")
 	head := c.tail
 
 	const waiters = 5
@@ -103,7 +154,7 @@ func TestChannelNotifyWakesAllWaiters(t *testing.T) {
 }
 
 func TestChannelAppendIsConcurrentSafe(t *testing.T) {
-	c := newChannel("test")
+	c := newTestChannel("test")
 	head := c.tail
 
 	const writers = 10
@@ -132,11 +183,11 @@ func TestChannelAppendIsConcurrentSafe(t *testing.T) {
 }
 
 func TestStreamAttachOnEmptyChannelBlocksUntilAppend(t *testing.T) {
-	c := newChannel("test")
+	c := newTestChannel("test")
 	s := c.Attach()
 
-	if got := s.ChannelSerial(); got != "0" {
-		t.Errorf("initial ChannelSerial = %q, want %q", got, "0")
+	if got := s.ChannelSerial(); got != "" {
+		t.Errorf("initial ChannelSerial = %q, want empty (no message delivered yet)", got)
 	}
 
 	got := make(chan *protocol.Message, 1)
@@ -162,19 +213,20 @@ func TestStreamAttachOnEmptyChannelBlocksUntilAppend(t *testing.T) {
 		t.Fatal("Next did not return within 1s")
 	}
 
-	if got := s.ChannelSerial(); got != "1" {
-		t.Errorf("post-Next ChannelSerial = %q, want %q", got, "1")
+	if got := s.ChannelSerial(); got == "" {
+		t.Error("post-Next ChannelSerial is empty; want the delivered message's serial")
 	}
 }
 
 func TestStreamAttachAfterAppendsParksAtTail(t *testing.T) {
-	c := newChannel("test")
+	c := newTestChannel("test")
 	c.Append(&protocol.Message{ID: "m1"})
 	c.Append(&protocol.Message{ID: "m2"})
 
 	s := c.Attach()
-	if got := s.ChannelSerial(); got != "2" {
-		t.Fatalf("ChannelSerial = %q, want %q", got, "2")
+	atTail := s.ChannelSerial()
+	if atTail == "" {
+		t.Fatal("ChannelSerial after appends is empty; want the tail message's serial")
 	}
 
 	// Attaching at the tail means Next blocks until a fresh append.
@@ -196,13 +248,13 @@ func TestStreamAttachAfterAppendsParksAtTail(t *testing.T) {
 	if m.ID != "m3" {
 		t.Errorf("msg.ID = %q, want %q", m.ID, "m3")
 	}
-	if got := s.ChannelSerial(); got != "3" {
-		t.Errorf("ChannelSerial = %q, want %q", got, "3")
+	if got := s.ChannelSerial(); got == "" || got <= atTail {
+		t.Errorf("ChannelSerial after Next = %q, want a serial greater than %q", got, atTail)
 	}
 }
 
 func TestStreamNextRespectsContext(t *testing.T) {
-	c := newChannel("test")
+	c := newTestChannel("test")
 	s := c.Attach()
 
 	ctx, cancel := context.WithCancel(context.Background())
