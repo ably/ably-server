@@ -454,9 +454,45 @@ Per-channel ring buffer for messages, bounded by count *and* age.
 
 ### 6.2 Disk backend
 
-SQLite via `modernc.org/sqlite` (pure-Go, no CGO). Single file at
-`--data-dir/ably.db`, WAL mode. The schema is the same as the cluster
-backend modulo pub/sub, so the SQL layer is shared.
+[bbolt](https://github.com/etcd-io/bbolt) — a pure-Go embedded B+tree
+KV store with crash-safe writes. Single file at `--data-dir/ably.db`.
+Chosen because the disk backend's job is narrow ("survive crashes for
+a single process") and bbolt gives us that without coupling the disk
+layer's schema to the Postgres cluster backend.
+
+Layout:
+
+- One top-level bucket per channel, named `ch/<channel-name>`.
+- Inside each channel bucket, a `messages` sub-bucket keyed by the
+  message's channel serial (see §8 — a lexicographically-sortable
+  string of the form `<timestamp>-<counter>@<seriesId>:<idx>`), so
+  bbolt's natural byte-order iteration yields messages in publish
+  order. Values are the encoded `protocol.Message` blob (msgpack).
+- An `ids` sub-bucket maps `Message.id` (client-supplied idempotency
+  key) to the `serial` it was assigned, so a repeat publish within the
+  retention window can short-circuit and return the original serial
+  without re-appending. Entries are dropped by the same sweep that
+  trims `messages` past TTL — idempotency is bounded by message
+  retention.
+- A `meta` sub-bucket holds the channel's last-issued
+  `(timestamp, counter)` pair so a fresh process resumes serial
+  assignment monotonically without scanning the `messages` bucket.
+
+Retention is enforced by a background sweep goroutine that, per
+channel, walks the ordered `messages` keys from oldest forward and
+deletes anything past the message TTL or beyond the per-channel cap.
+Because keys are serial-ordered and writes are append-only, the sweep
+stops at the first non-expired key per channel.
+
+bbolt has no native TTL, no secondary indexes, and a single-writer
+model — all of which suit this use case: short-lived data, one writer
+per node (the publish path), and the only read pattern beyond the
+live tail is a bounded history range scan.
+
+Future materialised state (e.g. presence membership when it lands)
+will reuse this backend by adding sibling sub-buckets (e.g.
+`presence`) under each channel bucket — separate from `messages`, no
+TTL, with explicit deletes on `leave`.
 
 ### 6.3 Database backend (cluster mode)
 
@@ -473,19 +509,20 @@ CREATE TABLE channels (
 );
 
 CREATE TABLE messages (
-  channel       TEXT        NOT NULL,
-  msg_serial    BIGINT      NOT NULL,        -- monotonic per-channel
-  id            TEXT        NOT NULL,        -- "{connId}:{msgSerial}:{idx}"
-  client_id     TEXT,
-  conn_id       TEXT,
-  name          TEXT,
-  data          BYTEA,
-  encoding      TEXT,
-  extras        JSONB,
-  timestamp     TIMESTAMPTZ NOT NULL,
-  PRIMARY KEY (channel, msg_serial)
+  channel    TEXT        NOT NULL,
+  serial     TEXT        NOT NULL,        -- "<ts>-<ctr>@<series>:<idx>" (§8)
+  id         TEXT,                        -- client-supplied idempotency key
+  client_id  TEXT,
+  conn_id    TEXT,
+  name       TEXT,
+  data       BYTEA,
+  encoding   TEXT,
+  extras     JSONB,
+  timestamp  TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (channel, serial)
 );
 CREATE INDEX ON messages (channel, timestamp DESC);
+CREATE UNIQUE INDEX ON messages (channel, id) WHERE id IS NOT NULL;
 ```
 
 Retention is enforced by a periodic background job (delete by `timestamp <
@@ -509,8 +546,13 @@ directly.
 There is no pub/sub abstraction. A publish is a direct sequence:
 
 1. Authorise.
-2. `Storage.AppendMessages` — assigns the canonical `msg_serial`.
-3. `channel.Append(msg)` on the in-process Channel.
+2. If the publish carries a client-supplied `Message.id`, look it up
+   in storage for this channel; on hit, return the stored `serial`
+   and stop.
+3. Mint the canonical channel serial (§8 timeserial) for the publish.
+4. `Storage.AppendMessages` — persists with that serial (and the
+   `id`, if any, in the channel's idempotency index).
+5. `channel.Append(msg)` on the in-process Channel.
 
 All attachments are on the same node and tail the same list.
 
@@ -519,20 +561,22 @@ All attachments are on the same node and tail the same list.
 Each node runs a single goroutine on a dedicated Postgres connection
 listening for channel-publish notifications:
 
-- The publishing node `INSERT`s the row into `messages` — this assigns
-  the global `msg_serial` — and emits
-  `NOTIFY ably_channel, '<channel-name>:<row-id>'`.
-- Every listening node (including the publisher) receives the notification,
-  fetches the row by id, and calls `channel.Append(msg)` on its local
-  Channel.
+- The publishing node mints the channel serial locally (§8), `INSERT`s
+  the row into `messages` with that serial as primary key, and emits
+  `NOTIFY ably_channel, '<channel-name>:<serial>'`.
+- Every listening node (including the publisher) receives the
+  notification, fetches the row by `(channel, serial)`, and
+  calls `channel.Append(msg)` on its local Channel.
 
-Routing the publisher's own message back through NOTIFY keeps a single
-ordering point per channel (the Postgres `msg_serial`) and ensures every
-node's linked list reflects the same global order.
+The serial's format is itself the global ordering: the `<seriesId>`
+component disambiguates serials minted in the same millisecond by
+different processes, so each node's linked list, sorted lexicographically
+by serial, reflects the same global order without a central sequence.
 
 NOTIFY's 8KB payload limit and at-least-once delivery are why we send
-*pointers* (row IDs) rather than full payloads — the listener always reads
-the canonical row from the table, deduplicating by `(channel, msg_serial)`.
+*pointers* (channel + serial) rather than full payloads — the listener
+always reads the canonical row from the table, deduplicating by
+`(channel, serial)`.
 
 LISTEN/NOTIFY's well-known throughput ceiling is not a concern here:
 ably-server targets developer-loop, CI, and modest single-region self-host
@@ -546,15 +590,54 @@ fork.
 - **clientId**: optional, resolved at auth time per §3.2. The server stamps
   it onto every outbound `Message.clientId` published by this connection,
   and rejects inbound frames that try to set a different value.
-- **msgSerial** (channel): monotonic `BIGINT` from the storage backend
-  (sequence/`MAX+1` under transaction, or atomic counter in memory).
-- **Message.id**: `{connId}:{publishMsgSerial}:{messageIndex}` per Ably
-  convention, so client-side de-dup works.
-- **channelSerial**: on `ATTACHED`, the **confirmed attach point** — the
-  serial from which the client's subscription begins. On each subsequent
-  `MESSAGE`, the serial of that message. The client retains the most recent
-  serial it has seen and sends it back on a future `ATTACH` to request
-  continuation from that point (see §4.3).
+- **msgSerial** (per-connection publish counter): `int64` on
+  `ProtocolMessage`, assigned by the client; the server echoes it on
+  `ACK`/`NACK` so the SDK can address publish acknowledgements. Distinct
+  from `channelSerial` below — this is the wire field for publish flow
+  control, not the canonical message ordering identifier.
+- **channelSerial** (canonical timeserial): a lexicographically-sortable
+  string assigned by the server when a publish lands on a channel,
+  modelled on Ably cloud's internal format:
+
+  ```
+  <timestamp>-<counter>@<seriesId>:<idx>
+  ```
+
+  - `timestamp` — current wall-clock time in milliseconds, zero-padded
+    to 14 digits (~3000 years of headroom).
+  - `counter` — zero-padded 3-digit per-`(timestamp, seriesId)` counter,
+    incremented when multiple serials are minted within the same
+    millisecond. Resets to `000` when the timestamp advances.
+  - `seriesId` — a fixed-length random string generated at process
+    start; disambiguates serials minted in the same millisecond on
+    different nodes in cluster mode.
+  - `idx` — zero-padded 3-digit index within an atomic publish; all
+    messages in a single REST publish (or one `MESSAGE` frame carrying
+    `messages[]`) share the same `<ts>-<ctr>@<series>` prefix and
+    differ only by `idx`.
+
+  On `ATTACHED` it carries the **confirmed attach point** — the serial
+  from which the client's subscription begins. On each subsequent
+  `MESSAGE`, the serial of that message. The client retains the most
+  recent serial it has seen and sends it back on a future `ATTACH` to
+  request continuation from that point (see §4.3).
+
+  Lexicographic comparison of serials matches publish order, which lets
+  the disk backend (bbolt) and cluster backend (Postgres) use the
+  serial directly as the primary key without a separate ordering
+  column.
+- **Message.serial**: the server-assigned timeserial for an individual
+  message — same format as `channelSerial` above (`<ts>-<ctr>@<series>:<idx>`
+  with the message's own `idx`). The `channelSerial` carried on an
+  outbound `MESSAGE` frame is the `Message.serial` of the message it
+  delivers.
+- **Message.id**: optional, **client-supplied** identifier used for
+  idempotent publishing. If present, the server enforces uniqueness
+  per channel within the message retention window: a second publish
+  carrying an `id` already seen on that channel returns the original
+  publish's `serial` and is *not* re-appended. If absent, the server
+  treats every publish as new. `id` is opaque to the server — clients
+  typically use a UUID or a deterministic hash of payload + intent.
 
 Replay on `ATTACH` is a bounded history read from storage between the
 client-supplied `channelSerial` and the channel's current head, streamed
@@ -613,7 +696,7 @@ client-supplied `channelSerial`. No connection state crosses nodes.
 
 - **Unit**: per-package; mock-free where practical (the storage interface
   has an in-memory implementation, exercised by the same test suite as the
-  SQLite and Postgres backends — table-driven contract tests).
+  bbolt and Postgres backends — table-driven contract tests).
 - **Integration**: spin up the binary against ably-go's existing test suite
   (or a curated subset) to validate SDK compatibility.
 - **Cluster**: Postgres + 2 server processes in Docker Compose; tests cover
