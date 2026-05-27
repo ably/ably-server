@@ -150,6 +150,32 @@ func TestMessageSerial(t *testing.T) {
 	}
 }
 
+func TestRestoreMakesNextMintStrictlyGreater(t *testing.T) {
+	g := NewGenerator("abcdefghij", fixedClock(1000))
+	g.Restore(2000, 5)
+
+	// Clock reports 1000 (< 2000), so Mint stays at restored ts and
+	// bumps counter to 6.
+	got := g.Mint()
+	want := "00000000002000-006@abcdefghij"
+	if got != want {
+		t.Errorf("after Restore at lower clock: got %q, want %q", got, want)
+	}
+}
+
+func TestRestoreYieldsToAdvancingClock(t *testing.T) {
+	g := NewGenerator("abcdefghij", fixedClock(3000))
+	g.Restore(2000, 5)
+
+	// Clock 3000 > restored ts 2000, so first Mint resets counter at
+	// the new ts.
+	got := g.Mint()
+	want := "00000000003000-000@abcdefghij"
+	if got != want {
+		t.Errorf("after Restore with advancing clock: got %q, want %q", got, want)
+	}
+}
+
 func TestMessageSerialOrdersWithinBatch(t *testing.T) {
 	cs := "01726585978590-000@abcdefghij"
 	prev := MessageSerial(cs, 0)

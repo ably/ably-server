@@ -77,6 +77,17 @@ func NewGenerator(seriesID string, now func() int64) *Generator {
 	return &Generator{seriesID: seriesID, now: now}
 }
 
+// Restore seeds the generator's monotonic state — used by persistent
+// backends on startup so the first post-restart Mint produces a
+// serial strictly greater than ts-ctr. Safe to call only before the
+// first Mint.
+func (g *Generator) Restore(ts int64, counter int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.lastTs = ts
+	g.lastCounter = counter
+}
+
 // Mint returns one fresh channelSerial — `<ts>-<ctr>@<series>` — for
 // an atomic publish. Callers stamp individual Message serials by
 // appending ":<idx>" via MessageSerial.
