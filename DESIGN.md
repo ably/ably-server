@@ -489,9 +489,14 @@ Layout:
   serial without re-appending. Entries are dropped by the same sweep
   that trims `messages` past TTL — idempotency is bounded by message
   retention.
-- A `meta` sub-bucket holds the channel's last-issued
-  `(timestamp, counter)` pair so a fresh process resumes serial
-  assignment monotonically without scanning the `messages` bucket.
+
+Plus a single top-level `_meta` bucket (not under any channel) holding
+the process-wide serial generator state: the last-issued `(timestamp,
+counter)` pair and the `seriesId`. Counter monotonicity is
+per-`(timestamp, seriesId)` — i.e. process-wide, not per-channel —
+because every minted serial on this node shares the same `seriesId`
+and must be unique across all channels. On startup the process loads
+this state to keep serials monotonic across restarts.
 
 Retention is enforced by a background sweep goroutine that, per
 channel, walks the ordered `messages` keys from oldest forward and
