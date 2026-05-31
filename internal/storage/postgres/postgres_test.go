@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -170,4 +171,71 @@ func TestPostgresBootstrapIsIdempotent(t *testing.T) {
 		t.Fatalf("Open #2 (idempotent bootstrap): %v", err)
 	}
 	t.Cleanup(func() { _ = s2.Close() })
+}
+
+// TestPostgresMigrateIsConcurrentSafe spawns N goroutines that each
+// call postgres.Open on the same fresh schema simultaneously. The
+// session-scoped pg_advisory_lock should serialise the migration
+// sweep: all Opens succeed; schema_migrations ends up with exactly
+// one row per shipped migration (no duplicates from concurrent
+// inserts); the messages table is correctly created.
+func TestPostgresMigrateIsConcurrentSafe(t *testing.T) {
+	c := startPostgres(t)
+	dsn := freshSchemaDSN(t, c.dsn)
+	ctx := context.Background()
+
+	const workers = 10
+	var (
+		wg   sync.WaitGroup
+		errs = make(chan error, workers)
+	)
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			s, err := postgres.Open(ctx, postgres.Options{DSN: dsn})
+			if err != nil {
+				errs <- err
+				return
+			}
+			_ = s.Close()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent Open: %v", err)
+	}
+
+	// schema_migrations must have exactly one row per shipped
+	// migration — no duplicates, no partial application.
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect for verification: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	rows, err := conn.Query(ctx, `SELECT version FROM schema_migrations ORDER BY version`)
+	if err != nil {
+		t.Fatalf("read schema_migrations: %v", err)
+	}
+	var versions []string
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		versions = append(versions, v)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate: %v", err)
+	}
+	if !slices.Equal(versions, []string{"0001_initial"}) {
+		t.Errorf("schema_migrations rows = %v, want [0001_initial]", versions)
+	}
+
+	// The messages table must exist and be queryable.
+	if _, err := conn.Exec(ctx, `SELECT 1 FROM messages LIMIT 0`); err != nil {
+		t.Errorf("messages table not present: %v", err)
+	}
 }

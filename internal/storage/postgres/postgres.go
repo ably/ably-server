@@ -2,24 +2,23 @@
 // ably-server's cluster mode (DESIGN.md §6.3).
 //
 // State is held in a single `messages` table (one row per Message,
-// grouped under a shared channelSerial PK), applied at Open() via the
-// embedded schema.sql. Each publish runs inside a transaction that
+// grouped under a shared channelSerial PK), provisioned at Open() via
+// an embedded migration sweep guarded by a session-scoped
+// pg_advisory_lock — so N nodes booting simultaneously against an
+// empty database serialise on the lock and only one applies the
+// pending migrations. Each publish runs inside a transaction that
 // takes a per-channel advisory lock (pg_advisory_xact_lock) so
 // concurrent writers serialise per channel without blocking writers
 // on other channels. Idempotency on client-supplied Message.IDs is
 // enforced by a partial UNIQUE index on (channel, id).
-//
-// Concurrent-safe schema application across N nodes booting against an
-// empty database is TASK-23 (advisory-lock around the whole bootstrap
-// + a schema_migrations tracker); for now Open() relies on the
-// CREATE-IF-NOT-EXISTS DDL.
 package postgres
 
 import (
 	"context"
-	_ "embed"
+	"embed"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/jackc/pgx/v5"
@@ -31,8 +30,15 @@ import (
 	"github.com/ably/ably-server/internal/storage"
 )
 
-//go:embed schema.sql
-var schemaSQL string
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
+
+// migrationLockKey is the int8 used with pg_advisory_lock to serialise
+// the migration sweep across all processes sharing this database. The
+// value is arbitrary — pg_advisory_lock's keyspace is per-database and
+// opt-in, so collisions with other applications would only matter if
+// someone else's code also picked this exact key on the same DB.
+const migrationLockKey int64 = 0x1ab1_e5e7_2e0a_17a3
 
 // Options configures the Postgres backend.
 type Options struct {
@@ -54,10 +60,12 @@ type Storage struct {
 	channels map[string]*channelStore
 }
 
-// Open dials Postgres at opts.DSN, applies the embedded schema, and
-// returns a Storage ready for use. The seriesId is freshly generated
-// per process — multi-node deployments rely on distinct per-node
-// seriesIds to disambiguate concurrent mints (DESIGN.md §8).
+// Open dials Postgres at opts.DSN, applies any pending migrations
+// (under a session-scoped advisory lock so concurrent Opens
+// serialise), and returns a Storage ready for use. The seriesId is
+// freshly generated per process — multi-node deployments rely on
+// distinct per-node seriesIds to disambiguate concurrent mints
+// (DESIGN.md §8).
 func Open(ctx context.Context, opts Options) (*Storage, error) {
 	if opts.DSN == "" {
 		return nil, errors.New("storage/postgres: Open requires a DSN")
@@ -70,15 +78,146 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		pool.Close()
 		return nil, fmt.Errorf("storage/postgres: ping: %w", err)
 	}
-	if _, err := pool.Exec(ctx, schemaSQL); err != nil {
+	if err := migrate(ctx, pool); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("storage/postgres: apply schema: %w", err)
+		return nil, fmt.Errorf("storage/postgres: migrate: %w", err)
 	}
 	return &Storage{
 		pool:     pool,
 		gen:      serial.NewGenerator(serial.NewSeriesID(), opts.Now),
 		channels: make(map[string]*channelStore),
 	}, nil
+}
+
+// migrate applies any pending embedded migrations under a session-
+// scoped pg_advisory_lock. Other processes calling Open against the
+// same database block on the lock acquire, then observe an
+// up-to-date schema_migrations table and apply nothing.
+//
+// Migrations live in the embedded migrations/ tree and are applied
+// in lex order of filename (the convention is "<4-digit>_<name>.sql",
+// e.g. 0001_initial.sql). Each migration runs in its own transaction
+// alongside the schema_migrations INSERT, so a crash mid-sweep
+// leaves the DB consistent (either fully applied or not), and the
+// next Open picks up where the previous one left off.
+func migrate(ctx context.Context, pool *pgxpool.Pool) error {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire conn: %w", err)
+	}
+	defer conn.Release()
+
+	// Session-scoped lock: held until we explicitly release it (or
+	// the conn returns to the pool, since pgxpool resets the
+	// session). We unlock explicitly for symmetry / defensiveness.
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLockKey); err != nil {
+		return fmt.Errorf("advisory lock: %w", err)
+	}
+	defer func() {
+		// Best-effort release; the conn's session-end would do it too.
+		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationLockKey)
+	}()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+		  version    TEXT        PRIMARY KEY,
+		  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`); err != nil {
+		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+
+	applied := make(map[string]struct{})
+	rows, err := conn.Query(ctx, `SELECT version FROM schema_migrations`)
+	if err != nil {
+		return fmt.Errorf("read schema_migrations: %w", err)
+	}
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan applied version: %w", err)
+		}
+		applied[v] = struct{}{}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate schema_migrations: %w", err)
+	}
+
+	pending, err := listMigrations()
+	if err != nil {
+		return err
+	}
+	for _, m := range pending {
+		if _, ok := applied[m.version]; ok {
+			continue
+		}
+		if err := applyMigration(ctx, conn, m); err != nil {
+			return fmt.Errorf("apply %s: %w", m.version, err)
+		}
+	}
+	return nil
+}
+
+type migration struct {
+	version string // filename minus ".sql", e.g. "0001_initial"
+	sql     string
+}
+
+// listMigrations reads the embedded migrations/ tree and returns the
+// migrations in lex order (which by convention matches numeric order
+// of the leading digit prefix).
+func listMigrations() ([]migration, error) {
+	entries, err := migrationsFS.ReadDir("migrations")
+	if err != nil {
+		return nil, fmt.Errorf("read migrations dir: %w", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+
+	out := make([]migration, 0, len(names))
+	for _, name := range names {
+		body, err := migrationsFS.ReadFile("migrations/" + name)
+		if err != nil {
+			return nil, fmt.Errorf("read migration %s: %w", name, err)
+		}
+		out = append(out, migration{
+			version: name[:len(name)-len(".sql")],
+			sql:     string(body),
+		})
+	}
+	return out, nil
+}
+
+// applyMigration runs a single migration's SQL and records the
+// schema_migrations row in the same transaction.
+func applyMigration(ctx context.Context, conn *pgxpool.Conn, m migration) error {
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, m.sql); err != nil {
+		return fmt.Errorf("exec migration sql: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO schema_migrations (version) VALUES ($1)`,
+		m.version,
+	); err != nil {
+		return fmt.Errorf("record migration: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
 }
 
 // Channel returns the ChannelStore for name. Successive calls with
@@ -188,7 +327,8 @@ func (cs *channelStore) AppendChannelMessage(ctx context.Context, msgs []*protoc
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO messages (channel, channel_serial, idx, id, payload)
 			 VALUES ($1, $2, $3, $4, $5)`,
-			cs.name, channelSerial, i, idArg, payload); err != nil {
+			cs.name, channelSerial, i, idArg, payload,
+		); err != nil {
 			return nil, false, fmt.Errorf("storage/postgres: insert message %d: %w", i, err)
 		}
 	}

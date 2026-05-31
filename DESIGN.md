@@ -500,11 +500,28 @@ CREATE UNIQUE INDEX messages_idempotency_idx
   ON messages (channel, id) WHERE id IS NOT NULL;
 ```
 
-The DDL ships in `internal/storage/postgres/schema.sql` and is applied
-(CREATE … IF NOT EXISTS) when `postgres.Open` is called. Concurrent-
-safe application across N nodes booting against an empty database —
-plus a `schema_migrations` tracker for forward migrations — lives in
-the auto-migrate path (DESIGN.md §11 / TASK-23).
+The DDL ships as versioned migrations under
+`internal/storage/postgres/migrations/*.sql` (e.g. `0001_initial.sql`)
+and is applied at `postgres.Open` by an auto-migrate sweep:
+
+1. Acquire a session-scoped `pg_advisory_lock` on a fixed int8 key
+   (arbitrary — advisory-lock keyspace is per-database and opt-in).
+   N nodes booting simultaneously block here; only one applies the
+   migrations, the rest observe an up-to-date state and skip.
+2. `CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT
+   PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())` —
+   the migration tracker itself.
+3. Read the applied version set; for each embedded migration whose
+   version is not in the set, run its SQL plus the
+   `schema_migrations` insert in a single transaction. Failure
+   rolls back the migration *and* the tracker row, so the next Open
+   retries the same migration.
+4. Release the advisory lock.
+
+The mechanism is forward-only, hand-rolled (no migration library),
+and matches what a load balancer rolling-restart of N nodes against
+the same Postgres needs: every restart is a no-op except the one
+that introduces a new migration file.
 
 Per-publish writes run inside a transaction that takes a per-channel
 advisory lock (`pg_advisory_xact_lock(hashtext(channel))`), so
@@ -698,6 +715,13 @@ Loaded in priority order: flag > env > defaults. No config file.
 - **pprof**: behind `--debug-listen` on a separate port.
 
 ## 11. Lifecycle & operations
+
+**Startup.** Each backend bootstraps its storage at `Open` time. The
+bbolt backend creates the two top-level buckets if missing (§6.2).
+The Postgres backend runs the auto-migrate sweep described in §6.3 —
+a session-scoped advisory lock serialises N concurrently-starting
+nodes so only one applies migrations, the rest observe the
+`schema_migrations` tracker and skip.
 
 On SIGTERM the server enters a graceful shutdown:
 
