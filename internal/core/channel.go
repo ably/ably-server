@@ -7,7 +7,7 @@ import (
 	"sync"
 
 	"github.com/ably/ably-server/internal/protocol"
-	"github.com/ably/ably-server/internal/serial"
+	"github.com/ably/ably-server/internal/storage"
 )
 
 // entry is a node in a Channel's linked list of ChannelMessages. Each
@@ -24,21 +24,25 @@ type entry struct {
 
 // Channel holds the live ChannelMessage list for one channel name. It
 // owns no goroutine; concurrency is serialised by mu around append.
+// Serial minting and persistence live in the underlying storage —
+// Channel itself only links already-minted ChannelMessages into the
+// live list so attachments can tail them.
 type Channel struct {
-	name string
-	gen  *serial.Generator
+	name  string
+	store storage.ChannelStore
 
 	mu   sync.Mutex
 	tail *entry // never nil: a sentinel is installed at construction
 }
 
-// newChannel constructs a Channel. The list starts with a sentinel
-// entry (no ChannelMessage) so Attach is safe before any Append.
-func newChannel(name string, gen *serial.Generator) *Channel {
+// newChannel constructs a Channel backed by store. The list starts
+// with a sentinel entry (no ChannelMessage) so Attach is safe before
+// any Append.
+func newChannel(name string, store storage.ChannelStore) *Channel {
 	return &Channel{
-		name: name,
-		gen:  gen,
-		tail: &entry{notify: make(chan struct{})},
+		name:  name,
+		store: store,
+		tail:  &entry{notify: make(chan struct{})},
 	}
 }
 
@@ -47,30 +51,45 @@ func (c *Channel) Name() string {
 	return c.name
 }
 
-// Append publishes one atomic batch: it mints a single channelSerial,
-// stamps each contained Message.Serial = "<channelSerial>:<idx>", and
-// links the resulting ChannelMessage as a single entry. Streams
-// parked on the previous tail wake when the new entry is linked.
+// Append links an already-minted ChannelMessage onto the tail as a
+// single entry, waking any parked streams. It performs no minting and
+// no stamping of contained Message.Serials — both are storage's
+// responsibility upstream.
 //
-// A no-op when called with no messages.
-func (c *Channel) Append(msgs ...*protocol.Message) {
-	if len(msgs) == 0 {
+// Used directly by the cluster broker's NOTIFY listener once it has
+// fetched the canonical row; intra-process publishes go through
+// AppendChannelMessage which calls Append after the storage write.
+//
+// A no-op when cm is nil or carries no Messages.
+func (c *Channel) Append(cm *protocol.ChannelMessage) {
+	if cm == nil || len(cm.Messages) == 0 {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	channelSerial := c.gen.Mint()
-	for i, m := range msgs {
-		m.Serial = serial.MessageSerial(channelSerial, i)
-	}
-	e := &entry{
-		cm:     &protocol.ChannelMessage{ChannelSerial: channelSerial, Messages: msgs},
-		notify: make(chan struct{}),
-	}
+	e := &entry{cm: cm, notify: make(chan struct{})}
 	c.tail.next = e
 	close(c.tail.notify)
 	c.tail = e
+}
+
+// AppendChannelMessage performs one atomic publish: it hands msgs to
+// the underlying storage backend (which mints the channelSerial,
+// stamps each Message.Serial, and persists the resulting cm) and on a
+// non-idempotent return links the cm into the live list before
+// returning. The (cm, idempotent, err) tuple is forwarded from
+// storage; idempotent=true means a prior publish carrying one of the
+// msgs' IDs was matched and nothing new was linked.
+func (c *Channel) AppendChannelMessage(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
+	cm, idempotent, err := c.store.AppendChannelMessage(ctx, msgs)
+	if err != nil {
+		return nil, false, err
+	}
+	if !idempotent {
+		c.Append(cm)
+	}
+	return cm, idempotent, nil
 }
 
 // Attach returns a Stream positioned at the current tail. The Stream's

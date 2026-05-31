@@ -16,7 +16,17 @@ import (
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/storage/memory"
 )
+
+// publish is a test helper around Channel.AppendChannelMessage that
+// fails the test on error.
+func publish(t *testing.T, m *core.Manager, channel string, msgs ...*protocol.Message) {
+	t.Helper()
+	if _, _, err := m.GetChannel(channel).AppendChannelMessage(context.Background(), msgs); err != nil {
+		t.Fatalf("publish to %q: %v", channel, err)
+	}
+}
 
 const testKey = "app.key:secret"
 
@@ -30,7 +40,7 @@ func newTestServer(t *testing.T, hb time.Duration) (*httptest.Server, *core.Mana
 	if err != nil {
 		t.Fatalf("parse api key: %v", err)
 	}
-	manager := core.NewManager()
+	manager := core.NewManager(memory.New(memory.Options{}))
 	rt := NewServer(parsed, manager, hb, slog.New(slog.DiscardHandler))
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", rt.HandleWebSocket)
@@ -285,7 +295,7 @@ func TestAttachForwardsPublishedMessages(t *testing.T) {
 		t.Fatalf("expected ATTACHED, got %v", msg.Action)
 	}
 
-	manager.GetChannel("foo").Append(&protocol.Message{ID: "m1"})
+	publish(t, manager, "foo", &protocol.Message{ID: "m1"})
 
 	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
 	if msg.Action != protocol.ActionMessage {
@@ -329,7 +339,7 @@ func TestAttachIsIdempotentPerChannel(t *testing.T) {
 		t.Fatalf("expected ATTACHED, got %v", msg.Action)
 	}
 
-	manager.GetChannel("foo").Append(&protocol.Message{ID: "m1"})
+	publish(t, manager, "foo", &protocol.Message{ID: "m1"})
 
 	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
 	if msg.Action != protocol.ActionMessage {
@@ -370,8 +380,8 @@ func TestAttachSupportsMultipleChannels(t *testing.T) {
 		t.Fatalf("ATTACHED channels = %v, want both foo and bar", got)
 	}
 
-	manager.GetChannel("foo").Append(&protocol.Message{ID: "f1"})
-	manager.GetChannel("bar").Append(&protocol.Message{ID: "b1"})
+	publish(t, manager, "foo", &protocol.Message{ID: "f1"})
+	publish(t, manager, "bar", &protocol.Message{ID: "b1"})
 
 	seen := map[string]string{}
 	for range 2 {
@@ -595,7 +605,7 @@ func TestDetachReceivesDetached(t *testing.T) {
 	}
 
 	// Publishing after detach should not forward to this connection.
-	manager.GetChannel("foo").Append(&protocol.Message{ID: "m1"})
+	publish(t, manager, "foo", &protocol.Message{ID: "m1"})
 	if err := ws.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
 		t.Fatalf("SetReadDeadline: %v", err)
 	}

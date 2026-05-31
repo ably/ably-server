@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/ably/ably-server/internal/protocol"
-	"github.com/ably/ably-server/internal/serial"
+	"github.com/ably/ably-server/internal/storage/memory"
 )
 
 // stepClock returns a clock func that advances by 1 ms on every call,
@@ -19,11 +19,26 @@ func stepClock(start int64) func() int64 {
 	return func() int64 { return ts.Add(1) }
 }
 
-// newTestChannel returns a Channel with a deterministic generator —
-// fixed seriesId and a monotonic stepping clock — so tests can assert
-// on serial values directly.
+// newTestChannel returns a Channel backed by a fresh in-memory store
+// with a deterministic SeriesID and stepping clock, so tests can
+// assert on serial values directly.
 func newTestChannel(name string) *Channel {
-	return newChannel(name, serial.NewGenerator("testseries0", stepClock(1000)))
+	store := memory.New(memory.Options{
+		SeriesID: "testseries0",
+		Now:      stepClock(1000),
+	})
+	return newChannel(name, store.Channel(name))
+}
+
+// publish is a thin test helper around Channel.AppendChannelMessage —
+// fails the test on error and otherwise returns the resulting cm.
+func publish(t *testing.T, c *Channel, msgs ...*protocol.Message) *protocol.ChannelMessage {
+	t.Helper()
+	cm, _, err := c.AppendChannelMessage(context.Background(), msgs)
+	if err != nil {
+		t.Fatalf("AppendChannelMessage: %v", err)
+	}
+	return cm
 }
 
 // isClosed reports whether ch is closed (non-blocking).
@@ -41,9 +56,9 @@ func TestChannelAppendBuildsList(t *testing.T) {
 	head := c.tail // sentinel; notify open, next nil
 
 	msgs := []*protocol.Message{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}}
-	// Each Append is its own publish — one ChannelMessage per call.
+	// Each publish is its own ChannelMessage — one entry per call.
 	for _, m := range msgs {
-		c.Append(m)
+		publish(t, c, m)
 	}
 
 	// Walk forward from the sentinel; verify each ChannelMessage in
@@ -86,7 +101,7 @@ func TestChannelAppendBuildsList(t *testing.T) {
 func TestChannelAppendStampsChannelSerialAndMessageSerial(t *testing.T) {
 	c := newTestChannel("test")
 	m := &protocol.Message{ID: "m1"}
-	c.Append(m)
+	publish(t, c, m)
 
 	tail := c.tail
 	wantCS := "00000000001000-000@testseries0"
@@ -104,7 +119,7 @@ func TestChannelAppendBatchSharesChannelSerial(t *testing.T) {
 	a := &protocol.Message{ID: "a"}
 	b := &protocol.Message{ID: "b"}
 	d := &protocol.Message{ID: "d"}
-	c.Append(a, b, d)
+	publish(t, c, a, b, d)
 
 	wantCS := "00000000001000-000@testseries0"
 	if c.tail.cm.ChannelSerial != wantCS {
@@ -136,7 +151,7 @@ func TestChannelNotifyWakesWaiter(t *testing.T) {
 		got <- head.next
 	}()
 
-	c.Append(&protocol.Message{ID: "m1"})
+	publish(t, c, &protocol.Message{ID: "m1"})
 
 	select {
 	case e := <-got:
@@ -164,7 +179,7 @@ func TestChannelNotifyWakesAllWaiters(t *testing.T) {
 		}()
 	}
 
-	c.Append(&protocol.Message{ID: "m1"})
+	publish(t, c, &protocol.Message{ID: "m1"})
 
 	deadline := time.After(time.Second)
 	for i := range waiters {
@@ -189,13 +204,15 @@ func TestChannelAppendIsConcurrentSafe(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range perWriter {
-				c.Append(&protocol.Message{ID: "x"})
+				// Empty ID — storage idempotency would dedup a shared
+				// non-empty ID across goroutines, defeating the test.
+				publish(t, c, &protocol.Message{})
 			}
 		}()
 	}
 	wg.Wait()
 
-	// Walk the list from the sentinel; every Append must be reachable
+	// Walk the list from the sentinel; every publish must be reachable
 	// as one ChannelMessage entry.
 	count := 0
 	for e := head; e.next != nil; e = e.next {
@@ -226,7 +243,7 @@ func TestStreamAttachOnEmptyChannelBlocksUntilAppend(t *testing.T) {
 		got <- cm
 	}()
 
-	c.Append(&protocol.Message{ID: "m1"})
+	publish(t, c, &protocol.Message{ID: "m1"})
 
 	select {
 	case cm := <-got:
@@ -247,8 +264,8 @@ func TestStreamAttachOnEmptyChannelBlocksUntilAppend(t *testing.T) {
 
 func TestStreamAttachAfterAppendsParksAtTail(t *testing.T) {
 	c := newTestChannel("test")
-	c.Append(&protocol.Message{ID: "m1"})
-	c.Append(&protocol.Message{ID: "m2"})
+	publish(t, c, &protocol.Message{ID: "m1"})
+	publish(t, c, &protocol.Message{ID: "m2"})
 
 	s := c.Attach()
 	atTail := s.ChannelSerial()
@@ -263,8 +280,12 @@ func TestStreamAttachAfterAppendsParksAtTail(t *testing.T) {
 		t.Fatal("Next returned with no fresh append; expected ctx error")
 	}
 
-	// Now publish a third message; Next should observe it.
-	go c.Append(&protocol.Message{ID: "m3"})
+	// Now publish a third message; Next should observe it. We can't
+	// use the publish helper here — t.Fatalf is unsafe from a goroutine
+	// not spawned by the test runner.
+	go func() {
+		_, _, _ = c.AppendChannelMessage(context.Background(), []*protocol.Message{{ID: "m3"}})
+	}()
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
 	defer cancel2()
@@ -296,13 +317,16 @@ func TestStreamNextReturnsAtomicBatchAsOneChannelMessage(t *testing.T) {
 	c := newTestChannel("test")
 	s := c.Attach()
 
-	// One Append with 3 messages is one ChannelMessage delivered as a
-	// single Next return.
-	go c.Append(
-		&protocol.Message{ID: "a"},
-		&protocol.Message{ID: "b"},
-		&protocol.Message{ID: "c"},
-	)
+	// One publish with 3 messages is one ChannelMessage delivered as
+	// a single Next return. Inline rather than via the publish helper:
+	// t.Fatalf is unsafe from non-test goroutines.
+	go func() {
+		_, _, _ = c.AppendChannelMessage(context.Background(), []*protocol.Message{
+			{ID: "a"},
+			{ID: "b"},
+			{ID: "c"},
+		})
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -320,10 +344,10 @@ func TestStreamNextReturnsAtomicBatchAsOneChannelMessage(t *testing.T) {
 	}
 
 	// A subsequent Next should park (no more entries until the next
-	// Append).
+	// publish).
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel2()
 	if _, err := s.Next(ctx2); err == nil {
-		t.Fatal("Next returned without a fresh Append; expected ctx error")
+		t.Fatal("Next returned without a fresh publish; expected ctx error")
 	}
 }

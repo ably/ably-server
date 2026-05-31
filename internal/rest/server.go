@@ -75,7 +75,11 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ch := s.manager.GetChannel(name)
-	ch.Append(msgs...)
+	if _, _, err := ch.AppendChannelMessage(r.Context(), msgs); err != nil {
+		s.logger.Warn("publish failed", "channel", name, "err", err)
+		http.Error(w, "publish failed", http.StatusInternalServerError)
+		return
+	}
 	w.WriteHeader(http.StatusCreated)
 }
 

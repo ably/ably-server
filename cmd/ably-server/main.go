@@ -21,6 +21,7 @@ import (
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/realtime"
 	"github.com/ably/ably-server/internal/rest"
+	"github.com/ably/ably-server/internal/storage/memory"
 )
 
 const apiKeyEnv = "ABLY_SERVER_API_KEY"
@@ -58,7 +59,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, out io.
 		return 1
 	}
 
-	manager := core.NewManager()
+	manager := core.NewManager(memory.New(memory.Options{}))
 	rt := realtime.NewServer(parsedKey, manager, *hbInterval, logger)
 	rs := rest.NewServer(parsedKey, manager, logger)
 

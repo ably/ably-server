@@ -161,11 +161,14 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 	}
 
 	ch := c.manager.GetChannel(msg.Channel)
-	ch.Append(msg.Messages...)
-
-	// ACK after Append: in the in-memory backend Append cannot fail, but
-	// once storage lands ACK will mean "committed", so we issue it once
-	// the channel state reflects the publish.
+	if _, _, err := ch.AppendChannelMessage(ctx, msg.Messages); err != nil {
+		c.logger.Warn("publish failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerial, "err", err)
+		c.queue(ctx, &protocol.ProtocolMessage{
+			Action:    protocol.ActionNack,
+			MsgSerial: msg.MsgSerial,
+		})
+		return
+	}
 	c.queue(ctx, &protocol.ProtocolMessage{
 		Action:    protocol.ActionAck,
 		MsgSerial: msg.MsgSerial,

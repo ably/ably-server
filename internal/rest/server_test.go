@@ -17,6 +17,7 @@ import (
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/storage/memory"
 )
 
 const testKey = "app.key:secret"
@@ -30,7 +31,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *core.Manager) {
 	if err != nil {
 		t.Fatalf("parse api key: %v", err)
 	}
-	manager := core.NewManager()
+	manager := core.NewManager(memory.New(memory.Options{}))
 	rs := NewServer(parsed, manager, slog.New(slog.DiscardHandler))
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /channels/{name}/messages", rs.HandlePublish)

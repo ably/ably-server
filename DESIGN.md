@@ -370,6 +370,10 @@ mutex around append. Attachments tail the list at their own pace, with no
 fan-out channels and no per-attachment buffering. Each list entry is one
 ChannelMessage (§8) — an atomic publish carrying one or more Messages.
 
+Serial minting and persistence live in the storage backend (§6, §8);
+Channel only links already-minted ChannelMessages so attachments can
+tail them.
+
 ```go
 type entry struct {
     cm     *ChannelMessage  // one atomic publish
@@ -378,31 +382,41 @@ type entry struct {
 }
 
 type Channel struct {
-    name string
-    gen  *serial.Generator  // mints channelSerials for this channel
+    name  string
+    store storage.ChannelStore  // sole minter of channelSerials
 
     mu   sync.Mutex
     tail *entry             // most recent entry
 }
 
-// Append publishes one atomic batch as a single ChannelMessage. The
-// caller passes raw Messages; Channel mints the channelSerial, stamps
-// each msg.Serial = "<channelSerial>:<idx>", and links the resulting
-// ChannelMessage as a single entry.
-func (c *Channel) Append(msgs ...*Message) {
+// Append links an already-minted ChannelMessage at the tail as a single
+// entry, waking parked streams. Performs no minting or Message.Serial
+// stamping — both are storage's responsibility upstream. Used directly
+// by the cluster broker's NOTIFY listener once it has fetched the
+// canonical row; intra-process publishes go through AppendChannelMessage.
+func (c *Channel) Append(cm *ChannelMessage) {
     c.mu.Lock()
     defer c.mu.Unlock()
-    channelSerial := c.gen.Mint()
-    for i, m := range msgs {
-        m.Serial = serial.MessageSerial(channelSerial, i)
-    }
-    e := &entry{
-        cm:     &ChannelMessage{ChannelSerial: channelSerial, Messages: msgs},
-        notify: make(chan struct{}),
-    }
+    e := &entry{cm: cm, notify: make(chan struct{})}
     c.tail.next = e
     close(c.tail.notify)
     c.tail = e
+}
+
+// AppendChannelMessage performs one atomic publish: storage mints the
+// channelSerial, stamps each Message.Serial, persists, and returns the
+// resulting cm; Channel links it into the live list on a non-idempotent
+// return. The (cm, idempotent, err) tuple is forwarded verbatim from
+// storage.
+func (c *Channel) AppendChannelMessage(ctx context.Context, msgs []*Message) (*ChannelMessage, bool, error) {
+    cm, idempotent, err := c.store.AppendChannelMessage(ctx, msgs)
+    if err != nil {
+        return nil, false, err
+    }
+    if !idempotent {
+        c.Append(cm)
+    }
+    return cm, idempotent, nil
 }
 
 func (c *Channel) Tail() *entry { /* mu-protected read */ }
@@ -441,12 +455,14 @@ Each WebSocket connection has:
 - An `attachments map[string]*Attachment` keyed by channel name.
 
 Inbound `MESSAGE` is routed to the matching attachment, which
-authorises the publish, builds a ChannelMessage from the inbound
-`messages[]`, persists via `Storage.AppendChannelMessage` (or, in
-cluster mode, lets the Postgres `INSERT` + `NOTIFY` round-trip do the
-local append), and replies with `ACK` / `NACK`. Inbound `ATTACH` /
-`DETACH` are handled by the connection itself, calling into
-`ChannelManager` to get/release a Channel.
+authorises the publish and calls `channel.AppendChannelMessage(ctx,
+messages)` — storage mints the channelSerial, stamps each contained
+`Message.serial`, persists the resulting ChannelMessage, and returns
+it; Channel links it into the live list (or, in cluster mode, the
+local `Append` is driven by the `NOTIFY` listener after fetching the
+canonical row). The connection then replies with `ACK` / `NACK`.
+Inbound `ATTACH` / `DETACH` are handled by the connection itself,
+calling into `ChannelManager` to get/release a Channel.
 
 ## 6. Storage
 
@@ -457,10 +473,20 @@ type Storage interface {
 }
 
 type ChannelStore interface {
-    AppendChannelMessage(ctx context.Context, cm *protocol.ChannelMessage) error
+    // AppendChannelMessage mints the channelSerial, stamps each
+    // msgs[i].Serial = "<channelSerial>:<idx>", persists the resulting
+    // ChannelMessage, and returns it. If any contained Message.ID has
+    // already been seen on this channel within the retention window,
+    // the call is idempotent: idempotent=true and the originally-
+    // persisted ChannelMessage is returned without re-appending.
+    AppendChannelMessage(ctx context.Context, msgs []*protocol.Message) (cm *protocol.ChannelMessage, idempotent bool, err error)
     History(ctx context.Context, q HistoryQuery) (HistoryPage, error)
 }
 ```
+
+Serial minting and idempotency live behind this interface so persistent
+backends (bbolt, Postgres) can restore monotonic generator state across
+restarts alongside the data it secures (§8).
 
 ### 6.1 Memory backend
 
@@ -580,16 +606,18 @@ directly.
 There is no pub/sub abstraction. A publish is a direct sequence:
 
 1. Authorise.
-2. If any message in the publish carries a client-supplied
-   `Message.id`, look it up in storage for this channel; on hit,
-   return the stored `channelSerial` and stop.
-3. Mint a single `channelSerial` (§8) for the publish, then build a
-   `ChannelMessage{channelSerial, messages}` stamping each contained
-   `Message.serial = channelSerial + ":" + idx`.
-4. `Storage.AppendChannelMessage` — persists the ChannelMessage as
-   one unit and indexes any contained `Message.id` against the
-   channelSerial.
-5. `channel.Append(channelMessage)` on the in-process Channel.
+2. `channel.AppendChannelMessage(ctx, messages)` — delegates to the
+   backend's `Storage.AppendChannelMessage`, which atomically:
+   - checks any contained `Message.id` against this channel's
+     idempotency index; on hit, returns the originally-persisted
+     ChannelMessage with `idempotent=true` and no new row is written;
+   - otherwise mints a fresh `channelSerial` (§8), stamps each
+     `Message.serial = channelSerial + ":" + idx`, persists the
+     resulting `ChannelMessage{channelSerial, messages}` as one unit,
+     and indexes any contained `Message.id`.
+3. On a non-idempotent return, Channel links the cm into its live
+   list as a single entry; attachments park on the previous tail's
+   `notify` wake up and observe the new entry.
 
 All attachments are on the same node and tail the same list.
 

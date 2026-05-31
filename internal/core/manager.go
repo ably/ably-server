@@ -3,35 +3,24 @@ package core
 import (
 	"sync"
 
-	"github.com/ably/ably-server/internal/serial"
+	"github.com/ably/ably-server/internal/storage"
 )
 
-// Manager owns the set of active Channels in this process, plus the
-// per-process seriesId used by every channel's serial generator.
+// Manager owns the set of active Channels in this process. Each
+// Channel is backed by a per-name facet of the shared storage, which
+// is the sole authority for channelSerial minting and idempotency
+// (DESIGN.md §6, §8).
 type Manager struct {
-	seriesID string
-	now      func() int64
+	store storage.Storage
 
 	mu       sync.Mutex
 	channels map[string]*Channel
 }
 
-// NewManager constructs an empty Manager with a freshly-minted
-// seriesId and the real-time clock.
-func NewManager() *Manager {
-	return newManager(serial.NewSeriesID(), nil)
-}
-
-// NewManagerWithClock is NewManager with an injected clock — used by
-// tests that need deterministic timeserials.
-func NewManagerWithClock(now func() int64) *Manager {
-	return newManager(serial.NewSeriesID(), now)
-}
-
-func newManager(seriesID string, now func() int64) *Manager {
+// NewManager constructs an empty Manager backed by store.
+func NewManager(store storage.Storage) *Manager {
 	return &Manager{
-		seriesID: seriesID,
-		now:      now,
+		store:    store,
 		channels: make(map[string]*Channel),
 	}
 }
@@ -44,7 +33,7 @@ func (m *Manager) GetChannel(name string) *Channel {
 	if ch, ok := m.channels[name]; ok {
 		return ch
 	}
-	ch := newChannel(name, serial.NewGenerator(m.seriesID, m.now))
+	ch := newChannel(name, m.store.Channel(name))
 	m.channels[name] = ch
 	return ch
 }
