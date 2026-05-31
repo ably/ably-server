@@ -92,15 +92,21 @@ func Open(opts Options) (*Storage, error) {
 	}, nil
 }
 
-// Channel returns the ChannelStore for name. Successive calls with
-// the same name return the same instance.
-func (s *Storage) Channel(name string) storage.ChannelStore {
+// Channel returns the ChannelStore for name, binding it to appender
+// on first access. Subsequent calls with the same name return the
+// same instance and ignore the new appender.
+func (s *Storage) Channel(name string, appender storage.Appender) storage.ChannelStore {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if cs, ok := s.channels[name]; ok {
 		return cs
 	}
-	cs := &channelStore{db: s.db, gen: s.gen, name: name}
+	cs := &channelStore{
+		db:       s.db,
+		gen:      s.gen,
+		name:     name,
+		appender: appender,
+	}
 	s.channels[name] = cs
 	return cs
 }
@@ -133,14 +139,15 @@ func channelPrefix(channel string) []byte {
 // bolt (one writer at a time per DB) and by the shared generator's
 // internal mutex.
 type channelStore struct {
-	db   *bolt.DB
-	gen  *serial.Generator
-	name string
+	db       *bolt.DB
+	gen      *serial.Generator
+	name     string
+	appender storage.Appender
 }
 
-func (cs *channelStore) AppendChannelMessage(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
+func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
 	if len(msgs) == 0 {
-		return nil, false, errors.New("storage/bbolt: AppendChannelMessage with no messages")
+		return nil, false, errors.New("storage/bbolt: Store with no messages")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
@@ -206,6 +213,14 @@ func (cs *channelStore) AppendChannelMessage(ctx context.Context, msgs []*protoc
 	})
 	if err != nil {
 		return nil, false, err
+	}
+
+	// Fire the appender outside the bolt tx — Append takes Channel's
+	// mu, and we want the bolt write lock released ASAP. Idempotent
+	// returns do not re-fire (the original was delivered on its
+	// first persist).
+	if !idempotent && cs.appender != nil {
+		cs.appender.Append(resultCM)
 	}
 	return resultCM, idempotent, nil
 }

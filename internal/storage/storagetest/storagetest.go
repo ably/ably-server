@@ -26,10 +26,10 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("AppendStampsChannelSerialAndMessageSerials", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo")
-		cm, idempotent, err := ch.AppendChannelMessage(context.Background(), []*protocol.Message{{Name: "x"}})
+		ch := s.Channel("foo", nil)
+		cm, idempotent, err := ch.Store(context.Background(), []*protocol.Message{{Name: "x"}})
 		if err != nil {
-			t.Fatalf("AppendChannelMessage: %v", err)
+			t.Fatalf("Store: %v", err)
 		}
 		if idempotent {
 			t.Fatal("idempotent=true on a fresh publish")
@@ -48,11 +48,11 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("AppendStampsBatchWithSharedChannelSerial", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo")
+		ch := s.Channel("foo", nil)
 		msgs := []*protocol.Message{{Name: "a"}, {Name: "b"}, {Name: "c"}}
-		cm, _, err := ch.AppendChannelMessage(context.Background(), msgs)
+		cm, _, err := ch.Store(context.Background(), msgs)
 		if err != nil {
-			t.Fatalf("AppendChannelMessage: %v", err)
+			t.Fatalf("Store: %v", err)
 		}
 		if len(cm.Messages) != 3 {
 			t.Fatalf("Messages length = %d, want 3", len(cm.Messages))
@@ -67,10 +67,10 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("AppendsAreMonotonicallyOrdered", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo")
+		ch := s.Channel("foo", nil)
 		var prev string
 		for i := range 5 {
-			cm, _, err := ch.AppendChannelMessage(context.Background(), []*protocol.Message{{Name: "x"}})
+			cm, _, err := ch.Store(context.Background(), []*protocol.Message{{Name: "x"}})
 			if err != nil {
 				t.Fatalf("publish %d: %v", i, err)
 			}
@@ -83,16 +83,16 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("IdempotentReturnsOriginalOnRepeatID", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo")
+		ch := s.Channel("foo", nil)
 
-		first, idemp, err := ch.AppendChannelMessage(context.Background(), []*protocol.Message{{ID: "dup", Data: "v1"}})
+		first, idemp, err := ch.Store(context.Background(), []*protocol.Message{{ID: "dup", Data: "v1"}})
 		if err != nil || idemp {
 			t.Fatalf("first publish: err=%v idempotent=%v", err, idemp)
 		}
 
 		// Re-publish with the same ID but different payload — should
 		// return the original ChannelMessage and not re-append.
-		second, idemp, err := ch.AppendChannelMessage(context.Background(), []*protocol.Message{{ID: "dup", Data: "v2"}})
+		second, idemp, err := ch.Store(context.Background(), []*protocol.Message{{ID: "dup", Data: "v2"}})
 		if err != nil {
 			t.Fatalf("second publish: %v", err)
 		}
@@ -118,16 +118,16 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("IdempotencyMatchesAnyMessageInBatch", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo")
+		ch := s.Channel("foo", nil)
 
-		first, _, err := ch.AppendChannelMessage(context.Background(), []*protocol.Message{{ID: "a"}, {ID: "b"}})
+		first, _, err := ch.Store(context.Background(), []*protocol.Message{{ID: "a"}, {ID: "b"}})
 		if err != nil {
 			t.Fatalf("first publish: %v", err)
 		}
 
 		// A new publish where any contained id matches should be
 		// treated as a duplicate.
-		second, idemp, err := ch.AppendChannelMessage(context.Background(), []*protocol.Message{{ID: "c"}, {ID: "b"}})
+		second, idemp, err := ch.Store(context.Background(), []*protocol.Message{{ID: "c"}, {ID: "b"}})
 		if err != nil {
 			t.Fatalf("second publish: %v", err)
 		}
@@ -141,13 +141,13 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("EmptyIDsAreAlwaysNew", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo")
+		ch := s.Channel("foo", nil)
 
-		first, _, err := ch.AppendChannelMessage(context.Background(), []*protocol.Message{{Name: "x"}})
+		first, _, err := ch.Store(context.Background(), []*protocol.Message{{Name: "x"}})
 		if err != nil {
 			t.Fatalf("first publish: %v", err)
 		}
-		second, idemp, err := ch.AppendChannelMessage(context.Background(), []*protocol.Message{{Name: "y"}})
+		second, idemp, err := ch.Store(context.Background(), []*protocol.Message{{Name: "y"}})
 		if err != nil {
 			t.Fatalf("second publish: %v", err)
 		}
@@ -161,22 +161,22 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("AppendRejectsEmptyBatch", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo")
-		if _, _, err := ch.AppendChannelMessage(context.Background(), nil); err == nil {
-			t.Error("AppendChannelMessage(nil) returned no error")
+		ch := s.Channel("foo", nil)
+		if _, _, err := ch.Store(context.Background(), nil); err == nil {
+			t.Error("Store(nil) returned no error")
 		}
-		if _, _, err := ch.AppendChannelMessage(context.Background(), []*protocol.Message{}); err == nil {
-			t.Error("AppendChannelMessage([]) returned no error")
+		if _, _, err := ch.Store(context.Background(), []*protocol.Message{}); err == nil {
+			t.Error("Store([]) returned no error")
 		}
 	})
 
 	t.Run("HistoryFromStartReturnsAllInOrder", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo")
+		ch := s.Channel("foo", nil)
 
 		var serials []string
 		for i := range 4 {
-			cm, _, err := ch.AppendChannelMessage(context.Background(), []*protocol.Message{{Name: "x", Data: i}})
+			cm, _, err := ch.Store(context.Background(), []*protocol.Message{{Name: "x", Data: i}})
 			if err != nil {
 				t.Fatalf("publish %d: %v", i, err)
 			}
@@ -202,11 +202,11 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryAfterSerialExcludesThatSerial", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo")
+		ch := s.Channel("foo", nil)
 
 		var serials []string
 		for range 4 {
-			cm, _, _ := ch.AppendChannelMessage(context.Background(), []*protocol.Message{{Name: "x"}})
+			cm, _, _ := ch.Store(context.Background(), []*protocol.Message{{Name: "x"}})
 			serials = append(serials, cm.ChannelSerial)
 		}
 
@@ -224,9 +224,9 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryAfterUnknownSerialReturnsLaterEntries", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo")
+		ch := s.Channel("foo", nil)
 
-		cm, _, _ := ch.AppendChannelMessage(context.Background(), []*protocol.Message{{Name: "x"}})
+		cm, _, _ := ch.Store(context.Background(), []*protocol.Message{{Name: "x"}})
 
 		// An "unknown" serial that sorts before cm's serial — history
 		// should return cm.
@@ -241,9 +241,9 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryAfterHeadReturnsEmpty", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo")
+		ch := s.Channel("foo", nil)
 
-		cm, _, _ := ch.AppendChannelMessage(context.Background(), []*protocol.Message{{Name: "x"}})
+		cm, _, _ := ch.Store(context.Background(), []*protocol.Message{{Name: "x"}})
 
 		page, err := ch.History(context.Background(), storage.HistoryQuery{AfterChannelSerial: cm.ChannelSerial})
 		if err != nil {
@@ -256,10 +256,10 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryWithLimitSetsHasMore", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo")
+		ch := s.Channel("foo", nil)
 
 		for range 5 {
-			_, _, _ = ch.AppendChannelMessage(context.Background(), []*protocol.Message{{Name: "x"}})
+			_, _, _ = ch.Store(context.Background(), []*protocol.Message{{Name: "x"}})
 		}
 
 		page, err := ch.History(context.Background(), storage.HistoryQuery{Limit: 2})
@@ -286,12 +286,12 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 	t.Run("ChannelsAreIsolated", func(t *testing.T) {
 		s := f(t)
 
-		fooCM, _, err := s.Channel("foo").AppendChannelMessage(context.Background(), []*protocol.Message{{ID: "x"}})
+		fooCM, _, err := s.Channel("foo", nil).Store(context.Background(), []*protocol.Message{{ID: "x"}})
 		if err != nil {
 			t.Fatalf("foo publish: %v", err)
 		}
 		// Same ID, different channel — must NOT be idempotent.
-		barCM, idemp, err := s.Channel("bar").AppendChannelMessage(context.Background(), []*protocol.Message{{ID: "x"}})
+		barCM, idemp, err := s.Channel("bar", nil).Store(context.Background(), []*protocol.Message{{ID: "x"}})
 		if err != nil {
 			t.Fatalf("bar publish: %v", err)
 		}
@@ -303,7 +303,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 		}
 
 		// History on foo must not include bar's publish.
-		page, err := s.Channel("foo").History(context.Background(), storage.HistoryQuery{})
+		page, err := s.Channel("foo", nil).History(context.Background(), storage.HistoryQuery{})
 		if err != nil {
 			t.Fatalf("foo History: %v", err)
 		}
@@ -314,11 +314,11 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("SameChannelInstanceReturned", func(t *testing.T) {
 		s := f(t)
-		a := s.Channel("foo")
-		b := s.Channel("foo")
+		a := s.Channel("foo", nil)
+		b := s.Channel("foo", nil)
 
 		// Publish via a; History via b must see it.
-		cm, _, err := a.AppendChannelMessage(context.Background(), []*protocol.Message{{Name: "x"}})
+		cm, _, err := a.Store(context.Background(), []*protocol.Message{{Name: "x"}})
 		if err != nil {
 			t.Fatalf("publish: %v", err)
 		}
@@ -333,7 +333,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("ConcurrentAppendsAreUniqueAndOrdered", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo")
+		ch := s.Channel("foo", nil)
 
 		const workers = 10
 		const perWorker = 20
@@ -346,7 +346,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 			go func() {
 				defer wg.Done()
 				for range perWorker {
-					cm, _, err := ch.AppendChannelMessage(context.Background(), []*protocol.Message{{Name: "x"}})
+					cm, _, err := ch.Store(context.Background(), []*protocol.Message{{Name: "x"}})
 					if err != nil {
 						t.Errorf("publish: %v", err)
 						return

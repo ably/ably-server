@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/storage"
 )
 
 // entry is a node in a Channel's linked list of ChannelMessages. Each
@@ -21,16 +22,18 @@ type entry struct {
 	next   *entry
 }
 
-// Channel holds the live ChannelMessage list for one channel name. It
-// owns no goroutine; concurrency is serialised by mu around Append.
+// Channel holds the live ChannelMessage list for one channel name and
+// the storage facet that backs it. It owns no goroutine; concurrency
+// is serialised by mu around Append.
 //
-// Channel is intentionally storage-agnostic. Callers (the realtime
-// connection's publish path, the REST publish handler, and the cluster
-// broker's NOTIFY listener) ask the storage backend for a minted
-// ChannelMessage and then pass it to Append to link it onto the live
-// list.
+// Publish() is the orchestration entry point: it calls Store on the
+// underlying storage and lets the storage backend drive the local
+// Append via the Appender callback we registered at construction
+// time. The same Append path is used for foreign publishes arriving
+// via the Postgres broker in cluster mode (DESIGN.md §7).
 type Channel struct {
-	name string
+	name  string
+	store storage.ChannelStore
 
 	mu   sync.Mutex
 	tail *entry // never nil: a sentinel is installed at construction
@@ -38,7 +41,9 @@ type Channel struct {
 
 // newChannel constructs a Channel. The list starts with a sentinel
 // entry (no ChannelMessage) so Attach is safe before any Append.
-func newChannel(name string) *Channel {
+// store may be nil for tests that only exercise the linked-list /
+// stream machinery; Publish requires a non-nil store.
+func newChannel(name string, store storage.ChannelStore) *Channel {
 	return &Channel{
 		name: name,
 		tail: &entry{notify: make(chan struct{})},
@@ -50,10 +55,22 @@ func (c *Channel) Name() string {
 	return c.name
 }
 
+// Publish runs the full publish-and-link sequence: hand msgs to the
+// underlying storage backend, which mints the channelSerial, persists,
+// and (in cluster mode) emits a NOTIFY. The link onto the live list
+// always arrives via the Appender callback the Channel registered at
+// construction — synchronously in single-process backends,
+// asynchronously via the LISTEN goroutine in cluster mode. The
+// (cm, idempotent, err) tuple is forwarded verbatim from storage.
+func (c *Channel) Publish(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
+	return c.store.Store(ctx, msgs)
+}
+
 // Append links an already-minted ChannelMessage at the tail as a
-// single entry, waking any parked streams. Storage upstream is
-// responsible for minting the ChannelSerial and stamping each
-// contained Message.Serial; Append performs neither.
+// single entry, waking any parked streams. It satisfies the
+// storage.Appender interface — the storage backend calls this to
+// deliver a persisted cm to subscribers (the publisher's own publish
+// in memory/bbolt; every node's publish in cluster mode).
 //
 // A no-op when cm is nil or carries no Messages.
 func (c *Channel) Append(cm *protocol.ChannelMessage) {

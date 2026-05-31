@@ -13,7 +13,6 @@ import (
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/id"
 	"github.com/ably/ably-server/internal/protocol"
-	"github.com/ably/ably-server/internal/storage"
 )
 
 // DefaultHeartbeatInterval is the cadence of server-driven HEARTBEAT
@@ -25,20 +24,18 @@ const DefaultHeartbeatInterval = 15 * time.Second
 type Server struct {
 	authn             *auth.Authenticator
 	manager           *core.Manager
-	store             storage.Storage
 	heartbeatInterval time.Duration
 	logger            *slog.Logger
 	upgrader          websocket.Upgrader
 }
 
-// NewServer constructs a Server. All arguments are required; callers
-// supply an explicit Manager (live channel state), Storage (persistence
-// + serial minting), heartbeat cadence, and logger.
-func NewServer(key auth.APIKey, manager *core.Manager, store storage.Storage, heartbeatInterval time.Duration, logger *slog.Logger) *Server {
+// NewServer constructs a Server. The Manager pairs each Channel with
+// its storage facet — publishes go through Channel.Publish, which
+// delegates to the storage backend.
+func NewServer(key auth.APIKey, manager *core.Manager, heartbeatInterval time.Duration, logger *slog.Logger) *Server {
 	return &Server{
 		authn:             auth.NewAuthenticator(key),
 		manager:           manager,
-		store:             store,
 		heartbeatInterval: heartbeatInterval,
 		logger:            logger,
 		upgrader: websocket.Upgrader{
@@ -81,7 +78,6 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		heartbeatInterval: s.heartbeatInterval,
 		logger:            s.logger.With("connId", connID),
 		manager:           s.manager,
-		store:             s.store,
 		outbound:          make(chan *protocol.ProtocolMessage, 16),
 		attachments:       make(map[string]*attachment),
 	}

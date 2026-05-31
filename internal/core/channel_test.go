@@ -37,7 +37,7 @@ func isClosed(ch <-chan struct{}) bool {
 }
 
 func TestChannelAppendBuildsList(t *testing.T) {
-	c := newChannel("test")
+	c := newChannel("test", nil)
 	head := c.tail // sentinel; notify open, next nil
 
 	cms := []*protocol.ChannelMessage{
@@ -78,7 +78,7 @@ func TestChannelAppendBuildsList(t *testing.T) {
 }
 
 func TestChannelAppendIsNoOpOnNilOrEmpty(t *testing.T) {
-	c := newChannel("test")
+	c := newChannel("test", nil)
 	head := c.tail
 
 	c.Append(nil)
@@ -95,7 +95,7 @@ func TestChannelAppendIsNoOpOnNilOrEmpty(t *testing.T) {
 }
 
 func TestChannelNotifyWakesWaiter(t *testing.T) {
-	c := newChannel("test")
+	c := newChannel("test", nil)
 	head := c.tail
 
 	got := make(chan *entry, 1)
@@ -120,7 +120,7 @@ func TestChannelNotifyWakesWaiter(t *testing.T) {
 }
 
 func TestChannelNotifyWakesAllWaiters(t *testing.T) {
-	c := newChannel("test")
+	c := newChannel("test", nil)
 	head := c.tail
 
 	const waiters = 5
@@ -145,7 +145,7 @@ func TestChannelNotifyWakesAllWaiters(t *testing.T) {
 }
 
 func TestChannelAppendIsConcurrentSafe(t *testing.T) {
-	c := newChannel("test")
+	c := newChannel("test", nil)
 	head := c.tail
 
 	const writers = 10
@@ -177,7 +177,7 @@ func TestChannelAppendIsConcurrentSafe(t *testing.T) {
 }
 
 func TestStreamAttachOnEmptyChannelBlocksUntilAppend(t *testing.T) {
-	c := newChannel("test")
+	c := newChannel("test", nil)
 	s := c.Attach()
 
 	if got := s.ChannelSerial(); got != "" {
@@ -216,7 +216,7 @@ func TestStreamAttachOnEmptyChannelBlocksUntilAppend(t *testing.T) {
 }
 
 func TestStreamAttachAfterAppendsParksAtTail(t *testing.T) {
-	c := newChannel("test")
+	c := newChannel("test", nil)
 	c.Append(newCM("001", "m1"))
 	c.Append(newCM("002", "m2"))
 
@@ -250,7 +250,7 @@ func TestStreamAttachAfterAppendsParksAtTail(t *testing.T) {
 }
 
 func TestStreamNextRespectsContext(t *testing.T) {
-	c := newChannel("test")
+	c := newChannel("test", nil)
 	s := c.Attach()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -262,7 +262,7 @@ func TestStreamNextRespectsContext(t *testing.T) {
 }
 
 func TestStreamNextReturnsAtomicBatchAsOneChannelMessage(t *testing.T) {
-	c := newChannel("test")
+	c := newChannel("test", nil)
 	s := c.Attach()
 
 	// One Append carrying 3 messages is one ChannelMessage delivered

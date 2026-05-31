@@ -77,9 +77,9 @@ func run(ctx context.Context, args []string, getenv func(string) string, out io.
 	}()
 	logger.Info("storage ready", "mode", *mode)
 
-	manager := core.NewManager()
-	rt := realtime.NewServer(parsedKey, manager, store, *hbInterval, logger)
-	rs := rest.NewServer(parsedKey, manager, store, logger)
+	manager := core.NewManager(store)
+	rt := realtime.NewServer(parsedKey, manager, *hbInterval, logger)
+	rs := rest.NewServer(parsedKey, manager, logger)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", rt.HandleWebSocket)

@@ -16,29 +16,22 @@ import (
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/protocol"
-	"github.com/ably/ably-server/internal/storage"
 	"github.com/ably/ably-server/internal/storage/memory"
 )
 
-// testHarness bundles the per-test core+storage pair so test helpers
-// can drive both layers without every call site having to thread two
-// dependencies. Tests that need to publish use harness.publish.
+// testHarness gives tests a single handle for driving publishes
+// through the same path the server uses.
 type testHarness struct {
 	manager *core.Manager
-	store   storage.Storage
 }
 
-// publish runs the full intra-process publish: storage mints + persists,
-// then the local Channel is linked (skipped on idempotent return). The
-// test fails on storage error.
+// publish runs a publish via core.Channel.Publish, which delegates to
+// the storage backend (in-process for these tests). Fails the test
+// on storage error.
 func (h *testHarness) publish(t *testing.T, channel string, msgs ...*protocol.Message) {
 	t.Helper()
-	cm, idempotent, err := h.store.Channel(channel).AppendChannelMessage(context.Background(), msgs)
-	if err != nil {
+	if _, _, err := h.manager.GetChannel(channel).Publish(context.Background(), msgs); err != nil {
 		t.Fatalf("publish to %q: %v", channel, err)
-	}
-	if !idempotent {
-		h.manager.GetChannel(channel).Append(cm)
 	}
 }
 
@@ -55,14 +48,13 @@ func newTestServer(t *testing.T, hb time.Duration) (*httptest.Server, *testHarne
 	if err != nil {
 		t.Fatalf("parse api key: %v", err)
 	}
-	manager := core.NewManager()
-	store := memory.New(memory.Options{})
-	rt := NewServer(parsed, manager, store, hb, slog.New(slog.DiscardHandler))
+	manager := core.NewManager(memory.New(memory.Options{}))
+	rt := NewServer(parsed, manager, hb, slog.New(slog.DiscardHandler))
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", rt.HandleWebSocket)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return srv, &testHarness{manager: manager, store: store}
+	return srv, &testHarness{manager: manager}
 }
 
 // dial connects a WebSocket client to srv with the test key included as

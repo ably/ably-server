@@ -1,24 +1,47 @@
 // Package postgres is the database-backed storage backend used by
-// ably-server's cluster mode (DESIGN.md §6.3).
+// ably-server's cluster mode (DESIGN.md §6.3, §7.2).
 //
 // State is held in a single `messages` table (one row per Message,
 // grouped under a shared channelSerial PK), provisioned at Open() via
 // an embedded migration sweep guarded by a session-scoped
 // pg_advisory_lock — so N nodes booting simultaneously against an
 // empty database serialise on the lock and only one applies the
-// pending migrations. Each publish runs inside a transaction that
-// takes a per-channel advisory lock (pg_advisory_xact_lock) so
-// concurrent writers serialise per channel without blocking writers
-// on other channels. Idempotency on client-supplied Message.IDs is
-// enforced by a partial UNIQUE index on (channel, id).
+// pending migrations.
+//
+// The publish path:
+//
+//   - ChannelStore.Store persists the cm and emits a NOTIFY on
+//     channel "ably_channel" inside the same transaction (PG buffers
+//     NOTIFYs until commit, so listeners only see it if the publish
+//     committed).
+//   - A LISTEN goroutine inside Storage, running on a dedicated
+//     pgx.Conn, receives every NOTIFY (including the publisher's
+//     own), fetches the canonical cm by (channel, channel_serial),
+//     looks up the channelStore that was registered for that channel
+//     via Channel(name, appender), and calls appender.Append(cm).
+//
+// There is no self-dedup at the broker level: the publish path does
+// not call the appender directly; the appender is the sole writer to
+// the live linked list, always via the LISTEN round-trip. NOTIFYs for
+// channels that no one on this node has opened (no Channel(name,…)
+// call yet) are silently dropped — local subscribers materialise the
+// channel via ATTACH, which calls core.Manager.GetChannel(name) and
+// in turn registers an appender here.
+//
+// Concurrent writers serialise per channel via a per-channel
+// pg_advisory_xact_lock inside Store's transaction, so the row
+// stream remains ordered by channelSerial without cross-channel
+// contention.
 package postgres
 
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/jackc/pgx/v5"
@@ -40,6 +63,18 @@ var migrationsFS embed.FS
 // someone else's code also picked this exact key on the same DB.
 const migrationLockKey int64 = 0x1ab1_e5e7_2e0a_17a3
 
+// notifyChannelName is the LISTEN channel used by the publish/subscribe
+// broker — distinct concept from an Ably channel.
+const notifyChannelName = "ably_channel"
+
+// notifyPayload is the JSON-encoded NOTIFY body. Keeping it JSON
+// avoids ambiguity in the face of Ably channel names that contain
+// arbitrary characters (including ':' and '@').
+type notifyPayload struct {
+	Channel string `json:"channel"`
+	Serial  string `json:"serial"`
+}
+
 // Options configures the Postgres backend.
 type Options struct {
 	// DSN is the libpq-style connection string (e.g.
@@ -58,12 +93,17 @@ type Storage struct {
 
 	mu       sync.Mutex
 	channels map[string]*channelStore
+
+	listenConn   *pgx.Conn
+	listenCancel context.CancelFunc
+	listenDone   chan struct{}
 }
 
 // Open dials Postgres at opts.DSN, applies any pending migrations
 // (under a session-scoped advisory lock so concurrent Opens
-// serialise), and returns a Storage ready for use. The seriesId is
-// freshly generated per process — multi-node deployments rely on
+// serialise), opens a dedicated LISTEN connection for the cluster
+// pub/sub broker, and returns a Storage ready for use. The seriesId
+// is freshly generated per process — multi-node deployments rely on
 // distinct per-node seriesIds to disambiguate concurrent mints
 // (DESIGN.md §8).
 func Open(ctx context.Context, opts Options) (*Storage, error) {
@@ -82,11 +122,147 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 		pool.Close()
 		return nil, fmt.Errorf("storage/postgres: migrate: %w", err)
 	}
-	return &Storage{
-		pool:     pool,
-		gen:      serial.NewGenerator(serial.NewSeriesID(), opts.Now),
-		channels: make(map[string]*channelStore),
-	}, nil
+
+	// Dedicated LISTEN connection. pgxpool doesn't expose the long-
+	// lived single-conn semantics LISTEN needs, so we acquire a
+	// separate raw conn for the broker goroutine.
+	listenConn, err := pgx.Connect(ctx, opts.DSN)
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("storage/postgres: dial LISTEN conn: %w", err)
+	}
+	if _, err := listenConn.Exec(ctx, `LISTEN `+pgx.Identifier{notifyChannelName}.Sanitize()); err != nil {
+		_ = listenConn.Close(context.Background())
+		pool.Close()
+		return nil, fmt.Errorf("storage/postgres: LISTEN: %w", err)
+	}
+
+	s := &Storage{
+		pool:       pool,
+		gen:        serial.NewGenerator(serial.NewSeriesID(), opts.Now),
+		channels:   make(map[string]*channelStore),
+		listenConn: listenConn,
+		listenDone: make(chan struct{}),
+	}
+
+	loopCtx, cancel := context.WithCancel(context.Background())
+	s.listenCancel = cancel
+	go s.listenLoop(loopCtx)
+	return s, nil
+}
+
+// Channel returns the ChannelStore for name, binding it to appender
+// on first access. Subsequent calls with the same name return the
+// same instance and ignore the new appender. The internal LISTEN
+// goroutine looks up channelStores in this map by name to dispatch
+// notifications.
+func (s *Storage) Channel(name string, appender storage.Appender) storage.ChannelStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cs, ok := s.channels[name]; ok {
+		return cs
+	}
+	cs := &channelStore{pool: s.pool, gen: s.gen, name: name, appender: appender}
+	s.channels[name] = cs
+	return cs
+}
+
+// Close stops the LISTEN goroutine, closes the LISTEN conn, and
+// releases the pool.
+func (s *Storage) Close() error {
+	if s.listenCancel != nil {
+		s.listenCancel()
+		<-s.listenDone
+	}
+	if s.listenConn != nil {
+		_ = s.listenConn.Close(context.Background())
+	}
+	s.pool.Close()
+	return nil
+}
+
+// listenLoop dispatches NOTIFY events to the registered channelStore
+// for each channel. A NOTIFY for an unregistered channel is dropped:
+// local attachments materialise the channelStore on demand via
+// Storage.Channel, so events that arrive before any local interest
+// are intentionally lost (the canonical cm is still in storage and
+// will be picked up by a subsequent ATTACH+resume via History).
+func (s *Storage) listenLoop(ctx context.Context) {
+	defer close(s.listenDone)
+
+	for {
+		n, err := s.listenConn.WaitForNotification(ctx)
+		if err != nil {
+			// Context cancellation is the expected shutdown path.
+			// Other errors are terminal for this conn — there's no
+			// reconnect strategy yet (TASK-22 follow-up).
+			return
+		}
+
+		var p notifyPayload
+		if err := json.Unmarshal([]byte(n.Payload), &p); err != nil {
+			continue // malformed; nothing actionable
+		}
+
+		s.mu.Lock()
+		cs, ok := s.channels[p.Channel]
+		s.mu.Unlock()
+		if !ok || cs.appender == nil {
+			continue
+		}
+
+		cm, err := s.loadChannelMessage(ctx, p.Channel, p.Serial)
+		if err != nil {
+			continue // best-effort; nothing we can do without the cm
+		}
+		cs.appender.Append(cm)
+	}
+}
+
+// loadChannelMessage fetches the canonical ChannelMessage at
+// (channel, channelSerial) via the pool. Used by the LISTEN loop
+// after each NOTIFY.
+func (s *Storage) loadChannelMessage(ctx context.Context, channel, channelSerial string) (*protocol.ChannelMessage, error) {
+	rows, err := s.pool.Query(ctx, sqlLoadCM, channel, channelSerial)
+	return decodeChannelMessageRows(rows, err, channel, channelSerial)
+}
+
+const sqlLoadCM = `
+SELECT idx, payload FROM messages
+WHERE channel = $1 AND channel_serial = $2
+ORDER BY idx
+`
+
+// decodeChannelMessageRows materialises a ChannelMessage from a rows
+// result of (idx, payload). Closes rows on exit.
+func decodeChannelMessageRows(rows pgx.Rows, queryErr error, channel, channelSerial string) (*protocol.ChannelMessage, error) {
+	if queryErr != nil {
+		return nil, fmt.Errorf("storage/postgres: load %s:%s: %w", channel, channelSerial, queryErr)
+	}
+	defer rows.Close()
+
+	cm := &protocol.ChannelMessage{ChannelSerial: channelSerial}
+	for rows.Next() {
+		var (
+			idx     int
+			payload []byte
+		)
+		if err := rows.Scan(&idx, &payload); err != nil {
+			return nil, fmt.Errorf("storage/postgres: scan %s:%s: %w", channel, channelSerial, err)
+		}
+		var m protocol.Message
+		if err := msgpack.Unmarshal(payload, &m); err != nil {
+			return nil, fmt.Errorf("storage/postgres: decode payload %s:%s idx=%d: %w", channel, channelSerial, idx, err)
+		}
+		cm.Messages = append(cm.Messages, &m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage/postgres: rows %s:%s: %w", channel, channelSerial, err)
+	}
+	if len(cm.Messages) == 0 {
+		return nil, fmt.Errorf("storage/postgres: ChannelMessage not found: %s:%s", channel, channelSerial)
+	}
+	return cm, nil
 }
 
 // migrate applies any pending embedded migrations under a session-
@@ -189,7 +365,7 @@ func listMigrations() ([]migration, error) {
 			return nil, fmt.Errorf("read migration %s: %w", name, err)
 		}
 		out = append(out, migration{
-			version: name[:len(name)-len(".sql")],
+			version: strings.TrimSuffix(name, ".sql"),
 			sql:     string(body),
 		})
 	}
@@ -220,47 +396,27 @@ func applyMigration(ctx context.Context, conn *pgxpool.Conn, m migration) error 
 	return nil
 }
 
-// Channel returns the ChannelStore for name. Successive calls with
-// the same name return the same instance.
-func (s *Storage) Channel(name string) storage.ChannelStore {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if cs, ok := s.channels[name]; ok {
-		return cs
-	}
-	cs := &channelStore{pool: s.pool, gen: s.gen, name: name}
-	s.channels[name] = cs
-	return cs
-}
-
-// Close releases the connection pool.
-func (s *Storage) Close() error {
-	s.pool.Close()
-	return nil
-}
-
 // channelStore is the per-channel facet. Concurrency is controlled by
-// the per-channel advisory lock taken inside AppendChannelMessage's
-// transaction — that lock serialises writers on the same channel
-// across all processes sharing this database.
+// the per-channel advisory lock taken inside Store's transaction —
+// that lock serialises writers on the same channel across every
+// process sharing this database.
 type channelStore struct {
-	pool *pgxpool.Pool
-	gen  *serial.Generator
-	name string
+	pool     *pgxpool.Pool
+	gen      *serial.Generator
+	name     string
+	appender storage.Appender
 }
 
-// AppendChannelMessage runs the full publish under a transaction:
-// take a per-channel advisory lock, look up any contained Message.IDs
-// for prior matches (idempotent return on hit), otherwise mint a
-// fresh channelSerial, stamp each Message.Serial, and insert the
-// channel_messages + messages rows. Caller-side ordering across
-// nodes is not preserved by the network race to acquire the lock —
-// what matters is that history ORDER BY channel_serial reflects the
-// global lex order of minted serials, which the serial format
-// guarantees (§8).
-func (cs *channelStore) AppendChannelMessage(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
+// Store persists one publish atomically: take a per-channel advisory
+// lock, look up any contained Message.IDs for prior matches
+// (idempotent return on hit), otherwise mint a fresh channelSerial,
+// stamp each Message.Serial, insert one row per Message, and emit a
+// NOTIFY on the broker channel. The cm is delivered to the channel's
+// appender asynchronously by the LISTEN goroutine after the NOTIFY
+// round-trips through the database.
+func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
 	if len(msgs) == 0 {
-		return nil, false, errors.New("storage/postgres: AppendChannelMessage with no messages")
+		return nil, false, errors.New("storage/postgres: Store with no messages")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
@@ -291,7 +447,7 @@ func (cs *channelStore) AppendChannelMessage(ctx context.Context, msgs []*protoc
 			cs.name, ids).Scan(&existingCS)
 		switch {
 		case err == nil:
-			original, lerr := loadChannelMessage(ctx, tx, cs.name, existingCS)
+			original, lerr := loadChannelMessageTx(ctx, tx, cs.name, existingCS)
 			if lerr != nil {
 				return nil, false, lerr
 			}
@@ -333,6 +489,21 @@ func (cs *channelStore) AppendChannelMessage(ctx context.Context, msgs []*protoc
 		}
 	}
 
+	// NOTIFY inside the tx: PG buffers the payload until commit, so
+	// listeners only see it if the publish actually lands. The
+	// LISTEN goroutine on every node (including this one) routes
+	// the cm to the channel's appender (DESIGN.md §7.2).
+	body, err := json.Marshal(notifyPayload{Channel: cs.name, Serial: channelSerial})
+	if err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: encode notify: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_notify($1, $2)`,
+		notifyChannelName, string(body),
+	); err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: notify: %w", err)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
 	}
@@ -349,9 +520,6 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 		return storage.HistoryPage{}, err
 	}
 
-	// We fetch Limit+1 distinct channel_serials to detect HasMore. The
-	// CTE picks the window of serials we want; the outer query joins
-	// back to messages for the actual rows.
 	limit := q.Limit
 	overLimit := q.Limit > 0
 	rows, err := cs.pool.Query(ctx, `
@@ -420,40 +588,10 @@ func nonEmptyIDs(msgs []*protocol.Message) []string {
 	return ids
 }
 
-// loadChannelMessage fetches a previously-persisted ChannelMessage by
-// (channel, channelSerial) — used to return the original on an
-// idempotent hit.
-func loadChannelMessage(ctx context.Context, tx pgx.Tx, channel, channelSerial string) (*protocol.ChannelMessage, error) {
-	rows, err := tx.Query(ctx,
-		`SELECT idx, payload FROM messages
-		 WHERE channel = $1 AND channel_serial = $2
-		 ORDER BY idx`,
-		channel, channelSerial)
-	if err != nil {
-		return nil, fmt.Errorf("storage/postgres: load original messages: %w", err)
-	}
-	defer rows.Close()
-
-	cm := &protocol.ChannelMessage{ChannelSerial: channelSerial}
-	for rows.Next() {
-		var (
-			idx     int
-			payload []byte
-		)
-		if err := rows.Scan(&idx, &payload); err != nil {
-			return nil, fmt.Errorf("storage/postgres: scan original row: %w", err)
-		}
-		var m protocol.Message
-		if err := msgpack.Unmarshal(payload, &m); err != nil {
-			return nil, fmt.Errorf("storage/postgres: decode original payload %d: %w", idx, err)
-		}
-		cm.Messages = append(cm.Messages, &m)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("storage/postgres: original rows: %w", err)
-	}
-	if len(cm.Messages) == 0 {
-		return nil, fmt.Errorf("storage/postgres: id index points to missing ChannelMessage %q", channelSerial)
-	}
-	return cm, nil
+// loadChannelMessageTx fetches a previously-persisted ChannelMessage
+// inside the caller's transaction — used by the idempotency pre-check
+// in Store to return the original cm on a hit.
+func loadChannelMessageTx(ctx context.Context, tx pgx.Tx, channel, channelSerial string) (*protocol.ChannelMessage, error) {
+	rows, err := tx.Query(ctx, sqlLoadCM, channel, channelSerial)
+	return decodeChannelMessageRows(rows, err, channel, channelSerial)
 }

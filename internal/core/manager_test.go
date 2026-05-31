@@ -3,10 +3,16 @@ package core
 import (
 	"sync"
 	"testing"
+
+	"github.com/ably/ably-server/internal/storage/memory"
 )
 
+func newTestManager() *Manager {
+	return NewManager(memory.New(memory.Options{}))
+}
+
 func TestManagerGetChannelCreates(t *testing.T) {
-	m := NewManager()
+	m := newTestManager()
 	c := m.GetChannel("foo")
 	if c == nil {
 		t.Fatal("GetChannel returned nil")
@@ -17,7 +23,7 @@ func TestManagerGetChannelCreates(t *testing.T) {
 }
 
 func TestManagerGetChannelIsIdempotent(t *testing.T) {
-	m := NewManager()
+	m := newTestManager()
 	a := m.GetChannel("foo")
 	b := m.GetChannel("foo")
 	if a != b {
@@ -26,7 +32,7 @@ func TestManagerGetChannelIsIdempotent(t *testing.T) {
 }
 
 func TestManagerGetChannelDistinctNames(t *testing.T) {
-	m := NewManager()
+	m := newTestManager()
 	a := m.GetChannel("foo")
 	b := m.GetChannel("bar")
 	if a == b {
@@ -35,7 +41,7 @@ func TestManagerGetChannelDistinctNames(t *testing.T) {
 }
 
 func TestManagerGetChannelConcurrent(t *testing.T) {
-	m := NewManager()
+	m := newTestManager()
 	const goroutines = 50
 	results := make(chan *Channel, goroutines)
 

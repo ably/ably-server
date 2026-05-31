@@ -10,7 +10,6 @@ import (
 
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/protocol"
-	"github.com/ably/ably-server/internal/storage"
 )
 
 // connection is one live WebSocket connection. It owns two goroutines:
@@ -25,7 +24,6 @@ type connection struct {
 	heartbeatInterval time.Duration
 	logger            *slog.Logger
 	manager           *core.Manager
-	store             storage.Storage
 
 	outbound    chan *protocol.ProtocolMessage
 	attachments map[string]*attachment
@@ -162,17 +160,13 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 		return
 	}
 
-	cm, idempotent, err := c.store.Channel(msg.Channel).AppendChannelMessage(ctx, msg.Messages)
-	if err != nil {
+	if _, _, err := c.manager.GetChannel(msg.Channel).Publish(ctx, msg.Messages); err != nil {
 		c.logger.Warn("publish failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerial, "err", err)
 		c.queue(ctx, &protocol.ProtocolMessage{
 			Action:    protocol.ActionNack,
 			MsgSerial: msg.MsgSerial,
 		})
 		return
-	}
-	if !idempotent {
-		c.manager.GetChannel(msg.Channel).Append(cm)
 	}
 	c.queue(ctx, &protocol.ProtocolMessage{
 		Action:    protocol.ActionAck,

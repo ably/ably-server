@@ -54,15 +54,15 @@ func New(opts Options) *Storage {
 }
 
 // Channel returns the ChannelStore for name, creating it on first
-// access. Subsequent calls with the same name return the same
-// instance.
-func (s *Storage) Channel(name string) storage.ChannelStore {
+// access and binding it to appender. Subsequent calls with the same
+// name return the same instance and ignore the new appender.
+func (s *Storage) Channel(name string, appender storage.Appender) storage.ChannelStore {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if cs, ok := s.channels[name]; ok {
 		return cs
 	}
-	cs := newChannelStore(s.gen)
+	cs := newChannelStore(s.gen, appender)
 	s.channels[name] = cs
 	return cs
 }
@@ -73,9 +73,11 @@ func (s *Storage) Close() error {
 }
 
 // channelStore holds the per-channel state: an ordered list of
-// channelSerials, a map for O(1) lookup, and an idempotency index.
+// channelSerials, a map for O(1) lookup, an idempotency index, and
+// the Appender that will receive freshly-stored ChannelMessages.
 type channelStore struct {
-	gen *serial.Generator
+	gen      *serial.Generator
+	appender storage.Appender
 
 	mu    sync.Mutex
 	order []string // append-only, sorted (serials are monotonic)
@@ -83,22 +85,25 @@ type channelStore struct {
 	byID  map[string]string // Message.id -> channelSerial
 }
 
-func newChannelStore(gen *serial.Generator) *channelStore {
+func newChannelStore(gen *serial.Generator, appender storage.Appender) *channelStore {
 	return &channelStore{
-		gen:  gen,
-		byCS: make(map[string]*protocol.ChannelMessage),
-		byID: make(map[string]string),
+		gen:      gen,
+		appender: appender,
+		byCS:     make(map[string]*protocol.ChannelMessage),
+		byID:     make(map[string]string),
 	}
 }
 
-// AppendChannelMessage implements storage.ChannelStore. The whole
-// operation (idempotency check + mint + insert) is guarded by a
-// single mutex acquire, so concurrent publishes with the same id are
-// serialised: one wins, the rest see the duplicate and return the
-// original.
-func (cs *channelStore) AppendChannelMessage(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
+// Store implements storage.ChannelStore. The whole operation
+// (idempotency check + mint + insert + appender delivery) is guarded
+// by a single mutex acquire, so concurrent publishes with the same id
+// are serialised: one wins, the rest see the duplicate and return
+// the original. The appender is fired synchronously after the insert
+// for fresh publishes only; idempotent returns do not re-fire the
+// appender (the original was already delivered).
+func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
 	if len(msgs) == 0 {
-		return nil, false, errors.New("storage/memory: AppendChannelMessage with no messages")
+		return nil, false, errors.New("storage/memory: Store with no messages")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
@@ -133,6 +138,10 @@ func (cs *channelStore) AppendChannelMessage(ctx context.Context, msgs []*protoc
 		if m.ID != "" {
 			cs.byID[m.ID] = channelSerial
 		}
+	}
+
+	if cs.appender != nil {
+		cs.appender.Append(cm)
 	}
 	return cm, false, nil
 }

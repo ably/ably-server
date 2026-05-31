@@ -347,13 +347,24 @@ mutex around append. Attachments tail the list at their own pace, with no
 fan-out channels and no per-attachment buffering. Each list entry is one
 ChannelMessage (§8) — an atomic publish carrying one or more Messages.
 
-Channel is intentionally storage-agnostic. Serial minting and
-persistence live in the storage backend (§6, §8); Channel exposes a
-single `Append(cm)` method that links an already-minted ChannelMessage
-onto the tail and wakes parked streams. Publish-path callers (the
-realtime connection, the REST publish handler, the cluster broker's
-NOTIFY listener) ask storage for a `cm` first and then pass it to
-`Append`; see §7.
+Each Channel is paired at construction with its `storage.ChannelStore`
+facet (Manager calls `storage.Channel(name, channelAsAppender)` so
+the storage holds a back-link to the in-process Channel). Channel
+exposes two methods:
+
+- `Publish(ctx, msgs)` — orchestrates a publish: delegates to
+  `store.Store(ctx, msgs)`, which mints the channelSerial and
+  persists. The link onto the live list arrives via the Appender
+  callback — synchronously after commit in memory/bbolt;
+  asynchronously via the LISTEN goroutine in Postgres (§7).
+- `Append(cm)` — satisfies the `storage.Appender` contract. It is
+  the **only** writer to the linked list, and it is called only by
+  the storage backend (never directly by publish-path callers, in
+  any mode).
+
+This is the unified flow: every cm that lands on a Channel's live
+list arrives through `storage → Appender.Append`, whether the publish
+originated locally or on a remote node.
 
 Each entry holds one ChannelMessage plus a `notify` channel that is
 closed once the next entry is linked; parked attachment goroutines wake
@@ -393,10 +404,11 @@ Each WebSocket connection has:
 - An `attachments map[string]*Attachment` keyed by channel name.
 
 Inbound `MESSAGE` is routed to the matching attachment, which
-authorises the publish and runs the §7.1 sequence: it asks storage for
-a minted+persisted ChannelMessage and, on a non-idempotent return,
-links it into the local Channel (in cluster mode the local link is
-driven instead by the `NOTIFY` listener — see §7.2). The connection
+authorises the publish and calls `channel.Publish(ctx, msgs)`. That
+returns once storage has committed; the link onto the local linked
+list happens asynchronously via the Appender callback the storage
+holds (synchronous in memory/bbolt, NOTIFY-driven in Postgres — see
+§7). The connection
 then replies with `ACK` / `NACK`. Inbound `ATTACH` / `DETACH` are
 handled by the connection itself, calling into `ChannelManager` to
 get/release a Channel.
@@ -405,12 +417,12 @@ get/release a Channel.
 
 The storage interface has two facets: a process-wide `Storage` that
 hands out per-channel `ChannelStore`s and owns any shared resources
-(e.g. a bolt DB handle), and a per-channel `ChannelStore` exposing two
-operations:
+(e.g. a bolt DB handle, a pgxpool), and a per-channel `ChannelStore`
+exposing two operations:
 
-- `AppendChannelMessage(ctx, msgs)` — mints a `channelSerial`, stamps
-  each `Message.Serial = "<channelSerial>:<idx>"`, persists the
-  resulting ChannelMessage atomically, and returns it. If any contained
+- `Store(ctx, msgs)` — mints a `channelSerial`, stamps each
+  `Message.Serial = "<channelSerial>:<idx>"`, persists the resulting
+  ChannelMessage atomically, and returns it. If any contained
   `Message.id` was already seen on this channel within the retention
   window, the call is idempotent: the originally-persisted
   ChannelMessage is returned with `idempotent=true` and no new row is
@@ -418,6 +430,16 @@ operations:
 - `History(ctx, query)` — bounded forward range scan ordered by
   channelSerial; backs both the REST history endpoint and attachment
   resume gap-fills (§4.3).
+
+Each `ChannelStore` is created with an `Appender` callback —
+`Storage.Channel(name, appender) ChannelStore`. The Appender is the
+single delivery path for committed cms: the backend invokes
+`appender.Append(cm)` on every fresh publish (skipped on idempotent
+returns, where the original was delivered when first persisted).
+Memory and bbolt fire it synchronously after commit. Postgres fires
+it asynchronously from the LISTEN goroutine after the NOTIFY emitted
+inside the commit tx round-trips — including for the publisher's own
+publish, so there is no separate path for self-publishes (§7).
 
 Serial minting and idempotency live behind this interface so persistent
 backends (bbolt, Postgres) can restore monotonic generator state across
@@ -551,64 +573,83 @@ set the TTL to a large value.
 
 ## 7. Pub/Sub
 
-Pub/sub is the mechanism that turns a *publish* (originating from any
-node, via WS or REST) into appended entries on the **local** Channel's
-linked list (§5.1) on every node that has attachments to that channel.
-There is no per-attachment fan-out channel; attachments tail the list
-directly.
+Pub/sub turns a *publish* (originating from any node, via WS or REST)
+into entries appended to the **local** Channel's linked list (§5.1)
+on every node that has attachments to that channel. The flow is
+unified across deployment modes: publish-path callers call
+`channel.Publish(ctx, msgs)`, the storage backend persists, and the
+Appender callback registered against each ChannelStore delivers the
+committed cm to `channel.Append(cm)`. The Appender is the only
+writer to the linked list in every mode.
 
 ### 7.1 Single-process modes (`memory`, `disk`)
 
-There is no pub/sub abstraction. A publish is a direct sequence run
-inside the publish-path caller (the REST handler or the realtime
-connection):
+The Appender fires synchronously, inside the storage's `Store` call,
+right after the persist commits. A publish is:
 
 1. Authorise.
-2. `storage.Channel(name).AppendChannelMessage(ctx, messages)` —
+2. `channel.Publish(ctx, messages)` → `store.Store(ctx, messages)` —
    atomically:
    - checks any contained `Message.id` against this channel's
      idempotency index; on hit, returns the originally-persisted
-     ChannelMessage with `idempotent=true` and no new row is written;
+     ChannelMessage with `idempotent=true` (no new row, no Appender
+     call — the original was delivered when first persisted);
    - otherwise mints a fresh `channelSerial` (§8), stamps each
-     `Message.serial = channelSerial + ":" + idx`, persists the
-     resulting `ChannelMessage{channelSerial, messages}` as one unit,
-     and indexes any contained `Message.id`.
-3. On a non-idempotent return, the caller calls
-   `manager.GetChannel(name).Append(cm)` to link the cm into the
-   live list. Attachments parked on the previous tail's `notify` wake
-   up and observe the new entry.
+     `Message.serial = channelSerial + ":" + idx`, persists, and
+     calls `appender.Append(cm)` — which is `core.Channel.Append`,
+     linking the cm onto the live list.
 
-`core.Manager` and `storage.Storage` are separate dependencies; the
-publish-path caller holds both. All attachments are on the same node
-and tail the same list.
+Local subscribers parked on the previous tail's `notify` wake up and
+observe the new entry. ACK/201 fires once `Publish` returns; the
+linked-list update has already happened by then.
 
 ### 7.2 Cluster mode (Postgres broker)
 
-Each node runs a single goroutine on a dedicated Postgres connection
-listening for channel-publish notifications:
+Same `channel.Publish` API; the Appender fires from a dedicated
+LISTEN goroutine running inside `postgres.Storage`. A publish is:
 
-- The publishing node mints the channel serial locally (§8), `INSERT`s
-  the row into `messages` with that serial as primary key, and emits
-  `NOTIFY ably_channel, '<channel-name>:<serial>'`.
-- Every listening node (including the publisher) receives the
-  notification, fetches the canonical ChannelMessage by
-  `(channel, serial)`, and calls `channel.Append(cm)` on its local
-  Channel.
+1. The publishing node's `store.Store(ctx, msgs)` mints the serial,
+   `INSERT`s the rows, and emits
+   `pg_notify('ably_channel', '{"channel":"...","serial":"..."}')`
+   inside the same transaction. PG buffers the NOTIFY until commit,
+   so listeners only see it if the publish committed.
+2. **Every** node's LISTEN goroutine — including the publisher's
+   — receives the NOTIFY, parses the JSON payload, looks up the
+   local `ChannelStore` for that channel name, fetches the canonical
+   cm by `(channel, channel_serial)`, and calls
+   `appender.Append(cm)`. The publisher's local subscribers see the
+   publish via this same round-trip — there is no fast-path direct
+   Append; no self-vs-foreign dedup.
+
+This means the publisher's local-visibility latency is one NOTIFY
+round-trip (typically ~1–5ms against a same-region Postgres). The
+trade-off is a single, symmetric delivery path: any cm reaches its
+Channel via exactly one mechanism (the Appender callback), regardless
+of which node minted it.
+
+Notifications for channels that have never been opened on this node
+(no `Channel(name, appender)` call yet) are silently dropped. The
+canonical cm remains in storage and is picked up by the eventual
+`ATTACH` via the history-replay path (§4.3).
 
 The serial's format is itself the global ordering: the `<seriesId>`
-component disambiguates serials minted in the same millisecond by
-different processes, so each node's linked list, sorted lexicographically
-by serial, reflects the same global order without a central sequence.
+suffix disambiguates serials minted in the same millisecond by
+different processes, so storage's `ORDER BY channel_serial` reflects
+a single global publish order without a central sequence. Local
+linked-list arrival order on a given node approximates this but may
+have small inversions under cross-node interleavings — canonical
+order is the storage scan.
 
-NOTIFY's 8KB payload limit and at-least-once delivery are why we send
-*pointers* (channel + serial) rather than full payloads — the listener
-always reads the canonical row from the table, deduplicating by
-`(channel, serial)`.
+NOTIFY's 8KB payload limit is why we send pointers `(channel,
+serial)` rather than full payloads. PG delivers notifications
+at-most-once during reconnect gaps (queued notifications are lost if
+the LISTEN conn drops); reconciling missed events via a post-
+reconnect history scan is left as a follow-up.
 
 LISTEN/NOTIFY's well-known throughput ceiling is not a concern here:
-ably-server targets developer-loop, CI, and modest single-region self-host
-deployments. Operators who need cloud-scale throughput should use Ably or
-fork.
+ably-server targets developer-loop, CI, and modest single-region
+self-host deployments. Operators who need cloud-scale throughput
+should use Ably or fork.
 
 ## 8. Identifiers & ordering
 

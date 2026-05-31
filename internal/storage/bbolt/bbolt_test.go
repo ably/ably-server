@@ -38,13 +38,13 @@ func TestBBoltSurvivesProcessRestart(t *testing.T) {
 	}
 	var fooSerials []string
 	for i := range 3 {
-		cm, _, err := s1.Channel("foo").AppendChannelMessage(ctx, []*protocol.Message{{Name: "x", Data: i}})
+		cm, _, err := s1.Channel("foo", nil).Store(ctx, []*protocol.Message{{Name: "x", Data: i}})
 		if err != nil {
 			t.Fatalf("foo publish %d: %v", i, err)
 		}
 		fooSerials = append(fooSerials, cm.ChannelSerial)
 	}
-	if _, _, err := s1.Channel("bar").AppendChannelMessage(ctx, []*protocol.Message{{Name: "y"}}); err != nil {
+	if _, _, err := s1.Channel("bar", nil).Store(ctx, []*protocol.Message{{Name: "y"}}); err != nil {
 		t.Fatalf("bar publish: %v", err)
 	}
 	if err := s1.Close(); err != nil {
@@ -59,7 +59,7 @@ func TestBBoltSurvivesProcessRestart(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s2.Close() })
 
-	page, err := s2.Channel("foo").History(ctx, storage.HistoryQuery{})
+	page, err := s2.Channel("foo", nil).History(ctx, storage.HistoryQuery{})
 	if err != nil {
 		t.Fatalf("foo History: %v", err)
 	}
@@ -73,11 +73,11 @@ func TestBBoltSurvivesProcessRestart(t *testing.T) {
 	}
 
 	// A post-restart publish persists and shows up at the tail.
-	fresh, _, err := s2.Channel("foo").AppendChannelMessage(ctx, []*protocol.Message{{Name: "z"}})
+	fresh, _, err := s2.Channel("foo", nil).Store(ctx, []*protocol.Message{{Name: "z"}})
 	if err != nil {
 		t.Fatalf("post-restart publish: %v", err)
 	}
-	page, err = s2.Channel("foo").History(ctx, storage.HistoryQuery{})
+	page, err = s2.Channel("foo", nil).History(ctx, storage.HistoryQuery{})
 	if err != nil {
 		t.Fatalf("foo History #2: %v", err)
 	}
