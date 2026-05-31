@@ -21,15 +21,25 @@ import (
 
 const integrationAPIKey = "app.key:secret"
 
-// startServer boots ably-server in cluster mode against a fresh
-// Postgres schema, on a free TCP port discovered via the Ready hook
-// in runOpts. It returns the bound "host:port" string; the server is
-// torn down on t.Cleanup.
+// startServer boots a single ably-server instance in cluster mode
+// against a fresh Postgres schema, on a free TCP port discovered via
+// the Ready hook in runOpts. It returns the bound "host:port" string;
+// the server is torn down on t.Cleanup.
+//
+// For multi-node tests use startServerOnDSN with a shared
+// FreshSchemaDSN so every node speaks to the same database state.
 func startServer(t *testing.T) string {
 	t.Helper()
-
 	pgc := pgtest.Start(t)
-	dsn := pgc.FreshSchemaDSN(t)
+	return startServerOnDSN(t, pgc.FreshSchemaDSN(t))
+}
+
+// startServerOnDSN boots one ably-server in cluster mode pointed at
+// the given DSN. The DSN may be a fresh schema (single-node test) or
+// a schema shared with sibling nodes (cluster test). Returns the
+// bound "host:port"; tears down on t.Cleanup.
+func startServerOnDSN(t *testing.T, dsn string) string {
+	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -231,3 +241,149 @@ func TestIntegrationWSPublishSelfLoop(t *testing.T) {
 		t.Fatalf("publisher did not receive its own publish via NOTIFY round-trip before deadline (%v)", ctx.Err())
 	}
 }
+
+// TestIntegrationClusterFullMesh boots three ably-server instances
+// against a single shared Postgres schema (i.e. a 3-node cluster),
+// attaches one ably-go SDK client to each, then publishes one message
+// via each WS in sequence. Every client must observe all three
+// messages exactly once and in the same order — proving cross-node
+// fan-out via LISTEN/NOTIFY plus the commit-order consistency that
+// DESIGN.md §7.2 calls out.
+func TestIntegrationClusterFullMesh(t *testing.T) {
+	const nodes = 3
+
+	pgc := pgtest.Start(t)
+	dsn := pgc.FreshSchemaDSN(t)
+
+	addrs := make([]string, nodes)
+	for i := range nodes {
+		addrs[i] = startServerOnDSN(t, dsn)
+	}
+
+	ctx, cancel := testCtx(t)
+	defer cancel()
+
+	receivers := make([]chan *ably.Message, nodes)
+	clients := make([]*ably.Realtime, nodes)
+	for i, addr := range addrs {
+		clients[i] = newClient(t, addr)
+		connect(t, clients[i])
+		ch := clients[i].Channels.Get("mesh")
+		recv := make(chan *ably.Message, nodes+1) // +1 to catch any duplicate without blocking
+		receivers[i] = recv
+		unsub, err := ch.SubscribeAll(ctx, func(m *ably.Message) {
+			recv <- m
+		})
+		if err != nil {
+			t.Fatalf("client %d SubscribeAll: %v", i, err)
+		}
+		defer unsub()
+	}
+
+	// Publish one message from each node, sequentially. Sequential
+	// publishes keep the timestamp prefix of each channelSerial
+	// monotonic across nodes, so the global commit order is the
+	// publish order — which is what we assert all clients see.
+	wantOrder := make([]string, nodes)
+	for i := range nodes {
+		name := nameFor(i)
+		wantOrder[i] = name
+		if err := clients[i].Channels.Get("mesh").Publish(ctx, name, dataFor(i)); err != nil {
+			t.Fatalf("node %d Publish: %v", i, err)
+		}
+	}
+
+	// Each receiver should see all N messages, exactly once each,
+	// in the same order as the publish sequence.
+	orders := make([][]string, nodes)
+	for i, recv := range receivers {
+		got := make([]string, 0, nodes)
+		for range nodes {
+			select {
+			case m := <-recv:
+				got = append(got, m.Name)
+			case <-ctx.Done():
+				t.Fatalf("client %d saw only %d/%d messages: %v", i, len(got), nodes, got)
+			}
+		}
+		orders[i] = got
+
+		// Drain-with-bounded-timeout: if any extra cm arrives in a
+		// short window, that's a duplicate from the broker.
+		select {
+		case extra := <-recv:
+			t.Errorf("client %d received unexpected extra message: %+v", i, extra)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+
+	// Every name appears in every order, exactly once.
+	for i, got := range orders {
+		seen := make(map[string]int, nodes)
+		for _, name := range got {
+			seen[name]++
+		}
+		for _, want := range wantOrder {
+			if seen[want] != 1 {
+				t.Errorf("client %d saw %d copies of %q, want 1 (got=%v)", i, seen[want], want, got)
+			}
+		}
+	}
+
+	// Order consistency: every client should observe the cms in the
+	// same order, matching the publish sequence (commit order on the
+	// shared PG).
+	for i, got := range orders {
+		for j, name := range got {
+			if name != wantOrder[j] {
+				t.Errorf("client %d: order[%d] = %q, want %q (full order: %v)", i, j, name, wantOrder[j], got)
+			}
+		}
+	}
+}
+
+// TestIntegrationClusterRESTPublishObservedAcrossNodes boots two
+// servers on one shared schema; a WS subscriber on server B receives
+// a publish issued via the REST endpoint on server A. Proves the
+// cross-protocol cross-node path: REST → A's storage.Store → NOTIFY
+// → B's LISTEN goroutine → B's Appender → B's Channel → B's WS
+// attachment.
+func TestIntegrationClusterRESTPublishObservedAcrossNodes(t *testing.T) {
+	pgc := pgtest.Start(t)
+	dsn := pgc.FreshSchemaDSN(t)
+
+	addrA := startServerOnDSN(t, dsn)
+	addrB := startServerOnDSN(t, dsn)
+
+	ctx, cancel := testCtx(t)
+	defer cancel()
+
+	clientB := newClient(t, addrB)
+	connect(t, clientB)
+	chB := clientB.Channels.Get("cross")
+	received := make(chan *ably.Message, 4)
+	unsub, err := chB.SubscribeAll(ctx, func(m *ably.Message) {
+		received <- m
+	})
+	if err != nil {
+		t.Fatalf("client B SubscribeAll: %v", err)
+	}
+	defer unsub()
+
+	postPublish(t, addrA, "cross", `{"name":"x","data":"hi"}`)
+
+	select {
+	case m := <-received:
+		if m.Name != "x" {
+			t.Errorf("Name = %q, want %q", m.Name, "x")
+		}
+		if got, ok := m.Data.(string); !ok || got != "hi" {
+			t.Errorf("Data = %v, want %q", m.Data, "hi")
+		}
+	case <-ctx.Done():
+		t.Fatalf("client B did not observe REST publish to server A before deadline (%v)", ctx.Err())
+	}
+}
+
+func nameFor(i int) string { return "from-" + strconv.Itoa(i) }
+func dataFor(i int) string { return "payload-" + strconv.Itoa(i) }
