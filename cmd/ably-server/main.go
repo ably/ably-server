@@ -37,28 +37,52 @@ const (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	os.Exit(run(ctx, os.Args[1:], os.Getenv, os.Stdout))
+	os.Exit(run(ctx, runOpts{
+		Args:   os.Args[1:],
+		Getenv: os.Getenv,
+		Out:    os.Stdout,
+	}))
+}
+
+// runOpts bundles run's inputs so the production main() and tests
+// share one entry point. Args/Getenv/Out are required; Ready is an
+// optional testing hook (see field doc).
+type runOpts struct {
+	// Args is the slice of CLI args (excluding os.Args[0]).
+	Args []string
+
+	// Getenv resolves an environment variable; tests pass a stub.
+	Getenv func(string) string
+
+	// Out is the writer used for logs and flag-parsing errors.
+	Out io.Writer
+
+	// Ready, when non-nil, receives the bound listener's address once
+	// net.Listen returns — used by tests that pass --listen=:0 to
+	// discover the ephemeral port. The send is bounded by ctx so a
+	// missing receiver does not deadlock startup.
+	Ready chan<- net.Addr
 }
 
 // run executes the server and returns the process exit code. All
-// inputs (args, environment, output) are passed in so the function is
-// testable without touching package-level state.
-func run(ctx context.Context, args []string, getenv func(string) string, out io.Writer) int {
+// inputs are passed via runOpts so the function is testable without
+// touching package-level state.
+func run(ctx context.Context, opts runOpts) int {
 	fs := flag.NewFlagSet("ably-server", flag.ContinueOnError)
-	fs.SetOutput(out)
+	fs.SetOutput(opts.Out)
 	listen := fs.String("listen", ":8080", "address for HTTP/WS listener")
-	apiKey := fs.String("api-key", getenv(apiKeyEnv), "API key in appId.keyId:keySecret format (env: "+apiKeyEnv+")")
+	apiKey := fs.String("api-key", opts.Getenv(apiKeyEnv), "API key in appId.keyId:keySecret format (env: "+apiKeyEnv+")")
 	mode := fs.String("mode", "memory", "storage backend: memory, disk, or cluster")
 	dataDir := fs.String("data-dir", "./data", "data directory for disk mode (holds the bbolt file)")
-	dbDSN := fs.String("db-dsn", getenv(dbDSNEnv), "libpq DSN for cluster mode, e.g. postgres://user:pw@host:5432/db?sslmode=disable (env: "+dbDSNEnv+")")
+	dbDSN := fs.String("db-dsn", opts.Getenv(dbDSNEnv), "libpq DSN for cluster mode, e.g. postgres://user:pw@host:5432/db?sslmode=disable (env: "+dbDSNEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	shutdownGrace := fs.Duration("shutdown-grace", 10*time.Second, "window to disconnect existing connections on SIGTERM")
 	logLevel := fs.String("log-level", "info", "log level: debug, info, warn, error")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(opts.Args); err != nil {
 		return 2
 	}
 
-	logger := newLogger(*logLevel, out)
+	logger := newLogger(*logLevel, opts.Out)
 
 	if *apiKey == "" {
 		logger.Error("api key is required", "flag", "--api-key", "env", apiKeyEnv)
@@ -106,6 +130,15 @@ func run(ctx context.Context, args []string, getenv func(string) string, out io.
 	if err != nil {
 		logger.Error("failed to listen", "addr", *listen, "err", err)
 		return 1
+	}
+
+	if opts.Ready != nil {
+		select {
+		case opts.Ready <- listener.Addr():
+		case <-ctx.Done():
+			_ = listener.Close()
+			return 1
+		}
 	}
 
 	go func() {

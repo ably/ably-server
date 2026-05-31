@@ -18,7 +18,11 @@ func envWith(vals map[string]string) func(string) string {
 
 func TestRunRejectsMissingKey(t *testing.T) {
 	var out bytes.Buffer
-	code := run(context.Background(), nil, emptyEnv, &out)
+	code := run(context.Background(), runOpts{
+		Args:   nil,
+		Getenv: emptyEnv,
+		Out:    &out,
+	})
 	if code != 1 {
 		t.Errorf("exit code = %d, want 1", code)
 	}
@@ -29,7 +33,11 @@ func TestRunRejectsMissingKey(t *testing.T) {
 
 func TestRunRejectsMalformedKeyFromFlag(t *testing.T) {
 	var out bytes.Buffer
-	code := run(context.Background(), []string{"--api-key=bogus"}, emptyEnv, &out)
+	code := run(context.Background(), runOpts{
+		Args:   []string{"--api-key=bogus"},
+		Getenv: emptyEnv,
+		Out:    &out,
+	})
 	if code != 1 {
 		t.Errorf("exit code = %d, want 1", code)
 	}
@@ -43,8 +51,11 @@ func TestRunFallsBackToEnv(t *testing.T) {
 	// malformed env value so the parse error proves the env was read
 	// — without starting the server.
 	var out bytes.Buffer
-	env := envWith(map[string]string{apiKeyEnv: "bogus"})
-	code := run(context.Background(), nil, env, &out)
+	code := run(context.Background(), runOpts{
+		Args:   nil,
+		Getenv: envWith(map[string]string{apiKeyEnv: "bogus"}),
+		Out:    &out,
+	})
 	if code != 1 {
 		t.Errorf("exit code = %d, want 1", code)
 	}
