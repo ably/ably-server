@@ -26,9 +26,13 @@ import (
 	"github.com/ably/ably-server/internal/storage"
 	"github.com/ably/ably-server/internal/storage/bbolt"
 	"github.com/ably/ably-server/internal/storage/memory"
+	"github.com/ably/ably-server/internal/storage/postgres"
 )
 
-const apiKeyEnv = "ABLY_SERVER_API_KEY"
+const (
+	apiKeyEnv = "ABLY_SERVER_API_KEY"
+	dbDSNEnv  = "ABLY_SERVER_DB_DSN"
+)
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -44,8 +48,9 @@ func run(ctx context.Context, args []string, getenv func(string) string, out io.
 	fs.SetOutput(out)
 	listen := fs.String("listen", ":8080", "address for HTTP/WS listener")
 	apiKey := fs.String("api-key", getenv(apiKeyEnv), "API key in appId.keyId:keySecret format (env: "+apiKeyEnv+")")
-	mode := fs.String("mode", "memory", "storage backend: memory or disk")
+	mode := fs.String("mode", "memory", "storage backend: memory, disk, or cluster")
 	dataDir := fs.String("data-dir", "./data", "data directory for disk mode (holds the bbolt file)")
+	dbDSN := fs.String("db-dsn", getenv(dbDSNEnv), "libpq DSN for cluster mode, e.g. postgres://user:pw@host:5432/db?sslmode=disable (env: "+dbDSNEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	shutdownGrace := fs.Duration("shutdown-grace", 10*time.Second, "window to disconnect existing connections on SIGTERM")
 	logLevel := fs.String("log-level", "info", "log level: debug, info, warn, error")
@@ -65,11 +70,15 @@ func run(ctx context.Context, args []string, getenv func(string) string, out io.
 		return 1
 	}
 
-	store, err := openStorage(*mode, *dataDir)
+	store, err := openStorage(ctx, *mode, *dataDir, *dbDSN)
 	if err != nil {
 		logger.Error("open storage", "mode", *mode, "err", err)
 		return 1
 	}
+	// Deferred so it fires after the graceful-shutdown block below
+	// (srv.Shutdown drains in-flight HTTP requests, then this defer
+	// closes the LISTEN goroutine + the pool — TASK-22's
+	// postgres.Storage.Close).
 	defer func() {
 		if err := store.Close(); err != nil {
 			logger.Error("close storage", "err", err)
@@ -117,10 +126,16 @@ func run(ctx context.Context, args []string, getenv func(string) string, out io.
 	return 0
 }
 
-// openStorage constructs the storage.Storage selected by mode. The
-// disk mode uses bbolt at <dataDir>/ably.db, creating dataDir if it
-// doesn't exist. Cluster mode (Postgres) is not yet implemented.
-func openStorage(mode, dataDir string) (storage.Storage, error) {
+// openStorage constructs the storage.Storage selected by mode:
+//
+//   - memory: in-process, no persistence.
+//   - disk:   bbolt at <dataDir>/ably.db (dataDir created if absent).
+//   - cluster: postgres at dbDSN (auto-migrates schema on Open;
+//     spawns the LISTEN/NOTIFY broker — see DESIGN.md §7.2).
+//
+// ctx bounds the cluster-mode dial + ping + migrate; it's ignored by
+// the in-process modes.
+func openStorage(ctx context.Context, mode, dataDir, dbDSN string) (storage.Storage, error) {
 	switch mode {
 	case "memory":
 		return memory.New(memory.Options{}), nil
@@ -132,8 +147,13 @@ func openStorage(mode, dataDir string) (storage.Storage, error) {
 			return nil, fmt.Errorf("create data-dir %q: %w", dataDir, err)
 		}
 		return bbolt.Open(bbolt.Options{Path: filepath.Join(dataDir, "ably.db")})
+	case "cluster":
+		if dbDSN == "" {
+			return nil, fmt.Errorf("--db-dsn is required when --mode=cluster (env: %s)", dbDSNEnv)
+		}
+		return postgres.Open(ctx, postgres.Options{DSN: dbDSN})
 	default:
-		return nil, fmt.Errorf("unknown --mode %q (valid: memory, disk)", mode)
+		return nil, fmt.Errorf("unknown --mode %q (valid: memory, disk, cluster)", mode)
 	}
 }
 
