@@ -262,38 +262,15 @@ and `rewind` is ignored.
 
 ### 4.4 Implementation
 
-An attachment is a per-node (connection, channel) pair, structured as a
-cursor over the Channel's linked list of entries (§5.1).
-
-```go
-type Attachment struct {
-    conn    *Connection
-    channel *Channel
-    flags   ChannelMode
-    serial  string
-
-    e *entry // current cursor
-}
-```
-
-A single goroutine per attachment runs the cursor loop:
-
-```go
-for {
-    select {
-    case <-a.e.notify:
-        a.e = a.e.next
-        a.forward(a.e.cm) // gated by mode flags
-    case <-a.ctx.Done():
-        return
-    }
-}
-```
-
-`forward` writes one `MESSAGE` `ProtocolMessage` per ChannelMessage onto
-the connection's outbound queue, with `ChannelSerial =
-cm.ChannelSerial` and `Messages = cm.Messages`. The connection's single
-writer goroutine (§5.2) serialises actual frame writes. There is no
+An attachment is a per-node (connection, channel) pair, structured as
+a cursor over the Channel's linked list of entries (§5.1). A single
+goroutine per attachment walks the cursor — parking on the current
+entry's `notify` until the next entry is linked, then advancing and
+forwarding the ChannelMessage. `forward` writes one `MESSAGE`
+`ProtocolMessage` per ChannelMessage onto the connection's outbound
+queue (with `ChannelSerial = cm.ChannelSerial`, `Messages =
+cm.Messages`, gated by mode flags). The connection's single writer
+goroutine (§5.2) serialises actual frame writes. There is no
 per-attachment buffered fan-out channel: each attachment proceeds at
 its own pace.
 
@@ -372,55 +349,21 @@ ChannelMessage (§8) — an atomic publish carrying one or more Messages.
 
 Serial minting and persistence live in the storage backend (§6, §8);
 Channel only links already-minted ChannelMessages so attachments can
-tail them.
+tail them. Channel exposes two append paths:
 
-```go
-type entry struct {
-    cm     *ChannelMessage  // one atomic publish
-    notify chan struct{}    // closed once next is set
-    next   *entry
-}
+- `AppendChannelMessage(ctx, msgs)` — the local publish path. Delegates
+  to `storage.ChannelStore.AppendChannelMessage`, which mints the
+  channelSerial, stamps each `Message.Serial`, persists, and returns
+  the resulting cm; Channel then links it into the live list on a
+  non-idempotent return.
+- `Append(cm)` — the link-only path. Used by the cluster broker's
+  NOTIFY listener (§7.2) once it has fetched the canonical row;
+  performs no minting or persistence.
 
-type Channel struct {
-    name  string
-    store storage.ChannelStore  // sole minter of channelSerials
-
-    mu   sync.Mutex
-    tail *entry             // most recent entry
-}
-
-// Append links an already-minted ChannelMessage at the tail as a single
-// entry, waking parked streams. Performs no minting or Message.Serial
-// stamping — both are storage's responsibility upstream. Used directly
-// by the cluster broker's NOTIFY listener once it has fetched the
-// canonical row; intra-process publishes go through AppendChannelMessage.
-func (c *Channel) Append(cm *ChannelMessage) {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    e := &entry{cm: cm, notify: make(chan struct{})}
-    c.tail.next = e
-    close(c.tail.notify)
-    c.tail = e
-}
-
-// AppendChannelMessage performs one atomic publish: storage mints the
-// channelSerial, stamps each Message.Serial, persists, and returns the
-// resulting cm; Channel links it into the live list on a non-idempotent
-// return. The (cm, idempotent, err) tuple is forwarded verbatim from
-// storage.
-func (c *Channel) AppendChannelMessage(ctx context.Context, msgs []*Message) (*ChannelMessage, bool, error) {
-    cm, idempotent, err := c.store.AppendChannelMessage(ctx, msgs)
-    if err != nil {
-        return nil, false, err
-    }
-    if !idempotent {
-        c.Append(cm)
-    }
-    return cm, idempotent, nil
-}
-
-func (c *Channel) Tail() *entry { /* mu-protected read */ }
-```
+Each entry holds one ChannelMessage plus a `notify` channel that is
+closed once the next entry is linked; parked attachment goroutines wake
+on that close. The list is grow-only — older entries become eligible
+for GC once no attachment retains a reference (see Memory below).
 
 The first `ATTACH` to a name (or the first publish) creates the Channel.
 The Channel is removed from the manager only when **both** are true:
@@ -466,27 +409,26 @@ calling into `ChannelManager` to get/release a Channel.
 
 ## 6. Storage
 
-```go
-type Storage interface {
-    Channel(name string) ChannelStore
-    Close() error
-}
+The storage interface has two facets: a process-wide `Storage` that
+hands out per-channel `ChannelStore`s and owns any shared resources
+(e.g. a bolt DB handle), and a per-channel `ChannelStore` exposing two
+operations:
 
-type ChannelStore interface {
-    // AppendChannelMessage mints the channelSerial, stamps each
-    // msgs[i].Serial = "<channelSerial>:<idx>", persists the resulting
-    // ChannelMessage, and returns it. If any contained Message.ID has
-    // already been seen on this channel within the retention window,
-    // the call is idempotent: idempotent=true and the originally-
-    // persisted ChannelMessage is returned without re-appending.
-    AppendChannelMessage(ctx context.Context, msgs []*protocol.Message) (cm *protocol.ChannelMessage, idempotent bool, err error)
-    History(ctx context.Context, q HistoryQuery) (HistoryPage, error)
-}
-```
+- `AppendChannelMessage(ctx, msgs)` — mints a `channelSerial`, stamps
+  each `Message.Serial = "<channelSerial>:<idx>"`, persists the
+  resulting ChannelMessage atomically, and returns it. If any contained
+  `Message.id` was already seen on this channel within the retention
+  window, the call is idempotent: the originally-persisted
+  ChannelMessage is returned with `idempotent=true` and no new row is
+  written.
+- `History(ctx, query)` — bounded forward range scan ordered by
+  channelSerial; backs both the REST history endpoint and attachment
+  resume gap-fills (§4.3).
 
 Serial minting and idempotency live behind this interface so persistent
 backends (bbolt, Postgres) can restore monotonic generator state across
-restarts alongside the data it secures (§8).
+restarts alongside the data it secures (§8). The canonical Go
+signatures live in `internal/storage/storage.go`.
 
 ### 6.1 Memory backend
 
