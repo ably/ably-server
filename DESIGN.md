@@ -436,29 +436,27 @@ Chosen because the disk backend's job is narrow ("survive crashes for
 a single process") and bbolt gives us that without coupling the disk
 layer's schema to the Postgres cluster backend.
 
-Layout:
+Layout — two top-level buckets, channel-scoped via composite keys:
 
-- One top-level bucket per channel, named `ch/<channel-name>`.
-- Inside each channel bucket, a `messages` sub-bucket keyed by
-  `channelSerial` (see §8 — the atomic-publish identifier
-  `<timestamp>-<counter>@<seriesId>`). Values are the encoded
-  `protocol.ChannelMessage` blob (msgpack), which carries the channel
-  serial and the slice of contained messages. bbolt's natural
-  byte-order iteration yields ChannelMessages in publish order.
-- An `ids` sub-bucket maps `Message.id` (client-supplied idempotency
-  key) to the `channelSerial` it landed in, so a repeat publish within
-  the retention window can short-circuit and return the original
-  serial without re-appending. Entries are dropped by the same sweep
-  that trims `messages` past TTL — idempotency is bounded by message
-  retention.
+- `messages`: keyed `<channel>\0<channelSerial>` (see §8 — the
+  atomic-publish identifier `<timestamp>-<counter>@<seriesId>`).
+  Values are the msgpack-encoded `protocol.ChannelMessage` blob.
+  bbolt's byte-order iteration over a `<channel>\0` prefix yields a
+  channel's ChannelMessages in publish order, mirroring the Postgres
+  backend's PK range scan.
+- `ids`: keyed `<channel>\0<Message.id>`, value is the channelSerial
+  the id landed in. bbolt has no secondary indexes, so this is the
+  manual equivalent of Postgres's partial UNIQUE idempotency index.
+  Entries are dropped by the same sweep that trims `messages` past
+  TTL — idempotency is bounded by message retention.
 
-Plus a single top-level `_meta` bucket (not under any channel) holding
-the process-wide serial generator state: the last-issued `(timestamp,
-counter)` pair and the `seriesId`. Counter monotonicity is
-per-`(timestamp, seriesId)` — i.e. process-wide, not per-channel —
-because every minted serial on this node shares the same `seriesId`
-and must be unique across all channels. On startup the process loads
-this state to keep serials monotonic across restarts.
+Per-process `seriesId` is regenerated on every `Open` and generator
+monotonic state is not persisted. The §8 serial format makes
+post-restart monotonicity fall out naturally: the 14-character
+zero-padded ms timestamp is the leading lex-comparison key, and wall
+clock advances between restarts, so a post-restart Mint sorts after
+all prior serials. The same-millisecond restart with an unlucky new
+seriesId is the only edge case we don't guarantee, and we don't.
 
 Retention is enforced by a background sweep goroutine that, per
 channel, walks the ordered `messages` keys from oldest forward and
@@ -471,11 +469,6 @@ bbolt has no native TTL, no secondary indexes, and a single-writer
 model — all of which suit this use case: short-lived data, one writer
 per node (the publish path), and the only read pattern beyond the
 live tail is a bounded history range scan.
-
-Future materialised state (e.g. presence membership when it lands)
-will reuse this backend by adding sibling sub-buckets (e.g.
-`presence`) under each channel bucket — separate from `messages`, no
-TTL, with explicit deletes on `leave`.
 
 ### 6.3 Database backend (cluster mode)
 

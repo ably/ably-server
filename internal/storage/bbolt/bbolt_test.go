@@ -22,6 +22,10 @@ func TestBBoltChannelStoreContract(t *testing.T) {
 	})
 }
 
+// TestBBoltSurvivesProcessRestart proves that data persists across a
+// Close+Open cycle on the same file: history of pre-restart publishes
+// remains readable, and a post-restart publish succeeds and is itself
+// visible via history.
 func TestBBoltSurvivesProcessRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ably.db")
@@ -40,15 +44,15 @@ func TestBBoltSurvivesProcessRestart(t *testing.T) {
 		}
 		fooSerials = append(fooSerials, cm.ChannelSerial)
 	}
-	barCM, _, err := s1.Channel("bar").AppendChannelMessage(ctx, []*protocol.Message{{Name: "y"}})
-	if err != nil {
+	if _, _, err := s1.Channel("bar").AppendChannelMessage(ctx, []*protocol.Message{{Name: "y"}}); err != nil {
 		t.Fatalf("bar publish: %v", err)
 	}
 	if err := s1.Close(); err != nil {
 		t.Fatalf("Close #1: %v", err)
 	}
 
-	// Second "process": same path; history must show prior publishes.
+	// Second "process": same path; history must show prior publishes
+	// in the same order, and a fresh publish must persist alongside.
 	s2, err := bbolt.Open(bbolt.Options{Path: path})
 	if err != nil {
 		t.Fatalf("Open #2: %v", err)
@@ -68,63 +72,19 @@ func TestBBoltSurvivesProcessRestart(t *testing.T) {
 		}
 	}
 
-	// A new publish on foo gets a channelSerial > all prior ones —
-	// the generator's state was restored from _meta.
+	// A post-restart publish persists and shows up at the tail.
 	fresh, _, err := s2.Channel("foo").AppendChannelMessage(ctx, []*protocol.Message{{Name: "z"}})
 	if err != nil {
 		t.Fatalf("post-restart publish: %v", err)
 	}
-	for _, prior := range append([]string{}, append(fooSerials, barCM.ChannelSerial)...) {
-		if fresh.ChannelSerial <= prior {
-			t.Errorf("post-restart channelSerial %q not greater than prior %q", fresh.ChannelSerial, prior)
-		}
-	}
-}
-
-func TestBBoltSeriesIDPersistsAcrossRestart(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "ably.db")
-
-	s1, err := bbolt.Open(bbolt.Options{Path: path})
+	page, err = s2.Channel("foo").History(ctx, storage.HistoryQuery{})
 	if err != nil {
-		t.Fatalf("Open #1: %v", err)
+		t.Fatalf("foo History #2: %v", err)
 	}
-	cm1, _, err := s1.Channel("foo").AppendChannelMessage(context.Background(), []*protocol.Message{{Name: "x"}})
-	if err != nil {
-		t.Fatalf("publish #1: %v", err)
+	if got := len(page.ChannelMessages); got != len(fooSerials)+1 {
+		t.Fatalf("post-restart History len = %d, want %d", got, len(fooSerials)+1)
 	}
-	if err := s1.Close(); err != nil {
-		t.Fatalf("Close #1: %v", err)
+	if got := page.ChannelMessages[len(page.ChannelMessages)-1].ChannelSerial; got != fresh.ChannelSerial {
+		t.Errorf("tail ChannelSerial = %q, want %q", got, fresh.ChannelSerial)
 	}
-
-	s2, err := bbolt.Open(bbolt.Options{Path: path})
-	if err != nil {
-		t.Fatalf("Open #2: %v", err)
-	}
-	t.Cleanup(func() { _ = s2.Close() })
-
-	cm2, _, err := s2.Channel("foo").AppendChannelMessage(context.Background(), []*protocol.Message{{Name: "y"}})
-	if err != nil {
-		t.Fatalf("publish #2: %v", err)
-	}
-
-	// Same seriesId on both sides of the restart.
-	series1 := seriesIDOf(t, cm1.ChannelSerial)
-	series2 := seriesIDOf(t, cm2.ChannelSerial)
-	if series1 != series2 {
-		t.Errorf("seriesId changed across restart: %q vs %q", series1, series2)
-	}
-}
-
-// seriesIDOf extracts the seriesId from a channelSerial of the form
-// "<ts>-<ctr>@<seriesId>".
-func seriesIDOf(t *testing.T, cs string) string {
-	t.Helper()
-	for i := 0; i < len(cs); i++ {
-		if cs[i] == '@' {
-			return cs[i+1:]
-		}
-	}
-	t.Fatalf("malformed channelSerial %q (no @)", cs)
-	return ""
 }

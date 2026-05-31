@@ -1,15 +1,27 @@
 // Package bbolt is the on-disk storage backend (DESIGN.md §6.2).
-// State lives in a single bolt file at the configured data path,
-// with one top-level bucket per channel plus a process-wide _meta
-// bucket holding the serial generator's monotonic state.
+// State lives in a single bolt file at the configured data path with
+// two top-level buckets:
+//
+//   - messages: keyed "<channel>\0<channelSerial>", value is the
+//     msgpack-encoded protocol.ChannelMessage. bbolt's byte-order
+//     iteration over a "<channel>\0" prefix yields a channel's
+//     ChannelMessages in publish order.
+//   - ids: keyed "<channel>\0<Message.id>", value is the channelSerial
+//     the ID landed in. bbolt has no secondary indexes, so this is
+//     the manual equivalent of Postgres's partial UNIQUE
+//     idempotency index.
+//
+// Per-process seriesId is regenerated on every Open — the same
+// rationale as the Postgres backend (DESIGN.md §8). Generator
+// monotonic state is not persisted; restart monotonicity falls out
+// because wall-clock time advances.
 package bbolt
 
 import (
+	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"strconv"
 	"sync"
 
 	"github.com/vmihailenco/msgpack/v5"
@@ -20,18 +32,15 @@ import (
 	"github.com/ably/ably-server/internal/storage"
 )
 
-// Bucket key constants. Channel buckets are named "ch/<channel>" so
-// they sort under a known prefix and can't collide with the meta
-// bucket.
 var (
-	metaBucketName      = []byte("_meta")
-	metaSeriesIDKey     = []byte("seriesId")
-	metaLastTsKey       = []byte("lastTs")
-	metaLastCounterKey  = []byte("lastCounter")
-	channelBucketPrefix = []byte("ch/")
-	messagesSubBucket   = []byte("messages")
-	idsSubBucket        = []byte("ids")
+	messagesBucket = []byte("messages")
+	idsBucket      = []byte("ids")
 )
+
+// keySep separates the channel name from the rest of a composite key.
+// NUL never appears in channel names in any Ably protocol use case, so
+// it's a safe in-band separator.
+const keySep = byte(0)
 
 // Options configures the bbolt backend.
 type Options struct {
@@ -52,9 +61,9 @@ type Storage struct {
 	channels map[string]*channelStore
 }
 
-// Open opens (or creates) the bolt file at opts.Path and loads the
-// serial generator's state from the _meta bucket. A fresh DB has its
-// seriesId minted and persisted before the first Append.
+// Open opens (or creates) the bolt file at opts.Path, ensures the two
+// top-level buckets exist, and returns a Storage ready for use. The
+// seriesId is freshly generated per process.
 func Open(opts Options) (*Storage, error) {
 	if opts.Path == "" {
 		return nil, errors.New("storage/bbolt: Open requires a Path")
@@ -63,46 +72,22 @@ func Open(opts Options) (*Storage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("storage/bbolt: open %q: %w", opts.Path, err)
 	}
-
-	var (
-		seriesID   string
-		lastTs     int64
-		lastCounter int
-	)
-	err = db.Update(func(tx *bolt.Tx) error {
-		meta, err := tx.CreateBucketIfNotExists(metaBucketName)
-		if err != nil {
+	if err := db.Update(func(tx *bolt.Tx) error {
+		if _, err := tx.CreateBucketIfNotExists(messagesBucket); err != nil {
 			return err
 		}
-		if v := meta.Get(metaSeriesIDKey); v != nil {
-			seriesID = string(v)
-		} else {
-			seriesID = serial.NewSeriesID()
-			if err := meta.Put(metaSeriesIDKey, []byte(seriesID)); err != nil {
-				return err
-			}
-		}
-		if v := meta.Get(metaLastTsKey); v != nil {
-			lastTs = int64(binary.BigEndian.Uint64(v))
-		}
-		if v := meta.Get(metaLastCounterKey); v != nil {
-			lastCounter = int(binary.BigEndian.Uint64(v))
+		if _, err := tx.CreateBucketIfNotExists(idsBucket); err != nil {
+			return err
 		}
 		return nil
-	})
-	if err != nil {
+	}); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("storage/bbolt: load _meta: %w", err)
-	}
-
-	gen := serial.NewGenerator(seriesID, opts.Now)
-	if lastTs != 0 || lastCounter != 0 {
-		gen.Restore(lastTs, lastCounter)
+		return nil, fmt.Errorf("storage/bbolt: bootstrap buckets: %w", err)
 	}
 
 	return &Storage{
 		db:       db,
-		gen:      gen,
+		gen:      serial.NewGenerator(serial.NewSeriesID(), opts.Now),
 		channels: make(map[string]*channelStore),
 	}, nil
 }
@@ -115,11 +100,7 @@ func (s *Storage) Channel(name string) storage.ChannelStore {
 	if cs, ok := s.channels[name]; ok {
 		return cs
 	}
-	cs := &channelStore{
-		db:         s.db,
-		gen:        s.gen,
-		bucketName: channelBucketName(name),
-	}
+	cs := &channelStore{db: s.db, gen: s.gen, name: name}
 	s.channels[name] = cs
 	return cs
 }
@@ -129,20 +110,32 @@ func (s *Storage) Close() error {
 	return s.db.Close()
 }
 
-func channelBucketName(name string) []byte {
-	b := make([]byte, 0, len(channelBucketPrefix)+len(name))
-	b = append(b, channelBucketPrefix...)
-	b = append(b, name...)
+// channelKey returns a composite key "<channel>\0<suffix>" suitable
+// for either the messages or ids bucket.
+func channelKey(channel, suffix string) []byte {
+	b := make([]byte, 0, len(channel)+1+len(suffix))
+	b = append(b, channel...)
+	b = append(b, keySep)
+	b = append(b, suffix...)
 	return b
 }
 
-// channelStore is the per-channel facet. All operations run inside a
-// bolt tx, so concurrency is controlled by bolt (one writer at a
-// time) and by the shared generator's internal mutex.
+// channelPrefix returns "<channel>\0" — the lex-bound for a
+// channel's range scan.
+func channelPrefix(channel string) []byte {
+	b := make([]byte, 0, len(channel)+1)
+	b = append(b, channel...)
+	b = append(b, keySep)
+	return b
+}
+
+// channelStore is the per-channel facet. Concurrency is controlled by
+// bolt (one writer at a time per DB) and by the shared generator's
+// internal mutex.
 type channelStore struct {
-	db         *bolt.DB
-	gen        *serial.Generator
-	bucketName []byte
+	db   *bolt.DB
+	gen  *serial.Generator
+	name string
 }
 
 func (cs *channelStore) AppendChannelMessage(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
@@ -158,18 +151,8 @@ func (cs *channelStore) AppendChannelMessage(ctx context.Context, msgs []*protoc
 		idempotent bool
 	)
 	err := cs.db.Update(func(tx *bolt.Tx) error {
-		cb, err := tx.CreateBucketIfNotExists(cs.bucketName)
-		if err != nil {
-			return err
-		}
-		messages, err := cb.CreateBucketIfNotExists(messagesSubBucket)
-		if err != nil {
-			return err
-		}
-		ids, err := cb.CreateBucketIfNotExists(idsSubBucket)
-		if err != nil {
-			return err
-		}
+		messages := tx.Bucket(messagesBucket)
+		ids := tx.Bucket(idsBucket)
 
 		// Idempotency: any contained ID that's already indexed makes
 		// this whole publish a duplicate.
@@ -177,8 +160,8 @@ func (cs *channelStore) AppendChannelMessage(ctx context.Context, msgs []*protoc
 			if m.ID == "" {
 				continue
 			}
-			if existingCS := ids.Get([]byte(m.ID)); existingCS != nil {
-				blob := messages.Get(existingCS)
+			if existingCS := ids.Get(channelKey(cs.name, m.ID)); existingCS != nil {
+				blob := messages.Get(channelKey(cs.name, string(existingCS)))
 				if blob == nil {
 					return fmt.Errorf("storage/bbolt: id index points to missing ChannelMessage %q", existingCS)
 				}
@@ -206,31 +189,16 @@ func (cs *channelStore) AppendChannelMessage(ctx context.Context, msgs []*protoc
 		if err != nil {
 			return fmt.Errorf("storage/bbolt: encode ChannelMessage: %w", err)
 		}
-		if err := messages.Put([]byte(channelSerial), blob); err != nil {
+		if err := messages.Put(channelKey(cs.name, channelSerial), blob); err != nil {
 			return err
 		}
 		for _, m := range msgs {
 			if m.ID == "" {
 				continue
 			}
-			if err := ids.Put([]byte(m.ID), []byte(channelSerial)); err != nil {
+			if err := ids.Put(channelKey(cs.name, m.ID), []byte(channelSerial)); err != nil {
 				return err
 			}
-		}
-
-		// Persist the generator's state so a fresh process keeps
-		// minting monotonically. The channelSerial itself encodes
-		// (ts, counter), so we just parse it back.
-		ts, counter, perr := parseTimestampCounter(channelSerial)
-		if perr != nil {
-			return perr
-		}
-		meta := tx.Bucket(metaBucketName)
-		if err := putUint64(meta, metaLastTsKey, uint64(ts)); err != nil {
-			return err
-		}
-		if err := putUint64(meta, metaLastCounterKey, uint64(counter)); err != nil {
-			return err
 		}
 
 		resultCM = cm
@@ -249,26 +217,28 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 
 	var page storage.HistoryPage
 	err := cs.db.View(func(tx *bolt.Tx) error {
-		cb := tx.Bucket(cs.bucketName)
-		if cb == nil {
-			return nil
-		}
-		messages := cb.Bucket(messagesSubBucket)
+		messages := tx.Bucket(messagesBucket)
 		if messages == nil {
 			return nil
 		}
 
-		cur := messages.Cursor()
-		var k, v []byte
+		prefix := channelPrefix(cs.name)
+		var seekKey []byte
 		if q.AfterChannelSerial == "" {
-			k, v = cur.First()
+			seekKey = prefix
 		} else {
-			k, v = cur.Seek([]byte(q.AfterChannelSerial))
-			if k != nil && string(k) == q.AfterChannelSerial {
-				k, v = cur.Next()
-			}
+			seekKey = channelKey(cs.name, q.AfterChannelSerial)
+		}
+
+		cur := messages.Cursor()
+		k, v := cur.Seek(seekKey)
+		if q.AfterChannelSerial != "" && k != nil && bytes.Equal(k, seekKey) {
+			k, v = cur.Next()
 		}
 		for ; k != nil; k, v = cur.Next() {
+			if !bytes.HasPrefix(k, prefix) {
+				break
+			}
 			if q.Limit > 0 && len(page.ChannelMessages) >= q.Limit {
 				page.HasMore = true
 				return nil
@@ -285,27 +255,4 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 		return storage.HistoryPage{}, err
 	}
 	return page, nil
-}
-
-// parseTimestampCounter pulls (ts, counter) back out of a freshly
-// minted channelSerial of the form "<14-digit ts>-<3-digit ctr>@<series>".
-func parseTimestampCounter(cs string) (int64, int, error) {
-	if len(cs) < 18 || cs[14] != '-' || cs[18] != '@' {
-		return 0, 0, fmt.Errorf("storage/bbolt: malformed channelSerial %q", cs)
-	}
-	ts, err := strconv.ParseInt(cs[:14], 10, 64)
-	if err != nil {
-		return 0, 0, fmt.Errorf("storage/bbolt: parse timestamp from %q: %w", cs, err)
-	}
-	ctr, err := strconv.Atoi(cs[15:18])
-	if err != nil {
-		return 0, 0, fmt.Errorf("storage/bbolt: parse counter from %q: %w", cs, err)
-	}
-	return ts, ctr, nil
-}
-
-func putUint64(b *bolt.Bucket, key []byte, v uint64) error {
-	var buf [8]byte
-	binary.BigEndian.PutUint64(buf[:], v)
-	return b.Put(key, buf[:])
 }
