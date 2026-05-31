@@ -486,43 +486,53 @@ single Postgres.
 Schema sketch:
 
 ```sql
-CREATE TABLE channels (
-  name TEXT PRIMARY KEY,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- One row per atomic publish (the ChannelMessage unit, §5/§8).
-CREATE TABLE channel_messages (
-  channel        TEXT        NOT NULL,
-  channel_serial TEXT        NOT NULL,    -- "<ts>-<ctr>@<series>" (§8)
-  timestamp      TIMESTAMPTZ NOT NULL,
-  PRIMARY KEY (channel, channel_serial)
-);
-CREATE INDEX ON channel_messages (channel, timestamp DESC);
-
--- One row per individual Message within a ChannelMessage.
+-- One row per individual Message. The PK groups Messages under their
+-- shared channelSerial; the channelSerial prefix encodes the mint
+-- timestamp (§8), so a forward range scan over the PK covers ordered
+-- history reads AND time-based retention without a separate
+-- created_at column.
 CREATE TABLE messages (
-  channel        TEXT NOT NULL,
-  channel_serial TEXT NOT NULL,           -- FK → channel_messages
-  idx            INT  NOT NULL,           -- position within the batch
-  id             TEXT,                    -- client-supplied idempotency key
-  client_id      TEXT,
-  conn_id        TEXT,
-  name           TEXT,
-  data           BYTEA,
-  encoding       TEXT,
-  extras         JSONB,
-  PRIMARY KEY (channel, channel_serial, idx),
-  FOREIGN KEY (channel, channel_serial)
-    REFERENCES channel_messages (channel, channel_serial) ON DELETE CASCADE
+  channel        TEXT  NOT NULL,
+  channel_serial TEXT  NOT NULL,    -- "<ts>-<ctr>@<series>" (§8)
+  idx            INT   NOT NULL,    -- position within the publish batch
+  id             TEXT,              -- nullable, client-supplied idempotency key
+  payload        BYTEA NOT NULL,    -- msgpack-encoded protocol.Message
+  PRIMARY KEY (channel, channel_serial, idx)
 );
-CREATE UNIQUE INDEX ON messages (channel, id) WHERE id IS NOT NULL;
+
+-- Idempotency: a non-NULL client-supplied id is unique per channel
+-- within the retention window. The partial index skips NULL ids so
+-- publishes without an id never collide.
+CREATE UNIQUE INDEX messages_idempotency_idx
+  ON messages (channel, id) WHERE id IS NOT NULL;
 ```
 
-Retention is enforced by a periodic background job that deletes rows
-from `channel_messages` where `timestamp < now() - ttl` (the
-`messages` rows cascade), plus a per-channel cap counted in
-ChannelMessages.
+The DDL ships in `internal/storage/postgres/schema.sql` and is applied
+(CREATE … IF NOT EXISTS) when `postgres.Open` is called. Concurrent-
+safe application across N nodes booting against an empty database —
+plus a `schema_migrations` tracker for forward migrations — lives in
+the auto-migrate path (DESIGN.md §11 / TASK-23).
+
+Per-publish writes run inside a transaction that takes a per-channel
+advisory lock (`pg_advisory_xact_lock(hashtext(channel))`), so
+concurrent writers serialise per channel without contending across
+channels. Each node generates its own seriesId at process start; the
+serial format itself (the `@seriesId` suffix) disambiguates concurrent
+mints, so generator state is not shared across nodes.
+
+Retention is a periodic background job that deletes the oldest
+messages on each channel using the channelSerial range — the first 14
+characters are the zero-padded mint timestamp in ms, so lex
+comparison matches numeric comparison:
+
+```sql
+DELETE FROM messages
+WHERE channel = $1
+  AND channel_serial < lpad(((now_ms - ttl_ms))::text, 14, '0');
+```
+
+A per-channel cap (counted in ChannelMessages = `DISTINCT
+channel_serial`) is applied in the same sweep.
 
 The default message TTL is **2 minutes**, matching Ably cloud's default;
 both the TTL and the per-channel message cap are configurable (see §9).
