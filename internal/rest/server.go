@@ -20,6 +20,7 @@ import (
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/storage"
 )
 
 // Server holds the REST endpoint's state. Its HTTP handlers are
@@ -27,15 +28,18 @@ import (
 type Server struct {
 	authn   *auth.Authenticator
 	manager *core.Manager
+	store   storage.Storage
 	logger  *slog.Logger
 }
 
 // NewServer constructs a Server. All arguments are required; callers
-// supply an explicit Manager and logger.
-func NewServer(key auth.APIKey, manager *core.Manager, logger *slog.Logger) *Server {
+// supply an explicit Manager (live channel state), Storage (persistence
+// + serial minting), and logger.
+func NewServer(key auth.APIKey, manager *core.Manager, store storage.Storage, logger *slog.Logger) *Server {
 	return &Server{
 		authn:   auth.NewAuthenticator(key),
 		manager: manager,
+		store:   store,
 		logger:  logger,
 	}
 }
@@ -74,11 +78,14 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ch := s.manager.GetChannel(name)
-	if _, _, err := ch.AppendChannelMessage(r.Context(), msgs); err != nil {
+	cm, idempotent, err := s.store.Channel(name).AppendChannelMessage(r.Context(), msgs)
+	if err != nil {
 		s.logger.Warn("publish failed", "channel", name, "err", err)
 		http.Error(w, "publish failed", http.StatusInternalServerError)
 		return
+	}
+	if !idempotent {
+		s.manager.GetChannel(name).Append(cm)
 	}
 	w.WriteHeader(http.StatusCreated)
 }

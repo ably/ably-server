@@ -347,18 +347,13 @@ mutex around append. Attachments tail the list at their own pace, with no
 fan-out channels and no per-attachment buffering. Each list entry is one
 ChannelMessage (§8) — an atomic publish carrying one or more Messages.
 
-Serial minting and persistence live in the storage backend (§6, §8);
-Channel only links already-minted ChannelMessages so attachments can
-tail them. Channel exposes two append paths:
-
-- `AppendChannelMessage(ctx, msgs)` — the local publish path. Delegates
-  to `storage.ChannelStore.AppendChannelMessage`, which mints the
-  channelSerial, stamps each `Message.Serial`, persists, and returns
-  the resulting cm; Channel then links it into the live list on a
-  non-idempotent return.
-- `Append(cm)` — the link-only path. Used by the cluster broker's
-  NOTIFY listener (§7.2) once it has fetched the canonical row;
-  performs no minting or persistence.
+Channel is intentionally storage-agnostic. Serial minting and
+persistence live in the storage backend (§6, §8); Channel exposes a
+single `Append(cm)` method that links an already-minted ChannelMessage
+onto the tail and wakes parked streams. Publish-path callers (the
+realtime connection, the REST publish handler, the cluster broker's
+NOTIFY listener) ask storage for a `cm` first and then pass it to
+`Append`; see §7.
 
 Each entry holds one ChannelMessage plus a `notify` channel that is
 closed once the next entry is linked; parked attachment goroutines wake
@@ -398,14 +393,13 @@ Each WebSocket connection has:
 - An `attachments map[string]*Attachment` keyed by channel name.
 
 Inbound `MESSAGE` is routed to the matching attachment, which
-authorises the publish and calls `channel.AppendChannelMessage(ctx,
-messages)` — storage mints the channelSerial, stamps each contained
-`Message.serial`, persists the resulting ChannelMessage, and returns
-it; Channel links it into the live list (or, in cluster mode, the
-local `Append` is driven by the `NOTIFY` listener after fetching the
-canonical row). The connection then replies with `ACK` / `NACK`.
-Inbound `ATTACH` / `DETACH` are handled by the connection itself,
-calling into `ChannelManager` to get/release a Channel.
+authorises the publish and runs the §7.1 sequence: it asks storage for
+a minted+persisted ChannelMessage and, on a non-idempotent return,
+links it into the local Channel (in cluster mode the local link is
+driven instead by the `NOTIFY` listener — see §7.2). The connection
+then replies with `ACK` / `NACK`. Inbound `ATTACH` / `DETACH` are
+handled by the connection itself, calling into `ChannelManager` to
+get/release a Channel.
 
 ## 6. Storage
 
@@ -545,11 +539,13 @@ directly.
 
 ### 7.1 Single-process modes (`memory`, `disk`)
 
-There is no pub/sub abstraction. A publish is a direct sequence:
+There is no pub/sub abstraction. A publish is a direct sequence run
+inside the publish-path caller (the REST handler or the realtime
+connection):
 
 1. Authorise.
-2. `channel.AppendChannelMessage(ctx, messages)` — delegates to the
-   backend's `Storage.AppendChannelMessage`, which atomically:
+2. `storage.Channel(name).AppendChannelMessage(ctx, messages)` —
+   atomically:
    - checks any contained `Message.id` against this channel's
      idempotency index; on hit, returns the originally-persisted
      ChannelMessage with `idempotent=true` and no new row is written;
@@ -557,11 +553,14 @@ There is no pub/sub abstraction. A publish is a direct sequence:
      `Message.serial = channelSerial + ":" + idx`, persists the
      resulting `ChannelMessage{channelSerial, messages}` as one unit,
      and indexes any contained `Message.id`.
-3. On a non-idempotent return, Channel links the cm into its live
-   list as a single entry; attachments park on the previous tail's
-   `notify` wake up and observe the new entry.
+3. On a non-idempotent return, the caller calls
+   `manager.GetChannel(name).Append(cm)` to link the cm into the
+   live list. Attachments parked on the previous tail's `notify` wake
+   up and observe the new entry.
 
-All attachments are on the same node and tail the same list.
+`core.Manager` and `storage.Storage` are separate dependencies; the
+publish-path caller holds both. All attachments are on the same node
+and tail the same list.
 
 ### 7.2 Cluster mode (Postgres broker)
 
@@ -572,8 +571,9 @@ listening for channel-publish notifications:
   the row into `messages` with that serial as primary key, and emits
   `NOTIFY ably_channel, '<channel-name>:<serial>'`.
 - Every listening node (including the publisher) receives the
-  notification, fetches the row by `(channel, serial)`, and
-  calls `channel.Append(msg)` on its local Channel.
+  notification, fetches the canonical ChannelMessage by
+  `(channel, serial)`, and calls `channel.Append(cm)` on its local
+  Channel.
 
 The serial's format is itself the global ordering: the `<seriesId>`
 component disambiguates serials minted in the same millisecond by

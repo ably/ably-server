@@ -24,15 +24,17 @@ const testKey = "app.key:secret"
 
 // newTestServer builds an httptest.Server wrapping our REST handler
 // with a known API key. The returned Manager is the same one the
-// server is wired with, so tests can observe Appends directly.
+// server is wired with, so tests can attach streams and observe the
+// effects of REST publishes.
 func newTestServer(t *testing.T) (*httptest.Server, *core.Manager) {
 	t.Helper()
 	parsed, err := auth.ParseAPIKey(testKey)
 	if err != nil {
 		t.Fatalf("parse api key: %v", err)
 	}
-	manager := core.NewManager(memory.New(memory.Options{}))
-	rs := NewServer(parsed, manager, slog.New(slog.DiscardHandler))
+	manager := core.NewManager()
+	store := memory.New(memory.Options{})
+	rs := NewServer(parsed, manager, store, slog.New(slog.DiscardHandler))
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /channels/{name}/messages", rs.HandlePublish)
 	mux.HandleFunc("GET /time", rs.HandleTime)

@@ -8,12 +8,14 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -21,6 +23,8 @@ import (
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/realtime"
 	"github.com/ably/ably-server/internal/rest"
+	"github.com/ably/ably-server/internal/storage"
+	"github.com/ably/ably-server/internal/storage/bbolt"
 	"github.com/ably/ably-server/internal/storage/memory"
 )
 
@@ -40,6 +44,8 @@ func run(ctx context.Context, args []string, getenv func(string) string, out io.
 	fs.SetOutput(out)
 	listen := fs.String("listen", ":8080", "address for HTTP/WS listener")
 	apiKey := fs.String("api-key", getenv(apiKeyEnv), "API key in appId.keyId:keySecret format (env: "+apiKeyEnv+")")
+	mode := fs.String("mode", "memory", "storage backend: memory or disk")
+	dataDir := fs.String("data-dir", "./data", "data directory for disk mode (holds the bbolt file)")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	shutdownGrace := fs.Duration("shutdown-grace", 10*time.Second, "window to disconnect existing connections on SIGTERM")
 	logLevel := fs.String("log-level", "info", "log level: debug, info, warn, error")
@@ -59,9 +65,21 @@ func run(ctx context.Context, args []string, getenv func(string) string, out io.
 		return 1
 	}
 
-	manager := core.NewManager(memory.New(memory.Options{}))
-	rt := realtime.NewServer(parsedKey, manager, *hbInterval, logger)
-	rs := rest.NewServer(parsedKey, manager, logger)
+	store, err := openStorage(*mode, *dataDir)
+	if err != nil {
+		logger.Error("open storage", "mode", *mode, "err", err)
+		return 1
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			logger.Error("close storage", "err", err)
+		}
+	}()
+	logger.Info("storage ready", "mode", *mode)
+
+	manager := core.NewManager()
+	rt := realtime.NewServer(parsedKey, manager, store, *hbInterval, logger)
+	rs := rest.NewServer(parsedKey, manager, store, logger)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", rt.HandleWebSocket)
@@ -97,6 +115,26 @@ func run(ctx context.Context, args []string, getenv func(string) string, out io.
 		return 1
 	}
 	return 0
+}
+
+// openStorage constructs the storage.Storage selected by mode. The
+// disk mode uses bbolt at <dataDir>/ably.db, creating dataDir if it
+// doesn't exist. Cluster mode (Postgres) is not yet implemented.
+func openStorage(mode, dataDir string) (storage.Storage, error) {
+	switch mode {
+	case "memory":
+		return memory.New(memory.Options{}), nil
+	case "disk":
+		if dataDir == "" {
+			return nil, errors.New("--data-dir is required when --mode=disk")
+		}
+		if err := os.MkdirAll(dataDir, 0o755); err != nil {
+			return nil, fmt.Errorf("create data-dir %q: %w", dataDir, err)
+		}
+		return bbolt.Open(bbolt.Options{Path: filepath.Join(dataDir, "ably.db")})
+	default:
+		return nil, fmt.Errorf("unknown --mode %q (valid: memory, disk)", mode)
+	}
 }
 
 func newLogger(level string, w io.Writer) *slog.Logger {

@@ -16,37 +16,53 @@ import (
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/storage"
 	"github.com/ably/ably-server/internal/storage/memory"
 )
 
-// publish is a test helper around Channel.AppendChannelMessage that
-// fails the test on error.
-func publish(t *testing.T, m *core.Manager, channel string, msgs ...*protocol.Message) {
+// testHarness bundles the per-test core+storage pair so test helpers
+// can drive both layers without every call site having to thread two
+// dependencies. Tests that need to publish use harness.publish.
+type testHarness struct {
+	manager *core.Manager
+	store   storage.Storage
+}
+
+// publish runs the full intra-process publish: storage mints + persists,
+// then the local Channel is linked (skipped on idempotent return). The
+// test fails on storage error.
+func (h *testHarness) publish(t *testing.T, channel string, msgs ...*protocol.Message) {
 	t.Helper()
-	if _, _, err := m.GetChannel(channel).AppendChannelMessage(context.Background(), msgs); err != nil {
+	cm, idempotent, err := h.store.Channel(channel).AppendChannelMessage(context.Background(), msgs)
+	if err != nil {
 		t.Fatalf("publish to %q: %v", channel, err)
+	}
+	if !idempotent {
+		h.manager.GetChannel(channel).Append(cm)
 	}
 }
 
 const testKey = "app.key:secret"
 
 // newTestServer constructs an httptest.Server wrapping our realtime
-// Server with a known API key. The returned Manager is the same one
-// the server is wired with, so tests can publish to channels and
-// observe attachment-driven forwarding.
-func newTestServer(t *testing.T, hb time.Duration) (*httptest.Server, *core.Manager) {
+// Server with a known API key. The returned testHarness wraps the
+// Manager and Storage the server is wired with, so tests can publish
+// to channels and observe attachment-driven forwarding via
+// harness.publish.
+func newTestServer(t *testing.T, hb time.Duration) (*httptest.Server, *testHarness) {
 	t.Helper()
 	parsed, err := auth.ParseAPIKey(testKey)
 	if err != nil {
 		t.Fatalf("parse api key: %v", err)
 	}
-	manager := core.NewManager(memory.New(memory.Options{}))
-	rt := NewServer(parsed, manager, hb, slog.New(slog.DiscardHandler))
+	manager := core.NewManager()
+	store := memory.New(memory.Options{})
+	rt := NewServer(parsed, manager, store, hb, slog.New(slog.DiscardHandler))
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", rt.HandleWebSocket)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return srv, manager
+	return srv, &testHarness{manager: manager, store: store}
 }
 
 // dial connects a WebSocket client to srv with the test key included as
@@ -283,7 +299,7 @@ func TestAttachReceivesAttachedAck(t *testing.T) {
 }
 
 func TestAttachForwardsPublishedMessages(t *testing.T) {
-	srv, manager := newTestServer(t, time.Hour)
+	srv, h := newTestServer(t, time.Hour)
 	ws := dial(t, srv, "")
 	drainConnected(t, ws)
 
@@ -295,7 +311,7 @@ func TestAttachForwardsPublishedMessages(t *testing.T) {
 		t.Fatalf("expected ATTACHED, got %v", msg.Action)
 	}
 
-	publish(t, manager, "foo", &protocol.Message{ID: "m1"})
+	h.publish(t, "foo", &protocol.Message{ID: "m1"})
 
 	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
 	if msg.Action != protocol.ActionMessage {
@@ -321,7 +337,7 @@ func TestAttachForwardsPublishedMessages(t *testing.T) {
 }
 
 func TestAttachIsIdempotentPerChannel(t *testing.T) {
-	srv, manager := newTestServer(t, time.Hour)
+	srv, h := newTestServer(t, time.Hour)
 	ws := dial(t, srv, "")
 	drainConnected(t, ws)
 
@@ -339,7 +355,7 @@ func TestAttachIsIdempotentPerChannel(t *testing.T) {
 		t.Fatalf("expected ATTACHED, got %v", msg.Action)
 	}
 
-	publish(t, manager, "foo", &protocol.Message{ID: "m1"})
+	h.publish(t, "foo", &protocol.Message{ID: "m1"})
 
 	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
 	if msg.Action != protocol.ActionMessage {
@@ -356,7 +372,7 @@ func TestAttachIsIdempotentPerChannel(t *testing.T) {
 }
 
 func TestAttachSupportsMultipleChannels(t *testing.T) {
-	srv, manager := newTestServer(t, time.Hour)
+	srv, h := newTestServer(t, time.Hour)
 	ws := dial(t, srv, "")
 	drainConnected(t, ws)
 
@@ -380,8 +396,8 @@ func TestAttachSupportsMultipleChannels(t *testing.T) {
 		t.Fatalf("ATTACHED channels = %v, want both foo and bar", got)
 	}
 
-	publish(t, manager, "foo", &protocol.Message{ID: "f1"})
-	publish(t, manager, "bar", &protocol.Message{ID: "b1"})
+	h.publish(t, "foo", &protocol.Message{ID: "f1"})
+	h.publish(t, "bar", &protocol.Message{ID: "b1"})
 
 	seen := map[string]string{}
 	for range 2 {
@@ -580,7 +596,7 @@ func TestCloseReceivesClosed(t *testing.T) {
 }
 
 func TestDetachReceivesDetached(t *testing.T) {
-	srv, manager := newTestServer(t, time.Hour)
+	srv, h := newTestServer(t, time.Hour)
 	ws := dial(t, srv, "")
 	drainConnected(t, ws)
 
@@ -605,7 +621,7 @@ func TestDetachReceivesDetached(t *testing.T) {
 	}
 
 	// Publishing after detach should not forward to this connection.
-	publish(t, manager, "foo", &protocol.Message{ID: "m1"})
+	h.publish(t, "foo", &protocol.Message{ID: "m1"})
 	if err := ws.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
 		t.Fatalf("SetReadDeadline: %v", err)
 	}

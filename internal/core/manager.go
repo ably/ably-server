@@ -1,26 +1,19 @@
 package core
 
-import (
-	"sync"
+import "sync"
 
-	"github.com/ably/ably-server/internal/storage"
-)
-
-// Manager owns the set of active Channels in this process. Each
-// Channel is backed by a per-name facet of the shared storage, which
-// is the sole authority for channelSerial minting and idempotency
-// (DESIGN.md §6, §8).
+// Manager owns the set of active Channels in this process. It is
+// purely about lifecycle and identity (which channels exist, returning
+// the same instance for the same name); storage is a separate
+// concern, injected directly into the publish-path callers.
 type Manager struct {
-	store storage.Storage
-
 	mu       sync.Mutex
 	channels map[string]*Channel
 }
 
-// NewManager constructs an empty Manager backed by store.
-func NewManager(store storage.Storage) *Manager {
+// NewManager constructs an empty Manager.
+func NewManager() *Manager {
 	return &Manager{
-		store:    store,
 		channels: make(map[string]*Channel),
 	}
 }
@@ -33,7 +26,7 @@ func (m *Manager) GetChannel(name string) *Channel {
 	if ch, ok := m.channels[name]; ok {
 		return ch
 	}
-	ch := newChannel(name, m.store.Channel(name))
+	ch := newChannel(name)
 	m.channels[name] = ch
 	return ch
 }
