@@ -26,6 +26,16 @@ func newCM(serial string, ids ...string) *protocol.ChannelMessage {
 	return &protocol.ChannelMessage{ChannelSerial: serial, Messages: msgs}
 }
 
+// newReadyChannel constructs a Channel and drives it through
+// Initialize with the given seed serial, mirroring what the storage
+// backend does in production. Tests that exercise Attach use this so
+// they don't have to wire up a real storage to get a ready channel.
+func newReadyChannel(name, seedSerial string) *Channel {
+	c := newChannel(name)
+	c.Initialize(seedSerial)
+	return c
+}
+
 // isClosed reports whether ch is closed (non-blocking).
 func isClosed(ch <-chan struct{}) bool {
 	select {
@@ -37,7 +47,7 @@ func isClosed(ch <-chan struct{}) bool {
 }
 
 func TestChannelAppendBuildsList(t *testing.T) {
-	c := newChannel("test", nil)
+	c := newChannel("test")
 	head := c.tail // sentinel; notify open, next nil
 
 	cms := []*protocol.ChannelMessage{
@@ -78,7 +88,7 @@ func TestChannelAppendBuildsList(t *testing.T) {
 }
 
 func TestChannelAppendIsNoOpOnNilOrEmpty(t *testing.T) {
-	c := newChannel("test", nil)
+	c := newChannel("test")
 	head := c.tail
 
 	c.Append(nil)
@@ -95,7 +105,7 @@ func TestChannelAppendIsNoOpOnNilOrEmpty(t *testing.T) {
 }
 
 func TestChannelNotifyWakesWaiter(t *testing.T) {
-	c := newChannel("test", nil)
+	c := newChannel("test")
 	head := c.tail
 
 	got := make(chan *entry, 1)
@@ -120,7 +130,7 @@ func TestChannelNotifyWakesWaiter(t *testing.T) {
 }
 
 func TestChannelNotifyWakesAllWaiters(t *testing.T) {
-	c := newChannel("test", nil)
+	c := newChannel("test")
 	head := c.tail
 
 	const waiters = 5
@@ -145,7 +155,7 @@ func TestChannelNotifyWakesAllWaiters(t *testing.T) {
 }
 
 func TestChannelAppendIsConcurrentSafe(t *testing.T) {
-	c := newChannel("test", nil)
+	c := newChannel("test")
 	head := c.tail
 
 	const writers = 10
@@ -176,12 +186,15 @@ func TestChannelAppendIsConcurrentSafe(t *testing.T) {
 	}
 }
 
-func TestStreamAttachOnEmptyChannelBlocksUntilAppend(t *testing.T) {
-	c := newChannel("test", nil)
-	s := c.Attach()
+func TestStreamAttachOnEmptyChannelExposesWatermark(t *testing.T) {
+	c := newReadyChannel("test", "seed-serial")
+	s, err := c.Attach(context.Background())
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
 
-	if got := s.ChannelSerial(); got != "" {
-		t.Errorf("initial ChannelSerial = %q, want empty (no ChannelMessage delivered yet)", got)
+	if got := s.ChannelSerial(); got != "seed-serial" {
+		t.Errorf("initial ChannelSerial = %q, want %q (watermark from Initialize)", got, "seed-serial")
 	}
 
 	got := make(chan *protocol.ChannelMessage, 1)
@@ -216,11 +229,14 @@ func TestStreamAttachOnEmptyChannelBlocksUntilAppend(t *testing.T) {
 }
 
 func TestStreamAttachAfterAppendsParksAtTail(t *testing.T) {
-	c := newChannel("test", nil)
+	c := newReadyChannel("test", "seed-serial")
 	c.Append(newCM("001", "m1"))
 	c.Append(newCM("002", "m2"))
 
-	s := c.Attach()
+	s, err := c.Attach(context.Background())
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
 	if got := s.ChannelSerial(); got != "002" {
 		t.Fatalf("ChannelSerial after appends = %q, want %q", got, "002")
 	}
@@ -250,8 +266,11 @@ func TestStreamAttachAfterAppendsParksAtTail(t *testing.T) {
 }
 
 func TestStreamNextRespectsContext(t *testing.T) {
-	c := newChannel("test", nil)
-	s := c.Attach()
+	c := newReadyChannel("test", "seed-serial")
+	s, err := c.Attach(context.Background())
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -262,8 +281,11 @@ func TestStreamNextRespectsContext(t *testing.T) {
 }
 
 func TestStreamNextReturnsAtomicBatchAsOneChannelMessage(t *testing.T) {
-	c := newChannel("test", nil)
-	s := c.Attach()
+	c := newReadyChannel("test", "seed-serial")
+	s, err := c.Attach(context.Background())
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
 
 	// One Append carrying 3 messages is one ChannelMessage delivered
 	// as a single Next return.
@@ -290,5 +312,46 @@ func TestStreamNextReturnsAtomicBatchAsOneChannelMessage(t *testing.T) {
 	defer cancel2()
 	if _, err := s.Next(ctx2); err == nil {
 		t.Fatal("Next returned without a fresh Append; expected ctx error")
+	}
+}
+
+func TestChannelAttachBlocksUntilInitialize(t *testing.T) {
+	c := newChannel("test")
+
+	attached := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_, err := c.Attach(ctx)
+		attached <- err
+	}()
+
+	// Without Initialize, Attach should not return promptly.
+	select {
+	case err := <-attached:
+		t.Fatalf("Attach returned before Initialize: err=%v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	c.Initialize("seed")
+
+	select {
+	case err := <-attached:
+		if err != nil {
+			t.Fatalf("Attach after Initialize: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Attach did not return within 1s of Initialize")
+	}
+}
+
+func TestChannelAttachRespectsContextBeforeInitialize(t *testing.T) {
+	c := newChannel("test")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := c.Attach(ctx); err == nil {
+		t.Fatal("Attach returned nil error on cancelled ctx before Initialize")
 	}
 }

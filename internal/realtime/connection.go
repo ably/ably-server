@@ -115,8 +115,17 @@ func (c *connection) handleAttach(ctx context.Context, name string) {
 	if _, exists := c.attachments[name]; exists {
 		return
 	}
-	ch := c.manager.GetChannel(name)
-	a := newAttachment(ctx, name, ch.Attach(), c.outbound, c.logger.With("channel", name))
+	ch, err := c.manager.GetChannel(ctx, name)
+	if err != nil {
+		c.logger.Warn("GetChannel failed", "channel", name, "err", err)
+		return
+	}
+	stream, err := ch.Attach(ctx)
+	if err != nil {
+		c.logger.Warn("Attach failed", "channel", name, "err", err)
+		return
+	}
+	a := newAttachment(ctx, name, stream, c.outbound, c.logger.With("channel", name))
 	c.attachments[name] = a
 	go a.run()
 }
@@ -160,7 +169,16 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 		return
 	}
 
-	if _, _, err := c.manager.GetChannel(msg.Channel).Publish(ctx, msg.Messages); err != nil {
+	ch, err := c.manager.GetChannel(ctx, msg.Channel)
+	if err != nil {
+		c.logger.Warn("publish failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerial, "err", err)
+		c.queue(ctx, &protocol.ProtocolMessage{
+			Action:    protocol.ActionNack,
+			MsgSerial: msg.MsgSerial,
+		})
+		return
+	}
+	if _, _, err := ch.Publish(ctx, msg.Messages); err != nil {
 		c.logger.Warn("publish failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerial, "err", err)
 		c.queue(ctx, &protocol.ProtocolMessage{
 			Action:    protocol.ActionNack,

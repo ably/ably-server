@@ -78,7 +78,13 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, _, err := s.manager.GetChannel(name).Publish(r.Context(), msgs); err != nil {
+	ch, err := s.manager.GetChannel(r.Context(), name)
+	if err != nil {
+		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
+		http.Error(w, "channel unavailable", http.StatusInternalServerError)
+		return
+	}
+	if _, _, err := ch.Publish(r.Context(), msgs); err != nil {
 		s.logger.Warn("publish failed", "channel", name, "err", err)
 		http.Error(w, "publish failed", http.StatusInternalServerError)
 		return
@@ -120,7 +126,13 @@ func (s *Server) HandleHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	page, err := s.manager.GetChannel(name).History(r.Context(), q)
+	ch, err := s.manager.GetChannel(r.Context(), name)
+	if err != nil {
+		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
+		http.Error(w, "channel unavailable", http.StatusInternalServerError)
+		return
+	}
+	page, err := ch.History(r.Context(), q)
 	if err != nil {
 		s.logger.Warn("history failed", "channel", name, "err", err)
 		http.Error(w, "history failed", http.StatusInternalServerError)

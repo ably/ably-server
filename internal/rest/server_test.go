@@ -46,6 +46,23 @@ func newTestServer(t *testing.T) (*httptest.Server, *core.Manager) {
 	return srv, manager
 }
 
+// attachStream resolves the channel and attaches a Stream using a
+// short-lived context — keeps the publish-observation tests compact.
+func attachStream(t *testing.T, manager *core.Manager, name string) *core.Stream {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ch, err := manager.GetChannel(ctx, name)
+	if err != nil {
+		t.Fatalf("GetChannel %q: %v", name, err)
+	}
+	stream, err := ch.Attach(ctx)
+	if err != nil {
+		t.Fatalf("Attach %q: %v", name, err)
+	}
+	return stream
+}
+
 // request issues a request to srv with the test key in Basic auth
 // (unless authed is false) and returns the response.
 func request(t *testing.T, srv *httptest.Server, method, path, contentType string, body []byte, authed bool) *http.Response {
@@ -79,7 +96,7 @@ func TestPublishJSONSingleMessage(t *testing.T) {
 
 	// Verify the publish landed on the channel by attaching a stream
 	// and observing the next message.
-	stream := manager.GetChannel("foo").Attach()
+	stream := attachStream(t, manager, "foo")
 	go func() {
 		// In case the publish reaches the channel before the stream
 		// observed it (unlikely since Attach captures tail post-publish),
@@ -115,7 +132,7 @@ func TestPublishJSONSingleMessage(t *testing.T) {
 
 func TestPublishJSONArrayBody(t *testing.T) {
 	srv, manager := newTestServer(t)
-	stream := manager.GetChannel("foo").Attach()
+	stream := attachStream(t, manager, "foo")
 
 	msgs := []*protocol.Message{
 		{Name: "a", Data: "1"},
@@ -148,7 +165,7 @@ func TestPublishJSONArrayBody(t *testing.T) {
 
 func TestPublishMsgpack(t *testing.T) {
 	srv, manager := newTestServer(t)
-	stream := manager.GetChannel("foo").Attach()
+	stream := attachStream(t, manager, "foo")
 
 	body, err := msgpack.Marshal(&protocol.Message{Name: "ping", Data: "pong"})
 	if err != nil {

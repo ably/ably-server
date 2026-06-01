@@ -11,6 +11,18 @@ import (
 	"github.com/ably/ably-server/internal/storage/storagetest"
 )
 
+// mustChannel materialises a ChannelStore for name, failing on error.
+// Used inside this _test file's higher-level flows; the contract
+// suite has its own helper of the same shape.
+func mustChannel(t *testing.T, s storage.Storage, name string) storage.ChannelStore {
+	t.Helper()
+	ch, err := s.Channel(context.Background(), name, nil)
+	if err != nil {
+		t.Fatalf("Channel(%q): %v", name, err)
+	}
+	return ch
+}
+
 func TestBBoltChannelStoreContract(t *testing.T) {
 	storagetest.RunChannelStoreTests(t, func(t *testing.T) storage.Storage {
 		s, err := bbolt.Open(bbolt.Options{Path: filepath.Join(t.TempDir(), "ably.db")})
@@ -38,13 +50,13 @@ func TestBBoltSurvivesProcessRestart(t *testing.T) {
 	}
 	var fooSerials []string
 	for i := range 3 {
-		cm, _, err := s1.Channel("foo", nil).Store(ctx, []*protocol.Message{{Name: "x", Data: i}})
+		cm, _, err := mustChannel(t, s1, "foo").Store(ctx, []*protocol.Message{{Name: "x", Data: i}})
 		if err != nil {
 			t.Fatalf("foo publish %d: %v", i, err)
 		}
 		fooSerials = append(fooSerials, cm.ChannelSerial)
 	}
-	if _, _, err := s1.Channel("bar", nil).Store(ctx, []*protocol.Message{{Name: "y"}}); err != nil {
+	if _, _, err := mustChannel(t, s1, "bar").Store(ctx, []*protocol.Message{{Name: "y"}}); err != nil {
 		t.Fatalf("bar publish: %v", err)
 	}
 	if err := s1.Close(); err != nil {
@@ -59,7 +71,7 @@ func TestBBoltSurvivesProcessRestart(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s2.Close() })
 
-	page, err := s2.Channel("foo", nil).History(ctx, storage.HistoryQuery{Direction: storage.DirectionForwards})
+	page, err := mustChannel(t, s2, "foo").History(ctx, storage.HistoryQuery{Direction: storage.DirectionForwards})
 	if err != nil {
 		t.Fatalf("foo History: %v", err)
 	}
@@ -73,11 +85,11 @@ func TestBBoltSurvivesProcessRestart(t *testing.T) {
 	}
 
 	// A post-restart publish persists and shows up at the tail.
-	fresh, _, err := s2.Channel("foo", nil).Store(ctx, []*protocol.Message{{Name: "z"}})
+	fresh, _, err := mustChannel(t, s2, "foo").Store(ctx, []*protocol.Message{{Name: "z"}})
 	if err != nil {
 		t.Fatalf("post-restart publish: %v", err)
 	}
-	page, err = s2.Channel("foo", nil).History(ctx, storage.HistoryQuery{Direction: storage.DirectionForwards})
+	page, err = mustChannel(t, s2, "foo").History(ctx, storage.HistoryQuery{Direction: storage.DirectionForwards})
 	if err != nil {
 		t.Fatalf("foo History #2: %v", err)
 	}

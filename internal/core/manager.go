@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"sync"
 
 	"github.com/ably/ably-server/internal/storage"
@@ -31,14 +32,32 @@ func NewManager(store storage.Storage) *Manager {
 // and registering it with the storage backend as the Appender for
 // that channel's stream of persisted cms. Concurrent calls for the
 // same name observe the same instance.
-func (m *Manager) GetChannel(name string) *Channel {
+//
+// On first creation the storage backend will call Channel.Initialize
+// with the channel's watermark serial before this returns, so the
+// returned Channel is ready for Attach. The Manager's mu is released
+// across the storage call to avoid holding it through any I/O.
+func (m *Manager) GetChannel(ctx context.Context, name string) (*Channel, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if ch, ok := m.channels[name]; ok {
-		return ch
+		m.mu.Unlock()
+		return ch, nil
 	}
-	ch := newChannel(name, nil)
-	ch.store = m.store.Channel(name, ch)
+	ch := newChannel(name)
 	m.channels[name] = ch
-	return ch
+	m.mu.Unlock()
+
+	store, err := m.store.Channel(ctx, name, ch)
+	if err != nil {
+		// Roll back: the half-constructed channel never finished init.
+		// Drop it so a later GetChannel can retry from scratch.
+		m.mu.Lock()
+		if cur, ok := m.channels[name]; ok && cur == ch {
+			delete(m.channels, name)
+		}
+		m.mu.Unlock()
+		return nil, err
+	}
+	ch.store = store
+	return ch, nil
 }

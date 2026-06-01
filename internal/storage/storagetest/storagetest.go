@@ -26,9 +26,42 @@ type Factory func(t *testing.T) storage.Storage
 func RunChannelStoreTests(t *testing.T, f Factory) {
 	t.Helper()
 
+	t.Run("ChannelInitializesAppenderWithWatermark", func(t *testing.T) {
+		s := f(t)
+		a := newCapturingAppender()
+		if _, err := s.Channel(context.Background(), "foo", a); err != nil {
+			t.Fatalf("Channel: %v", err)
+		}
+		got := a.initialized()
+		if got == "" {
+			t.Fatal("appender.Initialize was not called (or called with empty serial)")
+		}
+	})
+
+	t.Run("ChannelInitializeNotRecalledOnSecondCall", func(t *testing.T) {
+		s := f(t)
+		a := newCapturingAppender()
+		if _, err := s.Channel(context.Background(), "foo", a); err != nil {
+			t.Fatalf("first Channel: %v", err)
+		}
+		// Second call with a different appender — the backend is
+		// documented to ignore the new appender, so the original
+		// appender's Initialize count should remain at 1 and the new
+		// appender should not be Initialize'd at all (or if it is,
+		// initialize counts independently — but the channelStore→
+		// appender binding does not change).
+		b := newCapturingAppender()
+		if _, err := s.Channel(context.Background(), "foo", b); err != nil {
+			t.Fatalf("second Channel: %v", err)
+		}
+		if got := a.initializeCount(); got != 1 {
+			t.Errorf("original appender Initialize count = %d, want 1", got)
+		}
+	})
+
 	t.Run("AppendStampsChannelSerialAndMessageSerials", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 		cm, idempotent, err := ch.Store(context.Background(), []*protocol.Message{{Name: "x"}})
 		if err != nil {
 			t.Fatalf("Store: %v", err)
@@ -50,7 +83,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("AppendStampsBatchWithSharedChannelSerial", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 		msgs := []*protocol.Message{{Name: "a"}, {Name: "b"}, {Name: "c"}}
 		cm, _, err := ch.Store(context.Background(), msgs)
 		if err != nil {
@@ -69,7 +102,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("AppendsAreMonotonicallyOrdered", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 		var prev string
 		for i := range 5 {
 			cm, _, err := ch.Store(context.Background(), []*protocol.Message{{Name: "x"}})
@@ -85,7 +118,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("IdempotentReturnsOriginalOnRepeatID", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		first, idemp, err := ch.Store(context.Background(), []*protocol.Message{{ID: "dup", Data: "v1"}})
 		if err != nil || idemp {
@@ -120,7 +153,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("IdempotencyMatchesAnyMessageInBatch", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		first, _, err := ch.Store(context.Background(), []*protocol.Message{{ID: "a"}, {ID: "b"}})
 		if err != nil {
@@ -143,7 +176,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("EmptyIDsAreAlwaysNew", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		first, _, err := ch.Store(context.Background(), []*protocol.Message{{Name: "x"}})
 		if err != nil {
@@ -163,7 +196,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("AppendRejectsEmptyBatch", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 		if _, _, err := ch.Store(context.Background(), nil); err == nil {
 			t.Error("Store(nil) returned no error")
 		}
@@ -174,7 +207,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryForwardsReturnsAllInOrder", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		var serials []string
 		for i := range 4 {
@@ -204,7 +237,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryBackwardsReturnsNewestFirst", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		var serials []string
 		for i := range 4 {
@@ -233,7 +266,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryBackwardsReversesWithinBatch", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		// Publish two batches; observe that backwards reverses BOTH
 		// across publishes AND within each publish (Ably-verified).
@@ -269,7 +302,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryForwardsPreservesWithinBatch", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		_, _, _ = ch.Store(context.Background(), []*protocol.Message{{Name: "a0"}, {Name: "a1"}, {Name: "a2"}})
 		_, _, _ = ch.Store(context.Background(), []*protocol.Message{{Name: "b0"}, {Name: "b1"}})
@@ -292,7 +325,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryDoesNotMutatePersistedState", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		_, _, _ = ch.Store(context.Background(), []*protocol.Message{{Name: "a0"}, {Name: "a1"}, {Name: "a2"}})
 
@@ -323,7 +356,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryCursorForwardsExcludesCursorMessage", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		var cms []*protocol.ChannelMessage
 		for range 4 {
@@ -350,7 +383,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryCursorBackwardsExcludesCursorMessage", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		var cms []*protocol.ChannelMessage
 		for range 4 {
@@ -379,7 +412,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryCursorMidBatchForwards", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		// Publish a single 5-message batch.
 		cm, _, _ := ch.Store(context.Background(), []*protocol.Message{
@@ -408,7 +441,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryCursorMidBatchBackwards", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		cm, _, _ := ch.Store(context.Background(), []*protocol.Message{
 			{Name: "m0"}, {Name: "m1"}, {Name: "m2"}, {Name: "m3"}, {Name: "m4"},
@@ -431,7 +464,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryCursorBeforeAnyMessageReturnsAll", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		cm, _, _ := ch.Store(context.Background(), []*protocol.Message{{Name: "x"}})
 
@@ -450,7 +483,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryCursorAtLastMessageReturnsEmpty", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		cm, _, _ := ch.Store(context.Background(), []*protocol.Message{{Name: "x"}})
 
@@ -468,7 +501,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryLimitCountsMessagesNotBatches", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		// One atomic batch of 5 messages — Ably's `limit` should slice it.
 		_, _, _ = ch.Store(context.Background(), []*protocol.Message{
@@ -505,7 +538,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryLimitForwardsSetsHasMore", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		var serials []string
 		for range 5 {
@@ -544,7 +577,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryTimeBoundsFilter", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		// 10ms sleeps encourage (but do not require) distinct timestamps
 		// across publishes. Assertions are derived from each cm's own
@@ -589,7 +622,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryEndBeforeStartIsEmpty", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 		for range 3 {
 			_, _, _ = ch.Store(context.Background(), []*protocol.Message{{Name: "x"}})
 		}
@@ -610,7 +643,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 		s := f(t)
 		// Open the channel via Channel(...) so the store exists, then
 		// query without ever publishing.
-		page, err := s.Channel("foo", nil).History(context.Background(), storage.HistoryQuery{})
+		page, err := mustChannel(t, s, "foo").History(context.Background(), storage.HistoryQuery{})
 		if err != nil {
 			t.Fatalf("History: %v", err)
 		}
@@ -624,7 +657,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("HistoryLimitBackwardsTakesNewest", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		var serials []string
 		for range 5 {
@@ -654,12 +687,12 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 	t.Run("ChannelsAreIsolated", func(t *testing.T) {
 		s := f(t)
 
-		fooCM, _, err := s.Channel("foo", nil).Store(context.Background(), []*protocol.Message{{ID: "x"}})
+		fooCM, _, err := mustChannel(t, s, "foo").Store(context.Background(), []*protocol.Message{{ID: "x"}})
 		if err != nil {
 			t.Fatalf("foo publish: %v", err)
 		}
 		// Same ID, different channel — must NOT be idempotent.
-		barCM, idemp, err := s.Channel("bar", nil).Store(context.Background(), []*protocol.Message{{ID: "x"}})
+		barCM, idemp, err := mustChannel(t, s, "bar").Store(context.Background(), []*protocol.Message{{ID: "x"}})
 		if err != nil {
 			t.Fatalf("bar publish: %v", err)
 		}
@@ -671,7 +704,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 		}
 
 		// History on foo must not include bar's publish.
-		page, err := s.Channel("foo", nil).History(context.Background(), storage.HistoryQuery{})
+		page, err := mustChannel(t, s, "foo").History(context.Background(), storage.HistoryQuery{})
 		if err != nil {
 			t.Fatalf("foo History: %v", err)
 		}
@@ -682,8 +715,8 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("SameChannelInstanceReturned", func(t *testing.T) {
 		s := f(t)
-		a := s.Channel("foo", nil)
-		b := s.Channel("foo", nil)
+		a := mustChannel(t, s, "foo")
+		b := mustChannel(t, s, "foo")
 
 		// Publish via a; History via b must see it.
 		cm, _, err := a.Store(context.Background(), []*protocol.Message{{Name: "x"}})
@@ -701,7 +734,7 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 
 	t.Run("ConcurrentAppendsAreUniqueAndOrdered", func(t *testing.T) {
 		s := f(t)
-		ch := s.Channel("foo", nil)
+		ch := mustChannel(t, s, "foo")
 
 		const workers = 10
 		const perWorker = 20
@@ -758,6 +791,57 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 // padding the serial package uses for the per-message idx suffix.
 func threeDigit(i int) string {
 	return fmt.Sprintf("%03d", i)
+}
+
+// capturingAppender records Initialize and Append calls so the
+// contract tests can assert on the backend's appender-callback
+// behaviour without needing a real core.Channel.
+type capturingAppender struct {
+	mu             sync.Mutex
+	initSerial     string
+	initCount      int
+	appends        []*protocol.ChannelMessage
+}
+
+func newCapturingAppender() *capturingAppender {
+	return &capturingAppender{}
+}
+
+func (a *capturingAppender) Initialize(channelSerial string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.initSerial = channelSerial
+	a.initCount++
+}
+
+func (a *capturingAppender) Append(cm *protocol.ChannelMessage) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.appends = append(a.appends, cm)
+}
+
+func (a *capturingAppender) initialized() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.initSerial
+}
+
+func (a *capturingAppender) initializeCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.initCount
+}
+
+// mustChannel materialises a ChannelStore for name, failing the test
+// on error. Storage backends call appender.Initialize during this
+// call; tests that pass a nil appender skip that callback.
+func mustChannel(t *testing.T, s storage.Storage, name string) storage.ChannelStore {
+	t.Helper()
+	ch, err := s.Channel(context.Background(), name, nil)
+	if err != nil {
+		t.Fatalf("Channel(%q): %v", name, err)
+	}
+	return ch
 }
 
 // equalStrings reports whether a and b have the same length and

@@ -30,7 +30,12 @@ type testHarness struct {
 // on storage error.
 func (h *testHarness) publish(t *testing.T, channel string, msgs ...*protocol.Message) {
 	t.Helper()
-	if _, _, err := h.manager.GetChannel(channel).Publish(context.Background(), msgs); err != nil {
+	ctx := context.Background()
+	ch, err := h.manager.GetChannel(ctx, channel)
+	if err != nil {
+		t.Fatalf("GetChannel %q: %v", channel, err)
+	}
+	if _, _, err := ch.Publish(ctx, msgs); err != nil {
 		t.Fatalf("publish to %q: %v", channel, err)
 	}
 }
@@ -285,8 +290,11 @@ func TestAttachReceivesAttachedAck(t *testing.T) {
 	if msg.Channel != "foo" {
 		t.Errorf("Channel = %q, want %q", msg.Channel, "foo")
 	}
-	if msg.ChannelSerial != "" {
-		t.Errorf("ChannelSerial = %q, want empty (fresh attach with no delivered messages)", msg.ChannelSerial)
+	// Even a fresh attach to an empty channel carries a non-empty
+	// channelSerial — the storage watermark, so the client always has
+	// a resumable cursor (TASK-16).
+	if msg.ChannelSerial == "" {
+		t.Errorf("ChannelSerial = %q, want non-empty watermark on fresh attach", msg.ChannelSerial)
 	}
 }
 

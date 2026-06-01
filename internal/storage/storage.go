@@ -22,12 +22,28 @@ import (
 	"github.com/ably/ably-server/internal/protocol"
 )
 
-// Appender receives a ChannelMessage that has just landed on its
-// channel (either via a local Store call on memory/bbolt, or via a
-// Postgres NOTIFY round-trip in cluster mode). In core, *Channel
-// implements this — Appender.Append links the cm onto the live
-// linked list so attached streams observe it.
+// Appender is the bridge between the storage backend and the in-process
+// channel state. The backend calls Initialize exactly once, before any
+// Append, to hand the channel its initial channelSerial — the cursor
+// fresh attachments use as their resume point until the first real
+// publish lands. After Initialize, Append delivers each persisted
+// ChannelMessage (synchronously for memory/bbolt, asynchronously via
+// the Postgres LISTEN goroutine in cluster mode).
+//
+// In core, *Channel implements Appender — Initialize seeds the channel
+// sentinel's serial and unblocks Attach; Append links the cm onto the
+// live linked list so attached streams observe it.
 type Appender interface {
+	// Initialize is called once by the storage backend with the
+	// channel's initial channelSerial — the watermark from which fresh
+	// attachers begin. Until Initialize returns, the channel is "not
+	// ready" and Attach blocks.
+	Initialize(channelSerial string)
+
+	// Append delivers one persisted ChannelMessage to the live linked
+	// list. Backends guarantee monotonicity: every Append's serial is
+	// strictly greater than every prior Append's serial and strictly
+	// greater than the Initialize serial.
 	Append(cm *protocol.ChannelMessage)
 }
 
@@ -36,13 +52,16 @@ type Appender interface {
 // handle or a pgxpool).
 type Storage interface {
 	// Channel returns the ChannelStore for the given channel name,
-	// associating it with appender. Successive calls with the same
-	// name return the same instance and ignore the new appender (the
-	// channelStore→appender binding is fixed at first call). appender
-	// may be nil for storage-only use cases (e.g. the contract test
-	// suite); a nil appender means committed cms are not delivered
-	// anywhere.
-	Channel(name string, appender Appender) ChannelStore
+	// associating it with appender. The backend calls
+	// appender.Initialize(initialSerial) synchronously before returning,
+	// so callers can safely treat the channel as ready for Attach.
+	// Successive calls with the same name return the same instance and
+	// ignore the new appender (the channelStore→appender binding is
+	// fixed at first call). appender may be nil for storage-only use
+	// cases (e.g. the contract test suite); a nil appender means
+	// committed cms are not delivered anywhere and Initialize is not
+	// called.
+	Channel(ctx context.Context, name string, appender Appender) (ChannelStore, error)
 
 	// Close releases any resources held by the storage backend. After
 	// Close, behaviour of ChannelStores previously handed out is

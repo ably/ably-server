@@ -109,13 +109,16 @@ func TestPostgresMigrateIsConcurrentSafe(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate: %v", err)
 	}
-	if !slices.Equal(versions, []string{"0001_initial"}) {
-		t.Errorf("schema_migrations rows = %v, want [0001_initial]", versions)
+	if !slices.Equal(versions, []string{"0001_initial", "0002_channels_and_serial_mint"}) {
+		t.Errorf("schema_migrations rows = %v, want [0001_initial 0002_channels_and_serial_mint]", versions)
 	}
 
-	// The messages table must exist and be queryable.
+	// The messages and channels tables must exist and be queryable.
 	if _, err := conn.Exec(ctx, `SELECT 1 FROM messages LIMIT 0`); err != nil {
 		t.Errorf("messages table not present: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `SELECT 1 FROM channels LIMIT 0`); err != nil {
+		t.Errorf("channels table not present: %v", err)
 	}
 }
 
@@ -146,8 +149,13 @@ func TestPostgresClusterBrokerDeliversCrossNode(t *testing.T) {
 
 	a1 := newRecordingAppender()
 	a2 := newRecordingAppender()
-	ch1 := s1.Channel("room", a1)
-	_ = s2.Channel("room", a2)
+	ch1, err := s1.Channel(ctx, "room", a1)
+	if err != nil {
+		t.Fatalf("Channel node1: %v", err)
+	}
+	if _, err := s2.Channel(ctx, "room", a2); err != nil {
+		t.Fatalf("Channel node2: %v", err)
+	}
 
 	// Publish via node1 only. Both nodes' appenders should observe.
 	cm, idempotent, err := ch1.Store(ctx, []*protocol.Message{{ID: "m1", Data: "hi"}})
@@ -184,6 +192,99 @@ func TestPostgresClusterBrokerDeliversCrossNode(t *testing.T) {
 	}
 }
 
+// TestPostgresClusterSerialsAreStrictlyMonotonic publishes concurrently
+// from two postgres.Storage instances against the same database and
+// asserts the resulting channel_serials are strictly increasing in the
+// commit order. This is the property the channels-row mint function
+// guarantees that the previous process-local Generator could not
+// (DESIGN.md §8): two nodes minting at the same wall-clock ms used to
+// be disambiguated only by seriesId, which could produce serials that
+// lex-ordered out of commit order.
+func TestPostgresClusterSerialsAreStrictlyMonotonic(t *testing.T) {
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	ctx := context.Background()
+
+	s1, err := postgres.Open(ctx, postgres.Options{DSN: dsn})
+	if err != nil {
+		t.Fatalf("Open node1: %v", err)
+	}
+	t.Cleanup(func() { _ = s1.Close() })
+	s2, err := postgres.Open(ctx, postgres.Options{DSN: dsn})
+	if err != nil {
+		t.Fatalf("Open node2: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+
+	ch1, err := s1.Channel(ctx, "room", nil)
+	if err != nil {
+		t.Fatalf("Channel node1: %v", err)
+	}
+	ch2, err := s2.Channel(ctx, "room", nil)
+	if err != nil {
+		t.Fatalf("Channel node2: %v", err)
+	}
+
+	const perNode = 100
+	serialsCh := make(chan string, 2*perNode)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for range perNode {
+			cm, _, err := ch1.Store(ctx, []*protocol.Message{{Name: "x"}})
+			if err != nil {
+				t.Errorf("ch1 Store: %v", err)
+				return
+			}
+			serialsCh <- cm.ChannelSerial
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range perNode {
+			cm, _, err := ch2.Store(ctx, []*protocol.Message{{Name: "y"}})
+			if err != nil {
+				t.Errorf("ch2 Store: %v", err)
+				return
+			}
+			serialsCh <- cm.ChannelSerial
+		}
+	}()
+	wg.Wait()
+	close(serialsCh)
+
+	// Pull the canonical order from the DB rather than relying on
+	// per-goroutine arrival order. With the channels-row mint, the
+	// row's serial advances strictly on each successful publish — so
+	// the rows in messages are in mint order.
+	page, err := ch1.History(ctx, storage.HistoryQuery{Direction: storage.DirectionForwards, Limit: 1000})
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+	if got := len(page.ChannelMessages); got != 2*perNode {
+		t.Fatalf("history len = %d, want %d", got, 2*perNode)
+	}
+	var prev string
+	for i, cm := range page.ChannelMessages {
+		if cm.ChannelSerial <= prev {
+			t.Fatalf("page[%d] serial %q not > previous %q — cluster mint is not strictly monotonic", i, cm.ChannelSerial, prev)
+		}
+		prev = cm.ChannelSerial
+	}
+
+	// Sanity: every produced serial appears in history exactly once.
+	seen := make(map[string]int, 2*perNode)
+	for s := range serialsCh {
+		seen[s]++
+	}
+	for _, cm := range page.ChannelMessages {
+		if seen[cm.ChannelSerial] != 1 {
+			t.Errorf("history serial %q seen %d times in publish outputs, want 1", cm.ChannelSerial, seen[cm.ChannelSerial])
+		}
+	}
+}
+
 // recordingAppender captures every cm passed to Append, exposing
 // wait() for tests that need to synchronise on delivery.
 type recordingAppender struct {
@@ -194,6 +295,11 @@ type recordingAppender struct {
 
 func newRecordingAppender() *recordingAppender {
 	return &recordingAppender{got: make(chan *protocol.ChannelMessage, 16)}
+}
+
+func (a *recordingAppender) Initialize(channelSerial string) {
+	// noop for this test: we only assert on Append delivery.
+	_ = channelSerial
 }
 
 func (a *recordingAppender) Append(cm *protocol.ChannelMessage) {

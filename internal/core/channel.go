@@ -16,6 +16,12 @@ import (
 // entry.next has been set, which wakes all parked streams. The list is
 // grow-only — older entries become eligible for GC once no stream
 // retains a reference.
+//
+// The sentinel head (the entry installed at construction, before any
+// Append) carries a serial-only ChannelMessage once Initialize has
+// run: the channel's initial watermark. That ChannelMessage has no
+// Messages, so Stream.Next never returns it as a delivered cm — it
+// is only inspected via Stream.ChannelSerial.
 type entry struct {
 	cm     *protocol.ChannelMessage
 	notify chan struct{}
@@ -31,22 +37,28 @@ type entry struct {
 // Append via the Appender callback we registered at construction
 // time. The same Append path is used for foreign publishes arriving
 // via the Postgres broker in cluster mode (DESIGN.md §7).
+//
+// A Channel is created in a not-ready state; storage.Storage.Channel
+// calls Initialize on it before returning to seed the sentinel's
+// watermark serial and close ready. Attach blocks on ready, so a
+// caller cannot observe an empty channelSerial.
 type Channel struct {
 	name  string
 	store storage.ChannelStore
+	ready chan struct{}
 
 	mu   sync.Mutex
 	tail *entry // never nil: a sentinel is installed at construction
 }
 
-// newChannel constructs a Channel. The list starts with a sentinel
-// entry (no ChannelMessage) so Attach is safe before any Append.
-// store may be nil for tests that only exercise the linked-list /
-// stream machinery; Publish requires a non-nil store.
-func newChannel(name string, store storage.ChannelStore) *Channel {
+// newChannel constructs a Channel in the not-ready state. The list
+// starts with a sentinel entry (cm = nil) that Initialize will then
+// populate with the watermark serial.
+func newChannel(name string) *Channel {
 	return &Channel{
-		name: name,
-		tail: &entry{notify: make(chan struct{})},
+		name:  name,
+		ready: make(chan struct{}),
+		tail:  &entry{notify: make(chan struct{})},
 	}
 }
 
@@ -74,6 +86,25 @@ func (c *Channel) History(ctx context.Context, q storage.HistoryQuery) (storage.
 	return c.store.History(ctx, q)
 }
 
+// Initialize seeds the sentinel with the channel's initial watermark
+// serial and marks the channel ready. The storage backend calls this
+// exactly once before any Append. Subsequent calls are no-ops.
+//
+// Implements storage.Appender.
+func (c *Channel) Initialize(channelSerial string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case <-c.ready:
+		// Double-init: the contract says backends call this once. Honour
+		// idempotency defensively so a re-Channel call doesn't panic.
+		return
+	default:
+	}
+	c.tail.cm = &protocol.ChannelMessage{ChannelSerial: channelSerial}
+	close(c.ready)
+}
+
 // Append links an already-minted ChannelMessage at the tail as a
 // single entry, waking any parked streams. It satisfies the
 // storage.Appender interface — the storage backend calls this to
@@ -94,12 +125,20 @@ func (c *Channel) Append(cm *protocol.ChannelMessage) {
 	c.tail = e
 }
 
-// Attach returns a Stream positioned at the current tail. The Stream's
-// first Next call blocks until the next ChannelMessage is appended.
-func (c *Channel) Attach() *Stream {
+// Attach blocks until the channel is ready (Initialize has run), then
+// returns a Stream positioned at the current tail. The Stream's first
+// Next call blocks until the next ChannelMessage is appended.
+//
+// Returns ctx.Err() if the context cancels before the channel readies.
+func (c *Channel) Attach(ctx context.Context) (*Stream, error) {
+	select {
+	case <-c.ready:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return &Stream{cursor: c.tail}
+	return &Stream{cursor: c.tail}, nil
 }
 
 // Stream is an attachment's per-channel view of the linked list. Its
@@ -110,13 +149,10 @@ type Stream struct {
 }
 
 // ChannelSerial returns the cursor's current position — the
-// channelSerial of the last delivered ChannelMessage, or an empty
-// string if the stream is parked at the sentinel (no ChannelMessage
-// delivered yet).
+// channelSerial at the cursor (the sentinel's watermark before any
+// cm has been delivered, or the last delivered cm's serial after).
+// Never empty for a Stream returned by a ready Channel.
 func (s *Stream) ChannelSerial() string {
-	if s.cursor.cm == nil {
-		return ""
-	}
 	return s.cursor.cm.ChannelSerial
 }
 

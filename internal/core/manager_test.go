@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"sync"
 	"testing"
 
@@ -11,9 +12,18 @@ func newTestManager() *Manager {
 	return NewManager(memory.New(memory.Options{}))
 }
 
+func mustGetChannel(t *testing.T, m *Manager, name string) *Channel {
+	t.Helper()
+	ch, err := m.GetChannel(context.Background(), name)
+	if err != nil {
+		t.Fatalf("GetChannel(%q): %v", name, err)
+	}
+	return ch
+}
+
 func TestManagerGetChannelCreates(t *testing.T) {
 	m := newTestManager()
-	c := m.GetChannel("foo")
+	c := mustGetChannel(t, m, "foo")
 	if c == nil {
 		t.Fatal("GetChannel returned nil")
 	}
@@ -24,8 +34,8 @@ func TestManagerGetChannelCreates(t *testing.T) {
 
 func TestManagerGetChannelIsIdempotent(t *testing.T) {
 	m := newTestManager()
-	a := m.GetChannel("foo")
-	b := m.GetChannel("foo")
+	a := mustGetChannel(t, m, "foo")
+	b := mustGetChannel(t, m, "foo")
 	if a != b {
 		t.Fatal("GetChannel returned different instances for the same name")
 	}
@@ -33,8 +43,8 @@ func TestManagerGetChannelIsIdempotent(t *testing.T) {
 
 func TestManagerGetChannelDistinctNames(t *testing.T) {
 	m := newTestManager()
-	a := m.GetChannel("foo")
-	b := m.GetChannel("bar")
+	a := mustGetChannel(t, m, "foo")
+	b := mustGetChannel(t, m, "bar")
 	if a == b {
 		t.Fatal("GetChannel returned the same instance for different names")
 	}
@@ -50,7 +60,12 @@ func TestManagerGetChannelConcurrent(t *testing.T) {
 	for range goroutines {
 		go func() {
 			defer wg.Done()
-			results <- m.GetChannel("foo")
+			ch, err := m.GetChannel(context.Background(), "foo")
+			if err != nil {
+				t.Errorf("GetChannel: %v", err)
+				return
+			}
+			results <- ch
 		}()
 	}
 	wg.Wait()

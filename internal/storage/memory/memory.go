@@ -56,15 +56,23 @@ func New(opts Options) *Storage {
 // Channel returns the ChannelStore for name, creating it on first
 // access and binding it to appender. Subsequent calls with the same
 // name return the same instance and ignore the new appender.
-func (s *Storage) Channel(name string, appender storage.Appender) storage.ChannelStore {
+//
+// On first creation the channel mints an initial channelSerial from
+// the shared generator and hands it to the appender via Initialize
+// before returning — so Attach against a brand-new channel always
+// observes a non-empty watermark.
+func (s *Storage) Channel(_ context.Context, name string, appender storage.Appender) (storage.ChannelStore, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if cs, ok := s.channels[name]; ok {
-		return cs
+		return cs, nil
 	}
 	cs := newChannelStore(s.gen, appender)
 	s.channels[name] = cs
-	return cs
+	if appender != nil {
+		appender.Initialize(s.gen.Mint())
+	}
+	return cs, nil
 }
 
 // Close is a no-op for the memory backend.
@@ -75,6 +83,8 @@ func (s *Storage) Close() error {
 // channelStore holds the per-channel state: an ordered list of
 // channelSerials, a map for O(1) lookup, an idempotency index, and
 // the Appender that will receive freshly-stored ChannelMessages.
+// The channel's initial watermark is handed to the Appender via
+// Initialize at construction time; storage does not retain it.
 type channelStore struct {
 	gen      *serial.Generator
 	appender storage.Appender

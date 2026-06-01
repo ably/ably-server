@@ -94,12 +94,14 @@ func Open(opts Options) (*Storage, error) {
 
 // Channel returns the ChannelStore for name, binding it to appender
 // on first access. Subsequent calls with the same name return the
-// same instance and ignore the new appender.
-func (s *Storage) Channel(name string, appender storage.Appender) storage.ChannelStore {
+// same instance and ignore the new appender. On first creation the
+// shared generator mints an initial channelSerial and the appender's
+// Initialize is invoked with it before this call returns.
+func (s *Storage) Channel(_ context.Context, name string, appender storage.Appender) (storage.ChannelStore, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if cs, ok := s.channels[name]; ok {
-		return cs
+		return cs, nil
 	}
 	cs := &channelStore{
 		db:       s.db,
@@ -108,7 +110,10 @@ func (s *Storage) Channel(name string, appender storage.Appender) storage.Channe
 		appender: appender,
 	}
 	s.channels[name] = cs
-	return cs
+	if appender != nil {
+		appender.Initialize(s.gen.Mint())
+	}
+	return cs, nil
 }
 
 // Close closes the underlying bolt DB.

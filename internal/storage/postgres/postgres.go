@@ -88,8 +88,8 @@ type Options struct {
 
 // Storage is the pgx/pgxpool-backed storage.Storage.
 type Storage struct {
-	pool *pgxpool.Pool
-	gen  *serial.Generator
+	pool   *pgxpool.Pool
+	series string // per-process seriesId, embedded in every minted channelSerial
 
 	mu       sync.Mutex
 	channels map[string]*channelStore
@@ -139,7 +139,7 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 
 	s := &Storage{
 		pool:       pool,
-		gen:        serial.NewGenerator(serial.NewSeriesID(), opts.Now),
+		series:     serial.NewSeriesID(),
 		channels:   make(map[string]*channelStore),
 		listenConn: listenConn,
 		listenDone: make(chan struct{}),
@@ -151,20 +151,39 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 	return s, nil
 }
 
-// Channel returns the ChannelStore for name, binding it to appender
-// on first access. Subsequent calls with the same name return the
-// same instance and ignore the new appender. The internal LISTEN
-// goroutine looks up channelStores in this map by name to dispatch
-// notifications.
-func (s *Storage) Channel(name string, appender storage.Appender) storage.ChannelStore {
+// Channel returns the ChannelStore for name, binding it to appender on
+// first access. Subsequent calls with the same name return the same
+// instance and ignore the new appender. The internal LISTEN goroutine
+// looks up channelStores in this map by name to dispatch notifications.
+//
+// On first creation the channels row is upserted via ensure_channel
+// (creating it with a fresh seed serial if absent), and the resulting
+// channelSerial — the watermark — is handed to appender.Initialize
+// before this call returns.
+func (s *Storage) Channel(ctx context.Context, name string, appender storage.Appender) (storage.ChannelStore, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if cs, ok := s.channels[name]; ok {
-		return cs
+		s.mu.Unlock()
+		return cs, nil
 	}
-	cs := &channelStore{pool: s.pool, gen: s.gen, name: name, appender: appender}
+	cs := &channelStore{pool: s.pool, series: s.series, name: name, appender: appender}
 	s.channels[name] = cs
-	return cs
+	s.mu.Unlock()
+
+	if appender == nil {
+		return cs, nil
+	}
+	var initial string
+	if err := s.pool.QueryRow(ctx, `SELECT ensure_channel($1, $2)`, name, s.series).Scan(&initial); err != nil {
+		// Unwind: the channelStore exists in the map but was never
+		// Initialize'd. Remove it so a retry can re-attempt.
+		s.mu.Lock()
+		delete(s.channels, name)
+		s.mu.Unlock()
+		return nil, fmt.Errorf("storage/postgres: ensure_channel: %w", err)
+	}
+	appender.Initialize(initial)
+	return cs, nil
 }
 
 // Close stops the LISTEN goroutine, closes the LISTEN conn, and
@@ -397,23 +416,24 @@ func applyMigration(ctx context.Context, conn *pgxpool.Conn, m migration) error 
 }
 
 // channelStore is the per-channel facet. Concurrency is controlled by
-// the per-channel advisory lock taken inside Store's transaction —
-// that lock serialises writers on the same channel across every
-// process sharing this database.
+// the channels-row UPDATE inside advance_channel_serial: every Store
+// call serialises against other writers to the same channel via that
+// row's lock.
 type channelStore struct {
 	pool     *pgxpool.Pool
-	gen      *serial.Generator
+	series   string
 	name     string
 	appender storage.Appender
 }
 
-// Store persists one publish atomically: take a per-channel advisory
-// lock, look up any contained Message.IDs for prior matches
-// (idempotent return on hit), otherwise mint a fresh channelSerial,
-// stamp each Message.Serial, insert one row per Message, and emit a
-// NOTIFY on the broker channel. The cm is delivered to the channel's
-// appender asynchronously by the LISTEN goroutine after the NOTIFY
-// round-trips through the database.
+// Store persists one publish atomically: look up any contained
+// Message.IDs for prior matches (idempotent return on hit), otherwise
+// advance the channel's serial via advance_channel_serial (which
+// takes a row-level lock on the channels row and is the per-channel
+// write serialiser), stamp each Message.Serial, insert one row per
+// Message, and emit a NOTIFY on the broker channel. The cm is
+// delivered to the channel's appender asynchronously by the LISTEN
+// goroutine after the NOTIFY round-trips through the database.
 func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
 	if len(msgs) == 0 {
 		return nil, false, errors.New("storage/postgres: Store with no messages")
@@ -428,16 +448,11 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Per-channel advisory lock — released automatically at commit
-	// or rollback. Serialises concurrent writers on this channel
-	// across every process sharing this database.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, cs.name); err != nil {
-		return nil, false, fmt.Errorf("storage/postgres: advisory lock: %w", err)
-	}
-
 	// Idempotency pre-check. Any contained ID that's already indexed
 	// makes this whole publish a duplicate; we return the original
-	// ChannelMessage at the matching channelSerial.
+	// ChannelMessage at the matching channelSerial. We do this before
+	// advancing the channels row so a duplicate publish does not
+	// burn a serial.
 	ids := nonEmptyIDs(msgs)
 	if len(ids) > 0 {
 		var existingCS string
@@ -462,8 +477,15 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 		}
 	}
 
-	// Fresh publish: mint serial, stamp Message.Serials, persist.
-	channelSerial := cs.gen.Mint()
+	// Fresh publish: advance the channels-row serial (cluster-wide
+	// monotonic via the row lock), stamp Message.Serials, persist.
+	var channelSerial string
+	if err := tx.QueryRow(ctx,
+		`SELECT advance_channel_serial($1, $2)`,
+		cs.name, cs.series,
+	).Scan(&channelSerial); err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: advance channel serial: %w", err)
+	}
 	for i, m := range msgs {
 		m.Serial = serial.MessageSerial(channelSerial, i)
 	}
