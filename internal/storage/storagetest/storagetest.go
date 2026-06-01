@@ -575,6 +575,46 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 		}
 	})
 
+	t.Run("HistoryEndChannelSerialIsInclusiveUpperBound", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+
+		var cms []*protocol.ChannelMessage
+		for i := range 5 {
+			cm, _, err := ch.Store(context.Background(), []*protocol.Message{{Name: "x", Data: i}})
+			if err != nil {
+				t.Fatalf("publish %d: %v", i, err)
+			}
+			cms = append(cms, cm)
+		}
+
+		// Cap at cms[2]: forwards should return cms[0..2] (inclusive),
+		// backwards should return cms[2..0] in reverse.
+		page, err := ch.History(context.Background(), storage.HistoryQuery{
+			Direction:        storage.DirectionForwards,
+			EndChannelSerial: cms[2].ChannelSerial,
+		})
+		if err != nil {
+			t.Fatalf("forwards History: %v", err)
+		}
+		want := []string{cms[0].ChannelSerial, cms[1].ChannelSerial, cms[2].ChannelSerial}
+		if got := channelSerialsOf(page); !equalStrings(got, want) {
+			t.Errorf("forwards = %v, want %v", got, want)
+		}
+
+		page, err = ch.History(context.Background(), storage.HistoryQuery{
+			Direction:        storage.DirectionBackwards,
+			EndChannelSerial: cms[2].ChannelSerial,
+		})
+		if err != nil {
+			t.Fatalf("backwards History: %v", err)
+		}
+		want = []string{cms[2].ChannelSerial, cms[1].ChannelSerial, cms[0].ChannelSerial}
+		if got := channelSerialsOf(page); !equalStrings(got, want) {
+			t.Errorf("backwards = %v, want %v", got, want)
+		}
+	})
+
 	t.Run("HistoryTimeBoundsFilter", func(t *testing.T) {
 		s := f(t)
 		ch := mustChannel(t, s, "foo")

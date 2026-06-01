@@ -576,7 +576,8 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 
 	// The cursor predicate is the lex compare over the (channel_serial,
 	// idx) tuple. $4 holds the cursor's channelSerial and $5 its idx;
-	// empty $4 means "no cursor".
+	// empty $4 means "no cursor". $7 is the optional inclusive
+	// channelSerial upper bound (EndChannelSerial).
 	query := fmt.Sprintf(`
 		SELECT channel_serial, idx, payload
 		FROM messages
@@ -584,6 +585,7 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 		  AND ($2 = '' OR channel_serial >= $2)
 		  AND ($3 = '' OR channel_serial <  $3)
 		  AND ($4 = '' OR (channel_serial, idx) %s ($4, $5))
+		  AND ($7 = '' OR channel_serial <= $7)
 		ORDER BY channel_serial %s, idx %s
 		LIMIT CASE WHEN $6 > 0 THEN $6 + 1 ELSE NULL END
 	`, cursorOp, order, order)
@@ -592,6 +594,7 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 		cs.name, timeLower, timeUpper,
 		cursorChannelSerial, cursorIdx,
 		limit,
+		q.EndChannelSerial,
 	)
 	if err != nil {
 		return storage.HistoryPage{}, fmt.Errorf("storage/postgres: history query: %w", err)

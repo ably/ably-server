@@ -47,4 +47,26 @@ type ProtocolMessage struct {
 	Count         int        `json:"count,omitempty"         msgpack:"count,omitempty"`
 	Flags         int64      `json:"flags,omitempty"         msgpack:"flags,omitempty"`
 	Messages      []*Message `json:"messages,omitempty"      msgpack:"messages,omitempty"`
+	Error         *ErrorInfo `json:"error,omitempty"         msgpack:"error,omitempty"`
 }
+
+// ErrorInfo describes an error in Ably's standard wire form, attached
+// to a ProtocolMessage when the server needs to convey a non-fatal
+// problem to the client (e.g. a resume that could not fully replay).
+type ErrorInfo struct {
+	Message    string `json:"message,omitempty"    msgpack:"message,omitempty"`
+	Code       int    `json:"code,omitempty"       msgpack:"code,omitempty"`
+	StatusCode int    `json:"statusCode,omitempty" msgpack:"statusCode,omitempty"`
+	HRef       string `json:"href,omitempty"       msgpack:"href,omitempty"`
+}
+
+// Flags carried on ATTACHED.
+const (
+	// FlagResumed indicates the channel state was resumed from the
+	// client's supplied channelSerial: the gap between the client's
+	// cursor and the live tail was replayed in full. Cleared when the
+	// server could not satisfy the resume in full (e.g. cap exceeded,
+	// retention aged-out) — clients should treat the absence of this
+	// flag as a discontinuity.
+	FlagResumed int64 = 1 << 2
+)

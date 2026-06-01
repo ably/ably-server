@@ -2,6 +2,7 @@ package realtime
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -642,5 +643,173 @@ func TestDetachWithoutAttachIsIdempotent(t *testing.T) {
 	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
 	if msg.Action != protocol.ActionDetached {
 		t.Fatalf("Action = %v, want DETACHED", msg.Action)
+	}
+}
+
+// resumeAttachAndDrain ATTACHes on a new WS with the given resume
+// cursor, reads frames until ATTACHED, collects subsequent MESSAGE
+// frames until the next non-MESSAGE arrives or a short idle, and
+// returns the ATTACHED frame plus the replayed cms in order.
+func resumeAttachAndDrain(t *testing.T, srv *httptest.Server, channel, resumeFrom string) (attached *protocol.ProtocolMessage, replayed []*protocol.ProtocolMessage) {
+	t.Helper()
+	ws := dial(t, srv, "")
+	drainConnected(t, ws)
+
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:        protocol.ActionAttach,
+		Channel:       channel,
+		ChannelSerial: resumeFrom,
+	})
+
+	attached = readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if attached.Action != protocol.ActionAttached {
+		t.Fatalf("first frame = %v, want ATTACHED", attached.Action)
+	}
+
+	// Drain replayed MESSAGE frames; stop on idle.
+	for {
+		if err := ws.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+			t.Fatalf("SetReadDeadline: %v", err)
+		}
+		_, data, err := ws.ReadMessage()
+		if err != nil {
+			break
+		}
+		var f protocol.ProtocolMessage
+		if err := protocol.Unmarshal(data, protocol.FormatJSON, &f); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if f.Action != protocol.ActionMessage {
+			t.Fatalf("unexpected frame during replay drain: %v", f.Action)
+		}
+		replayed = append(replayed, &f)
+	}
+	_ = ws.Close()
+	return attached, replayed
+}
+
+func TestResumeReplaysGapAndSetsResumedFlag(t *testing.T) {
+	srv, h := newTestServer(t, time.Hour)
+
+	// Publish 5 messages first; capture the channelSerial of each.
+	for i := range 5 {
+		h.publish(t, "foo", &protocol.Message{ID: fmt.Sprintf("m%d", i)})
+	}
+	// Read each delivered channelSerial via a fresh attach.
+	ws := dial(t, srv, "")
+	drainConnected(t, ws)
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "foo"})
+	if first := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); first.Action != protocol.ActionAttached {
+		t.Fatalf("ATTACHED expected, got %v", first.Action)
+	}
+	// No publishes happen after this attach — there are no MESSAGE frames to drain.
+	// To capture per-publish serials, publish + read in lockstep on a fresh attach below.
+	_ = ws.Close()
+
+	ws2 := dial(t, srv, "")
+	drainConnected(t, ws2)
+	sendFrame(t, ws2, protocol.FormatJSON, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "bar"})
+	if first := readFrame(t, ws2, protocol.FormatJSON, 2*time.Second); first.Action != protocol.ActionAttached {
+		t.Fatalf("ATTACHED expected, got %v", first.Action)
+	}
+	var serials []string
+	for i := range 5 {
+		h.publish(t, "bar", &protocol.Message{ID: fmt.Sprintf("b%d", i)})
+		f := readFrame(t, ws2, protocol.FormatJSON, 2*time.Second)
+		serials = append(serials, f.ChannelSerial)
+	}
+	_ = ws2.Close()
+
+	// Resume on "bar" with the serial of b1 — expect ATTACHED w/ RESUMED set
+	// and replay of b2, b3, b4.
+	attached, replayed := resumeAttachAndDrain(t, srv, "bar", serials[1])
+	if attached.Flags&protocol.FlagResumed == 0 {
+		t.Errorf("Flags = %v, want RESUMED (= %v) set", attached.Flags, protocol.FlagResumed)
+	}
+	if attached.Error != nil {
+		t.Errorf("Error = %+v, want nil on full replay", attached.Error)
+	}
+	if attached.ChannelSerial != serials[1] {
+		t.Errorf("ATTACHED.ChannelSerial = %q, want %q (echoes client cursor)", attached.ChannelSerial, serials[1])
+	}
+	if len(replayed) != 3 {
+		t.Fatalf("replayed len = %d, want 3 (b2, b3, b4); got %+v", len(replayed), replayed)
+	}
+	for i, want := range []string{"b2", "b3", "b4"} {
+		if got := replayed[i].Messages[0].ID; got != want {
+			t.Errorf("replayed[%d].Messages[0].ID = %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestResumeWhenCaughtUpHasNoReplay(t *testing.T) {
+	srv, h := newTestServer(t, time.Hour)
+
+	ws := dial(t, srv, "")
+	drainConnected(t, ws)
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "foo"})
+	if first := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); first.Action != protocol.ActionAttached {
+		t.Fatalf("ATTACHED expected, got %v", first.Action)
+	}
+	h.publish(t, "foo", &protocol.Message{ID: "m1"})
+	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	cursorAtHead := msg.ChannelSerial
+	_ = ws.Close()
+
+	// Resume with the most recent serial — client is caught up.
+	attached, replayed := resumeAttachAndDrain(t, srv, "foo", cursorAtHead)
+	if attached.Flags&protocol.FlagResumed == 0 {
+		t.Errorf("Flags = %v, want RESUMED set (caught-up resume is a successful resume)", attached.Flags)
+	}
+	if len(replayed) != 0 {
+		t.Errorf("replayed len = %d, want 0 (caught up); got %+v", len(replayed), replayed)
+	}
+}
+
+func TestResumeAgainstEmptyChannelFallsThroughToFreshAttach(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+
+	// "empty-chan" has no publishes. Resume with a fabricated cursor.
+	attached, replayed := resumeAttachAndDrain(t, srv, "empty-chan", "00000000000001-000@aaaaaaaaaa:000")
+	if attached.Flags&protocol.FlagResumed != 0 {
+		t.Errorf("Flags = %v, want RESUMED clear (no replay possible)", attached.Flags)
+	}
+	if len(replayed) != 0 {
+		t.Errorf("replayed len = %d, want 0", len(replayed))
+	}
+	if attached.Error == nil {
+		t.Error("Error = nil, want an ErrorInfo explaining the discontinuity")
+	}
+}
+
+func TestResumeCapExceededDeliversNewestCapWithError(t *testing.T) {
+	srv, h := newTestServer(t, time.Hour)
+
+	// Use a low replay cap by reaching into the package internals: we
+	// can't change defaultReplayCap without rebuilding, so instead we
+	// publish more than the cap (~1000). For test speed, publish 1100.
+	const total = defaultReplayCap + 100
+	const ancientCursor = "00000000000001-000@aaaaaaaaaa:000"
+
+	for i := range total {
+		h.publish(t, "cap-chan", &protocol.Message{ID: fmt.Sprintf("m%d", i)})
+	}
+
+	attached, replayed := resumeAttachAndDrain(t, srv, "cap-chan", ancientCursor)
+	if attached.Flags&protocol.FlagResumed != 0 {
+		t.Errorf("Flags = %v, want RESUMED clear (cap exceeded)", attached.Flags)
+	}
+	if attached.Error == nil {
+		t.Error("Error = nil, want an ErrorInfo explaining the truncation")
+	}
+	if len(replayed) != defaultReplayCap {
+		t.Fatalf("replayed len = %d, want %d (newest cap)", len(replayed), defaultReplayCap)
+	}
+	// The newest cap should be m100..m1099.
+	for i := range defaultReplayCap {
+		want := fmt.Sprintf("m%d", i+(total-defaultReplayCap))
+		if got := replayed[i].Messages[0].ID; got != want {
+			t.Fatalf("replayed[%d].Messages[0].ID = %q, want %q", i, got, want)
+		}
 	}
 }

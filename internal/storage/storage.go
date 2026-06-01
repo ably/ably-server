@@ -141,6 +141,18 @@ type HistoryQuery struct {
 	// ChannelMessage carrying only the surviving subset of Messages.
 	Cursor string
 
+	// EndChannelSerial, if non-empty, additionally caps results to
+	// ChannelMessages with channel_serial <= this value (inclusive).
+	// Distinct from Cursor: Cursor is an exclusive pagination boundary
+	// applied direction-specifically, EndChannelSerial is an inclusive
+	// channel-serial-level upper bound applied in either direction.
+	//
+	// Used by resume to bound the gap fetch at the attach-time anchor:
+	// concurrent publishes that have landed in storage but not yet on
+	// the calling Channel's live list are excluded from the scan and
+	// will arrive via Stream.Next instead.
+	EndChannelSerial string
+
 	// Limit caps the number of MESSAGES (not ChannelMessages) returned,
 	// matching Ably's REST `limit` semantics. Zero or negative means no
 	// limit. When the limit cuts a multi-message batch, the trailing

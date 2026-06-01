@@ -85,7 +85,7 @@ func (c *connection) readLoop(ctx context.Context) {
 func (c *connection) dispatch(ctx context.Context, msg *protocol.ProtocolMessage) {
 	switch msg.Action {
 	case protocol.ActionAttach:
-		c.handleAttach(ctx, msg.Channel)
+		c.handleAttach(ctx, msg)
 	case protocol.ActionDetach:
 		c.handleDetach(ctx, msg.Channel)
 	case protocol.ActionMessage:
@@ -104,10 +104,13 @@ func (c *connection) handleClose(ctx context.Context) {
 	c.queue(ctx, &protocol.ProtocolMessage{Action: protocol.ActionClosed})
 }
 
-// handleAttach starts an attachment for name if one does not already
-// exist on this connection. The attachment goroutine writes ATTACHED
-// followed by a MESSAGE frame for every subsequent publish.
-func (c *connection) handleAttach(ctx context.Context, name string) {
+// handleAttach starts an attachment for the channel named by msg if
+// one does not already exist on this connection. msg.ChannelSerial,
+// if non-empty, is the client's resume cursor: the attachment will
+// replay the gap from that cursor to the live anchor before entering
+// the live MESSAGE forwarding loop (subject to the replay cap).
+func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMessage) {
+	name := msg.Channel
 	if name == "" {
 		c.logger.Warn("ATTACH with empty channel name; ignoring")
 		return
@@ -125,7 +128,7 @@ func (c *connection) handleAttach(ctx context.Context, name string) {
 		c.logger.Warn("Attach failed", "channel", name, "err", err)
 		return
 	}
-	a := newAttachment(ctx, name, stream, c.outbound, c.logger.With("channel", name))
+	a := newAttachment(ctx, name, ch, stream, msg.ChannelSerial, c.outbound, c.logger.With("channel", name))
 	c.attachments[name] = a
 	go a.run()
 }

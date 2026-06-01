@@ -261,6 +261,15 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 	if timeUpper != "" {
 		upperKey = channelKey(cs.name, timeUpper)
 	}
+	if q.EndChannelSerial != "" {
+		// Inclusive upper bound on channelSerial — convert to an
+		// exclusive byte-key upper by appending a NUL byte, the lex
+		// successor of the channel-key prefix for EndChannelSerial.
+		endKey := append(channelKey(cs.name, q.EndChannelSerial), 0)
+		if bytes.Compare(endKey, upperKey) < 0 {
+			upperKey = endKey
+		}
+	}
 
 	var page storage.HistoryPage
 	count := 0

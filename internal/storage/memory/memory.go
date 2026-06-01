@@ -186,6 +186,16 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 	if upper != "" {
 		hi = sort.SearchStrings(cs.order, upper)
 	}
+	if q.EndChannelSerial != "" {
+		// Tighten hi to the first index whose channelSerial > EndChannelSerial.
+		// sort.SearchStrings on the bound directly gives the smallest
+		// index with cs.order[i] >= upperKey, so we use the immediate
+		// successor in lex space (append a NUL byte) to express "<=".
+		hiExclusive := sort.SearchStrings(cs.order, q.EndChannelSerial+"\x00")
+		if hiExclusive < hi {
+			hi = hiExclusive
+		}
+	}
 
 	forwards := q.Direction == storage.DirectionForwards
 	cursor := q.Cursor
