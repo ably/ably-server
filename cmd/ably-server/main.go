@@ -117,6 +117,7 @@ func run(ctx context.Context, opts runOpts) int {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", rt.HandleWebSocket)
 	mux.HandleFunc("POST /channels/{name}/messages", rs.HandlePublish)
+	mux.HandleFunc("GET /channels/{name}/messages", rs.HandleHistory)
 	mux.HandleFunc("GET /time", rs.HandleTime)
 	mux.HandleFunc("GET /healthz", rs.HandleHealthz)
 	mux.HandleFunc("GET /readyz", rs.HandleReadyz)

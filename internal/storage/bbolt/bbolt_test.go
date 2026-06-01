@@ -59,7 +59,7 @@ func TestBBoltSurvivesProcessRestart(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s2.Close() })
 
-	page, err := s2.Channel("foo", nil).History(ctx, storage.HistoryQuery{})
+	page, err := s2.Channel("foo", nil).History(ctx, storage.HistoryQuery{Direction: storage.DirectionForwards})
 	if err != nil {
 		t.Fatalf("foo History: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestBBoltSurvivesProcessRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post-restart publish: %v", err)
 	}
-	page, err = s2.Channel("foo", nil).History(ctx, storage.HistoryQuery{})
+	page, err = s2.Channel("foo", nil).History(ctx, storage.HistoryQuery{Direction: storage.DirectionForwards})
 	if err != nil {
 		t.Fatalf("foo History #2: %v", err)
 	}

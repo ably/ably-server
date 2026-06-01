@@ -66,6 +66,14 @@ func (c *Channel) Publish(ctx context.Context, msgs []*protocol.Message) (*proto
 	return c.store.Store(ctx, msgs)
 }
 
+// History delegates to the underlying ChannelStore. Backends return
+// ChannelMessages in the order requested by q.Direction (see
+// storage.HistoryQuery); the REST and resume paths flatten the page
+// without further reordering.
+func (c *Channel) History(ctx context.Context, q storage.HistoryQuery) (storage.HistoryPage, error) {
+	return c.store.History(ctx, q)
+}
+
 // Append links an already-minted ChannelMessage at the tail as a
 // single entry, waking any parked streams. It satisfies the
 // storage.Appender interface — the storage backend calls this to

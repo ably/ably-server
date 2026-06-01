@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -36,6 +37,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *core.Manager) {
 	rs := NewServer(parsed, manager, slog.New(slog.DiscardHandler))
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /channels/{name}/messages", rs.HandlePublish)
+	mux.HandleFunc("GET /channels/{name}/messages", rs.HandleHistory)
 	mux.HandleFunc("GET /time", rs.HandleTime)
 	mux.HandleFunc("GET /healthz", rs.HandleHealthz)
 	mux.HandleFunc("GET /readyz", rs.HandleReadyz)
@@ -250,4 +252,297 @@ func TestHealthzAndReadyzNoAuth(t *testing.T) {
 			t.Errorf("%s body = %q, want %q", path, body, "ok")
 		}
 	}
+}
+
+// historyGet issues GET /channels/{channel}/messages with the test
+// API key in Basic auth. accept may be empty (server defaults to
+// JSON).
+func historyGet(t *testing.T, srv *httptest.Server, channel, rawQuery, accept string) *http.Response {
+	t.Helper()
+	u := srv.URL + "/channels/" + channel + "/messages"
+	if rawQuery != "" {
+		u += "?" + rawQuery
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, u, nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.SetBasicAuth("app.key", "secret")
+	if accept != "" {
+		req.Header.Set("Accept", accept)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
+}
+
+// publishBatch sends one POST with the given messages and fails the
+// test on a non-201 response.
+func publishBatch(t *testing.T, srv *httptest.Server, channel string, msgs []*protocol.Message) {
+	t.Helper()
+	body, err := json.Marshal(msgs)
+	if err != nil {
+		t.Fatalf("encode batch: %v", err)
+	}
+	resp := request(t, srv, http.MethodPost, "/channels/"+channel+"/messages", "application/json", body, true)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("publish batch: status = %d, want 201", resp.StatusCode)
+	}
+}
+
+func decodeHistoryJSON(t *testing.T, resp *http.Response) []*protocol.Message {
+	t.Helper()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	var out []*protocol.Message
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("decode body %q: %v", body, err)
+	}
+	return out
+}
+
+func messageNames(ms []*protocol.Message) []string {
+	out := make([]string, len(ms))
+	for i, m := range ms {
+		out[i] = m.Name
+	}
+	return out
+}
+
+func TestHistoryRequiresAuth(t *testing.T) {
+	srv, _ := newTestServer(t)
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/channels/foo/messages", nil)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestHistoryEmptyChannelReturnsEmptyArray(t *testing.T) {
+	srv, _ := newTestServer(t)
+	resp := historyGet(t, srv, "foo", "", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "[]" {
+		t.Errorf("body = %q, want %q", body, "[]")
+	}
+}
+
+func TestHistoryDefaultsToBackwardsWithFullReversal(t *testing.T) {
+	srv, _ := newTestServer(t)
+	publishBatch(t, srv, "foo", []*protocol.Message{{Name: "a0"}, {Name: "a1"}, {Name: "a2"}})
+	publishBatch(t, srv, "foo", []*protocol.Message{{Name: "b0"}, {Name: "b1"}})
+
+	resp := historyGet(t, srv, "foo", "", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	got := messageNames(decodeHistoryJSON(t, resp))
+	want := []string{"b1", "b0", "a2", "a1", "a0"}
+	if !equalStrings(got, want) {
+		t.Errorf("default direction names = %v, want %v (Ably-verified full reversal)", got, want)
+	}
+}
+
+func TestHistoryForwardsPreservesOrder(t *testing.T) {
+	srv, _ := newTestServer(t)
+	publishBatch(t, srv, "foo", []*protocol.Message{{Name: "a0"}, {Name: "a1"}, {Name: "a2"}})
+	publishBatch(t, srv, "foo", []*protocol.Message{{Name: "b0"}, {Name: "b1"}})
+
+	resp := historyGet(t, srv, "foo", "direction=forwards", "")
+	got := messageNames(decodeHistoryJSON(t, resp))
+	want := []string{"a0", "a1", "a2", "b0", "b1"}
+	if !equalStrings(got, want) {
+		t.Errorf("forwards names = %v, want %v", got, want)
+	}
+}
+
+func TestHistoryLimitAndCursorTraversal(t *testing.T) {
+	srv, _ := newTestServer(t)
+	for i := range 5 {
+		publishBatch(t, srv, "foo", []*protocol.Message{{Name: fmt.Sprintf("m%d", i)}})
+	}
+
+	// First page: backwards, limit 2 — newest two.
+	resp := historyGet(t, srv, "foo", "limit=2", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	got := messageNames(decodeHistoryJSON(t, resp))
+	if !equalStrings(got, []string{"m4", "m3"}) {
+		t.Fatalf("page1 names = %v, want [m4 m3]", got)
+	}
+	nextURL := nextLink(t, resp.Header.Get("Link"))
+	if nextURL == "" {
+		t.Fatal("page1 missing rel=next link")
+	}
+
+	// Follow the opaque next link verbatim (no parsing of cursor value).
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+nextURL, nil)
+	req.SetBasicAuth("app.key", "secret")
+	resp2, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("page2 do: %v", err)
+	}
+	t.Cleanup(func() { resp2.Body.Close() })
+	got = messageNames(decodeHistoryJSON(t, resp2))
+	if !equalStrings(got, []string{"m2", "m1"}) {
+		t.Fatalf("page2 names = %v, want [m2 m1]", got)
+	}
+	nextURL2 := nextLink(t, resp2.Header.Get("Link"))
+	if nextURL2 == "" {
+		t.Fatal("page2 missing rel=next link")
+	}
+
+	// Final page: one message remaining; no further next link.
+	req, _ = http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+nextURL2, nil)
+	req.SetBasicAuth("app.key", "secret")
+	resp3, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("page3 do: %v", err)
+	}
+	t.Cleanup(func() { resp3.Body.Close() })
+	got = messageNames(decodeHistoryJSON(t, resp3))
+	if !equalStrings(got, []string{"m0"}) {
+		t.Errorf("page3 names = %v, want [m0]", got)
+	}
+	if nextLink(t, resp3.Header.Get("Link")) != "" {
+		t.Error("page3 should not have a rel=next link")
+	}
+}
+
+func TestHistoryRejectsInvalidParams(t *testing.T) {
+	srv, _ := newTestServer(t)
+	cases := []string{
+		"direction=sideways",
+		"limit=abc",
+		"limit=0",
+		"limit=1001",
+		"start=-1",
+		"end=notanumber",
+	}
+	for _, raw := range cases {
+		resp := historyGet(t, srv, "foo", raw, "")
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%q: status = %d, want 400", raw, resp.StatusCode)
+		}
+	}
+}
+
+func TestHistoryMsgpackRoundTrip(t *testing.T) {
+	srv, _ := newTestServer(t)
+	publishBatch(t, srv, "foo", []*protocol.Message{{Name: "a"}, {Name: "b"}})
+
+	resp := historyGet(t, srv, "foo", "direction=forwards", "application/x-msgpack")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/x-msgpack" {
+		t.Errorf("Content-Type = %q, want application/x-msgpack", ct)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	var got []*protocol.Message
+	if err := msgpack.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode msgpack: %v", err)
+	}
+	if !equalStrings(messageNames(got), []string{"a", "b"}) {
+		t.Errorf("names = %v, want [a b]", messageNames(got))
+	}
+}
+
+func TestHistoryLimitSplitsAtomicBatch(t *testing.T) {
+	// Ably's `limit` counts Messages and slices a multi-message
+	// atomic publish across pages (verified empirically against the
+	// live API).
+	srv, _ := newTestServer(t)
+	publishBatch(t, srv, "foo", []*protocol.Message{
+		{Name: "m0"}, {Name: "m1"}, {Name: "m2"}, {Name: "m3"}, {Name: "m4"},
+	})
+
+	// Page 1: backwards, limit 2 → m4, m3.
+	resp := historyGet(t, srv, "foo", "limit=2", "")
+	got := messageNames(decodeHistoryJSON(t, resp))
+	if !equalStrings(got, []string{"m4", "m3"}) {
+		t.Fatalf("page1 names = %v, want [m4 m3]", got)
+	}
+	nextURL := nextLink(t, resp.Header.Get("Link"))
+	if nextURL == "" {
+		t.Fatal("expected a rel=next link with a mid-batch cursor")
+	}
+	// The cursor in the next link must look like a Message.Serial
+	// (channelSerial:idx). It's URL-encoded inside the link.
+	if !strings.Contains(nextURL, "%3A") && !strings.Contains(nextURL, ":") {
+		t.Errorf("next link cursor not in Message.Serial form: %q", nextURL)
+	}
+
+	// Page 2: follow the opaque cursor.
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+nextURL, nil)
+	req.SetBasicAuth("app.key", "secret")
+	resp2, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("page2 do: %v", err)
+	}
+	t.Cleanup(func() { resp2.Body.Close() })
+	got = messageNames(decodeHistoryJSON(t, resp2))
+	if !equalStrings(got, []string{"m2", "m1"}) {
+		t.Fatalf("page2 names = %v, want [m2 m1]", got)
+	}
+}
+
+func TestHistoryLinkHeadersAlwaysIncludeFirstAndCurrent(t *testing.T) {
+	srv, _ := newTestServer(t)
+	publishBatch(t, srv, "foo", []*protocol.Message{{Name: "x"}})
+	resp := historyGet(t, srv, "foo", "limit=10", "")
+	link := resp.Header.Get("Link")
+	if !strings.Contains(link, `rel="current"`) {
+		t.Errorf("Link missing rel=current: %q", link)
+	}
+	if !strings.Contains(link, `rel="first"`) {
+		t.Errorf("Link missing rel=first: %q", link)
+	}
+	if strings.Contains(link, `rel="next"`) {
+		t.Errorf("Link unexpectedly contains rel=next when HasMore=false: %q", link)
+	}
+}
+
+// nextLink extracts the URI from the rel="next" entry of a Link
+// header, returning "" if no such entry is present.
+func nextLink(t *testing.T, header string) string {
+	t.Helper()
+	for part := range strings.SplitSeq(header, ",") {
+		part = strings.TrimSpace(part)
+		if !strings.Contains(part, `rel="next"`) {
+			continue
+		}
+		// Format: <url>; rel="next"
+		end := strings.Index(part, ">")
+		if !strings.HasPrefix(part, "<") || end < 0 {
+			t.Fatalf("malformed Link entry: %q", part)
+		}
+		return part[1:end]
+	}
+	return ""
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i, s := range a {
+		if s != b[i] {
+			return false
+		}
+	}
+	return true
 }

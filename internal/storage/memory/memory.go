@@ -146,7 +146,18 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	return cm, false, nil
 }
 
-// History implements storage.ChannelStore.
+// History implements storage.ChannelStore. The walk over cs.order is
+// direction-aware: forwards starts at the lower-bound index and walks
+// up; backwards starts at the upper-bound index and walks down. Within
+// each batch we iterate Messages in idx order (forwards) or reverse
+// idx order (backwards), applying the cursor at Message-serial
+// granularity. Time bounds (q.Start / q.End) and the channelSerial-
+// extracted cursor are lex compares against the channelSerial column.
+//
+// Limit and HasMore are counted at Message granularity, matching
+// Ably's REST `limit` semantics — a single multi-message batch can be
+// split across pages. Emitted ChannelMessages are shallow copies; the
+// persisted state is never mutated.
 func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (storage.HistoryPage, error) {
 	if err := ctx.Err(); err != nil {
 		return storage.HistoryPage{}, err
@@ -155,25 +166,65 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	start := 0
-	if q.AfterChannelSerial != "" {
-		// First index whose serial > AfterChannelSerial.
-		start = sort.SearchStrings(cs.order, q.AfterChannelSerial)
-		if start < len(cs.order) && cs.order[start] == q.AfterChannelSerial {
-			start++
+	lower, upper := serial.TimestampBounds(q.Start, q.End)
+
+	lo := 0
+	if lower != "" {
+		lo = sort.SearchStrings(cs.order, lower)
+	}
+	hi := len(cs.order)
+	if upper != "" {
+		hi = sort.SearchStrings(cs.order, upper)
+	}
+
+	forwards := q.Direction == storage.DirectionForwards
+	cursor := q.Cursor
+	limit := q.Limit
+
+	var page storage.HistoryPage
+	count := 0
+
+	emit := func(m *protocol.Message, current **protocol.ChannelMessage, channelSerial string) bool {
+		if limit > 0 && count >= limit {
+			page.HasMore = true
+			return false
+		}
+		if *current == nil || (*current).ChannelSerial != channelSerial {
+			*current = &protocol.ChannelMessage{ChannelSerial: channelSerial}
+			page.ChannelMessages = append(page.ChannelMessages, *current)
+		}
+		(*current).Messages = append((*current).Messages, m)
+		count++
+		return true
+	}
+
+	if forwards {
+		var current *protocol.ChannelMessage
+		for i := lo; i < hi; i++ {
+			cm := cs.byCS[cs.order[i]]
+			for idx, m := range cm.Messages {
+				if cursor != "" && serial.MessageSerial(cm.ChannelSerial, idx) <= cursor {
+					continue
+				}
+				if !emit(m, &current, cm.ChannelSerial) {
+					return page, nil
+				}
+			}
+		}
+		return page, nil
+	}
+
+	var current *protocol.ChannelMessage
+	for i := hi - 1; i >= lo; i-- {
+		cm := cs.byCS[cs.order[i]]
+		for idx := len(cm.Messages) - 1; idx >= 0; idx-- {
+			if cursor != "" && serial.MessageSerial(cm.ChannelSerial, idx) >= cursor {
+				continue
+			}
+			if !emit(cm.Messages[idx], &current, cm.ChannelSerial) {
+				return page, nil
+			}
 		}
 	}
-
-	end := len(cs.order)
-	hasMore := false
-	if q.Limit > 0 && end-start > q.Limit {
-		end = start + q.Limit
-		hasMore = true
-	}
-
-	page := make([]*protocol.ChannelMessage, 0, end-start)
-	for i := start; i < end; i++ {
-		page = append(page, cs.byCS[cs.order[i]])
-	}
-	return storage.HistoryPage{ChannelMessages: page, HasMore: hasMore}, nil
+	return page, nil
 }

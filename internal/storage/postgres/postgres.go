@@ -510,42 +510,73 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	return cm, false, nil
 }
 
-// History runs a forward range scan over messages, ordered by
-// (channel_serial, idx). Rows are grouped into ChannelMessages by
-// serial; HasMore is set when (Limit+1) distinct channel_serials were
-// available, signalled by fetching one extra ChannelMessage's worth
-// of rows than requested.
+// History runs a direction-aware range scan over messages at Message
+// granularity. Time bounds (q.Start / q.End) are applied as predicates
+// on channel_serial — the serial's leading timestamp prefix makes the
+// lex compare correct (DESIGN.md §8 + internal/serial.TimestampBounds),
+// so no separate timestamp column or index is needed.
+//
+// q.Cursor is a Message.Serial (`<channelSerial>:<idx>`), decomposed
+// into a (channel_serial, idx) tuple and applied as a strict (>/<)
+// predicate over the lex-ordered pair. q.Limit caps Messages (not
+// ChannelMessages); we fetch Limit+1 rows to detect HasMore. Rows are
+// grouped into ChannelMessages in Go — a multi-message batch may be
+// split across pages, so the head/tail ChannelMessage in a page can
+// be partial.
 func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (storage.HistoryPage, error) {
 	if err := ctx.Err(); err != nil {
 		return storage.HistoryPage{}, err
 	}
 
+	timeLower, timeUpper := serial.TimestampBounds(q.Start, q.End)
+	forwards := q.Direction == storage.DirectionForwards
+
+	var (
+		cursorChannelSerial string
+		cursorIdx           int
+	)
+	if q.Cursor != "" {
+		var err error
+		cursorChannelSerial, cursorIdx, err = serial.ParseMessageSerial(q.Cursor)
+		if err != nil {
+			return storage.HistoryPage{}, fmt.Errorf("storage/postgres: parse cursor: %w", err)
+		}
+	}
+
 	limit := q.Limit
 	overLimit := q.Limit > 0
-	rows, err := cs.pool.Query(ctx, `
-		WITH window_cms AS (
-		  SELECT DISTINCT channel_serial
-		  FROM messages
-		  WHERE channel = $1
-		    AND ($2 = '' OR channel_serial > $2)
-		  ORDER BY channel_serial
-		  LIMIT CASE WHEN $3 > 0 THEN $3 + 1 ELSE NULL END
-		)
-		SELECT m.channel_serial, m.idx, m.payload
-		FROM window_cms w
-		JOIN messages m
-		  ON m.channel = $1 AND m.channel_serial = w.channel_serial
-		ORDER BY m.channel_serial, m.idx
-	`, cs.name, q.AfterChannelSerial, limit)
+	order := "ASC"
+	cursorOp := ">"
+	if !forwards {
+		order = "DESC"
+		cursorOp = "<"
+	}
+
+	// The cursor predicate is the lex compare over the (channel_serial,
+	// idx) tuple. $4 holds the cursor's channelSerial and $5 its idx;
+	// empty $4 means "no cursor".
+	query := fmt.Sprintf(`
+		SELECT channel_serial, idx, payload
+		FROM messages
+		WHERE channel = $1
+		  AND ($2 = '' OR channel_serial >= $2)
+		  AND ($3 = '' OR channel_serial <  $3)
+		  AND ($4 = '' OR (channel_serial, idx) %s ($4, $5))
+		ORDER BY channel_serial %s, idx %s
+		LIMIT CASE WHEN $6 > 0 THEN $6 + 1 ELSE NULL END
+	`, cursorOp, order, order)
+
+	rows, err := cs.pool.Query(ctx, query,
+		cs.name, timeLower, timeUpper,
+		cursorChannelSerial, cursorIdx,
+		limit,
+	)
 	if err != nil {
 		return storage.HistoryPage{}, fmt.Errorf("storage/postgres: history query: %w", err)
 	}
 	defer rows.Close()
 
-	var (
-		page    storage.HistoryPage
-		current *protocol.ChannelMessage
-	)
+	var page storage.HistoryPage
 	for rows.Next() {
 		var (
 			cs2     string
@@ -559,21 +590,60 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 		if err := msgpack.Unmarshal(payload, &m); err != nil {
 			return storage.HistoryPage{}, fmt.Errorf("storage/postgres: decode payload %s:%d: %w", cs2, idx, err)
 		}
-		if current == nil || current.ChannelSerial != cs2 {
-			current = &protocol.ChannelMessage{ChannelSerial: cs2}
-			page.ChannelMessages = append(page.ChannelMessages, current)
-		}
-		current.Messages = append(current.Messages, &m)
+		appendMessage(&page, cs2, &m)
 	}
 	if err := rows.Err(); err != nil {
 		return storage.HistoryPage{}, fmt.Errorf("storage/postgres: history rows: %w", err)
 	}
 
-	if overLimit && len(page.ChannelMessages) > limit {
-		page.ChannelMessages = page.ChannelMessages[:limit]
+	if overLimit && messageCount(page) > limit {
+		trimToLimit(&page, limit)
 		page.HasMore = true
 	}
 	return page, nil
+}
+
+// appendMessage tacks m onto the trailing ChannelMessage when its
+// channelSerial matches; otherwise starts a fresh entry. Used by the
+// row-scanning loop above where consecutive rows from the same batch
+// arrive contiguously.
+func appendMessage(page *storage.HistoryPage, channelSerial string, m *protocol.Message) {
+	if n := len(page.ChannelMessages); n > 0 && page.ChannelMessages[n-1].ChannelSerial == channelSerial {
+		page.ChannelMessages[n-1].Messages = append(page.ChannelMessages[n-1].Messages, m)
+		return
+	}
+	page.ChannelMessages = append(page.ChannelMessages, &protocol.ChannelMessage{
+		ChannelSerial: channelSerial,
+		Messages:      []*protocol.Message{m},
+	})
+}
+
+// messageCount totals the Messages across all ChannelMessages in page.
+func messageCount(page storage.HistoryPage) int {
+	n := 0
+	for _, cm := range page.ChannelMessages {
+		n += len(cm.Messages)
+	}
+	return n
+}
+
+// trimToLimit drops Messages past limit, in order, possibly leaving
+// the last surviving ChannelMessage partial.
+func trimToLimit(page *storage.HistoryPage, limit int) {
+	left := limit
+	for i, cm := range page.ChannelMessages {
+		if left == 0 {
+			page.ChannelMessages = page.ChannelMessages[:i]
+			return
+		}
+		if left >= len(cm.Messages) {
+			left -= len(cm.Messages)
+			continue
+		}
+		cm.Messages = cm.Messages[:left]
+		page.ChannelMessages = page.ChannelMessages[:i+1]
+		return
+	}
 }
 
 // nonEmptyIDs returns the subset of m.ID values that are non-empty.

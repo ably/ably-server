@@ -80,22 +80,75 @@ type ChannelStore interface {
 	History(ctx context.Context, q HistoryQuery) (HistoryPage, error)
 }
 
-// HistoryQuery bounds a forward history read.
-type HistoryQuery struct {
-	// AfterChannelSerial — empty means "from the start of retained
-	// history". Otherwise, results begin strictly after this serial.
-	AfterChannelSerial string
+// Direction selects the history scan order.
+//
+// The zero value is DirectionBackwards to match Ably's REST default
+// (newest first), so an unset HistoryQuery yields the SDK-expected
+// ordering.
+type Direction uint8
 
-	// Limit caps the number of ChannelMessages returned. Zero or
-	// negative means no limit.
+const (
+	// DirectionBackwards iterates newest publish first. The Messages
+	// slice within each returned ChannelMessage is also reversed
+	// (highest idx first), so a flatten yields fully-reversed order.
+	DirectionBackwards Direction = iota
+
+	// DirectionForwards iterates oldest publish first. The Messages
+	// slice within each returned ChannelMessage is in natural idx
+	// order.
+	DirectionForwards
+)
+
+// HistoryQuery bounds a history read.
+type HistoryQuery struct {
+	// Direction selects scan order. Zero value is DirectionBackwards
+	// (Ably default).
+	Direction Direction
+
+	// Start, End are inclusive bounds on the publish timestamp encoded
+	// in each ChannelMessage's serial (DESIGN.md §8). Units are
+	// milliseconds since the Unix epoch. Zero means "no bound on that
+	// side".
+	Start int64
+	End   int64
+
+	// Cursor is a Message.Serial (`<channelSerial>:<idx>`) used for
+	// pagination:
+	//   - DirectionForwards:  results are strictly after this serial
+	//   - DirectionBackwards: results are strictly before this serial
+	// Empty means "no cursor". The serial is compared lexicographically
+	// (the format makes lex compare match logical order), so a cursor
+	// may land mid-batch — the page may begin or end with a partial
+	// ChannelMessage carrying only the surviving subset of Messages.
+	Cursor string
+
+	// Limit caps the number of MESSAGES (not ChannelMessages) returned,
+	// matching Ably's REST `limit` semantics. Zero or negative means no
+	// limit. When the limit cuts a multi-message batch, the trailing
+	// ChannelMessage in the page is partial; HasMore is true.
 	Limit int
 }
 
-// HistoryPage is one page of forward history results.
+// HistoryPage is one page of history results, ordered per the query's
+// Direction.
+//
+// For DirectionBackwards the returned ChannelMessages are newest-first
+// and each entry's Messages slice has been reversed (highest idx
+// first); for DirectionForwards both orderings are natural. The
+// Messages slice is always a fresh slice — backends MUST NOT mutate
+// the persisted ChannelMessage when reversing or when emitting
+// partial-batch pages.
+//
+// When the query's Cursor lands mid-batch, the first ChannelMessage in
+// the page may contain only the Messages that survive the cursor (a
+// proper subset of the persisted batch). When Limit cuts mid-batch,
+// the last ChannelMessage in the page is similarly partial.
 type HistoryPage struct {
 	ChannelMessages []*protocol.ChannelMessage
 
 	// HasMore is true if the query was Limit-bounded and at least one
-	// further ChannelMessage exists past the last entry returned.
+	// further Message exists past the last entry returned (in the
+	// requested direction). Counted at Message granularity to match
+	// the Limit semantics.
 	HasMore bool
 }

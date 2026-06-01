@@ -225,44 +225,122 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	return resultCM, idempotent, nil
 }
 
+// History runs a direction-aware range scan over the channel's
+// ChannelMessages. Time bounds (q.Start / q.End) are translated to
+// byte-comparable lower/upper key bounds against the
+// "<channel>\0<channelSerial>" composite key; bolt's cursor walks
+// forwards (Seek+Next) or backwards (Seek+Prev) within those bounds.
+//
+// Pagination operates at Message granularity: q.Cursor is a
+// Message.Serial (`<channelSerial>:<idx>`) and q.Limit caps the
+// Message count (not the ChannelMessage count). A multi-message batch
+// can be split across pages — the head/tail ChannelMessage in a page
+// may carry only a subset of its persisted Messages. The persisted
+// blob is never mutated.
 func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (storage.HistoryPage, error) {
 	if err := ctx.Err(); err != nil {
 		return storage.HistoryPage{}, err
 	}
 
+	prefix := channelPrefix(cs.name)
+	timeLower, timeUpper := serial.TimestampBounds(q.Start, q.End)
+	forwards := q.Direction == storage.DirectionForwards
+	limit := q.Limit
+	cursor := q.Cursor
+
+	lowerKey := prefix
+	if timeLower != "" {
+		lowerKey = channelKey(cs.name, timeLower)
+	}
+	upperKey := nextPrefix(prefix)
+	if timeUpper != "" {
+		upperKey = channelKey(cs.name, timeUpper)
+	}
+
 	var page storage.HistoryPage
+	count := 0
+
+	// emitMessage appends m onto the trailing ChannelMessage when its
+	// channelSerial matches, or starts a fresh entry otherwise. It
+	// returns false once Limit is reached, signalling outer-loop exit.
+	emitMessage := func(channelSerial string, m *protocol.Message) bool {
+		if limit > 0 && count >= limit {
+			page.HasMore = true
+			return false
+		}
+		var current *protocol.ChannelMessage
+		if n := len(page.ChannelMessages); n > 0 && page.ChannelMessages[n-1].ChannelSerial == channelSerial {
+			current = page.ChannelMessages[n-1]
+		} else {
+			current = &protocol.ChannelMessage{ChannelSerial: channelSerial}
+			page.ChannelMessages = append(page.ChannelMessages, current)
+		}
+		current.Messages = append(current.Messages, m)
+		count++
+		return true
+	}
+
 	err := cs.db.View(func(tx *bolt.Tx) error {
 		messages := tx.Bucket(messagesBucket)
 		if messages == nil {
 			return nil
 		}
+		c := messages.Cursor()
 
-		prefix := channelPrefix(cs.name)
-		var seekKey []byte
-		if q.AfterChannelSerial == "" {
-			seekKey = prefix
-		} else {
-			seekKey = channelKey(cs.name, q.AfterChannelSerial)
-		}
-
-		cur := messages.Cursor()
-		k, v := cur.Seek(seekKey)
-		if q.AfterChannelSerial != "" && k != nil && bytes.Equal(k, seekKey) {
-			k, v = cur.Next()
-		}
-		for ; k != nil; k, v = cur.Next() {
-			if !bytes.HasPrefix(k, prefix) {
-				break
-			}
-			if q.Limit > 0 && len(page.ChannelMessages) >= q.Limit {
-				page.HasMore = true
-				return nil
-			}
+		decode := func(k, v []byte) (*protocol.ChannelMessage, error) {
 			cm := &protocol.ChannelMessage{}
 			if err := msgpack.Unmarshal(v, cm); err != nil {
-				return fmt.Errorf("storage/bbolt: decode ChannelMessage %q: %w", k, err)
+				return nil, fmt.Errorf("storage/bbolt: decode ChannelMessage %q: %w", k, err)
 			}
-			page.ChannelMessages = append(page.ChannelMessages, cm)
+			return cm, nil
+		}
+
+		if forwards {
+			for k, v := c.Seek(lowerKey); k != nil; k, v = c.Next() {
+				if !bytes.HasPrefix(k, prefix) || bytes.Compare(k, upperKey) >= 0 {
+					break
+				}
+				cm, err := decode(k, v)
+				if err != nil {
+					return err
+				}
+				for idx, m := range cm.Messages {
+					if cursor != "" && serial.MessageSerial(cm.ChannelSerial, idx) <= cursor {
+						continue
+					}
+					if !emitMessage(cm.ChannelSerial, m) {
+						return nil
+					}
+				}
+			}
+			return nil
+		}
+
+		// Backwards: position at the last key strictly < upperKey, then
+		// walk Prev() until lowerKey or the prefix is exhausted. Within
+		// each batch, iterate Messages in reverse idx order.
+		k, v := c.Seek(upperKey)
+		if k == nil {
+			k, v = c.Last()
+		} else {
+			k, v = c.Prev()
+		}
+		for ; k != nil; k, v = c.Prev() {
+			if !bytes.HasPrefix(k, prefix) || bytes.Compare(k, lowerKey) < 0 {
+				break
+			}
+			cm, err := decode(k, v)
+			if err != nil {
+				return err
+			}
+			for idx := len(cm.Messages) - 1; idx >= 0; idx-- {
+				if cursor != "" && serial.MessageSerial(cm.ChannelSerial, idx) >= cursor {
+					continue
+				}
+				if !emitMessage(cm.ChannelSerial, cm.Messages[idx]) {
+					return nil
+				}
+			}
 		}
 		return nil
 	})
@@ -270,4 +348,15 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 		return storage.HistoryPage{}, err
 	}
 	return page, nil
+}
+
+// nextPrefix returns the smallest byte string strictly greater than
+// every key starting with p — i.e. p with its last byte incremented.
+// Callers ensure p is non-empty and its last byte is not 0xff (true
+// for channelPrefix, which always ends in keySep == 0).
+func nextPrefix(p []byte) []byte {
+	out := make([]byte, len(p))
+	copy(out, p)
+	out[len(out)-1]++
+	return out
 }

@@ -4,19 +4,19 @@
 //
 // Two forms (see DESIGN.md §8):
 //
-//	channelSerial:  <timestamp>-<counter>@<seriesId>
-//	                |14 digits | 3 digit |10 chars
+//		channelSerial:  <timestamp>-<counter>@<seriesId>
+//		                |14 digits | 3 digit |10 chars
 //
-//	Message.serial: <channelSerial>:<idx>
-//	                                |3 digit
+//		Message.serial: <channelSerial>:<idx>
+//		                                |3 digit
 //
-//   - timestamp — wall-clock ms since epoch, zero-padded to 14 digits.
-//   - counter   — increments when multiple serials are minted in the
-//     same millisecond; resets to 000 when the timestamp advances.
-//   - seriesId  — random per-process identifier; disambiguates serials
-//     minted in the same millisecond on different nodes.
-//   - idx       — index of a Message within its containing
-//     ChannelMessage (atomic publish).
+//	  - timestamp — wall-clock ms since epoch, zero-padded to 14 digits.
+//	  - counter   — increments when multiple serials are minted in the
+//	    same millisecond; resets to 000 when the timestamp advances.
+//	  - seriesId  — random per-process identifier; disambiguates serials
+//	    minted in the same millisecond on different nodes.
+//	  - idx       — index of a Message within its containing
+//	    ChannelMessage (atomic publish).
 //
 // channelSerials are the discrete attach/resume points in a channel's
 // stream — one per atomic publish. Individual Message.serials append
@@ -32,6 +32,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -120,4 +122,49 @@ func (g *Generator) Mint() string {
 // Format: `<channelSerial>:<idx>` with idx zero-padded to 3 digits.
 func MessageSerial(channelSerial string, idx int) string {
 	return fmt.Sprintf("%s:%0*d", channelSerial, idxWidth, idx)
+}
+
+// ParseMessageSerial splits a Message.Serial into its component
+// channelSerial and idx. The format is `<channelSerial>:<idx>`; the
+// channelSerial part contains '@' but never ':' so the last ':' is
+// always the boundary.
+func ParseMessageSerial(s string) (channelSerial string, idx int, err error) {
+	i := strings.LastIndexByte(s, ':')
+	if i < 0 {
+		return "", 0, fmt.Errorf("serial: %q is not a Message.Serial (no ':')", s)
+	}
+	channelSerial = s[:i]
+	idx, err = strconv.Atoi(s[i+1:])
+	if err != nil {
+		return "", 0, fmt.Errorf("serial: %q has non-integer idx suffix: %w", s, err)
+	}
+	if idx < 0 {
+		return "", 0, fmt.Errorf("serial: %q has negative idx", s)
+	}
+	return channelSerial, idx, nil
+}
+
+// TimestampBounds maps an inclusive ms-since-epoch range to a
+// half-open lex range over channelSerials. Useful for backends that
+// implement timestamp-bounded history reads via prefix/range scans on
+// the channelSerial column.
+//
+// A zero bound means "unbounded on that side" and is returned as an
+// empty string. Otherwise:
+//
+//   - lower is the smallest possible channelSerial with ts == start
+//     ("<start>-"). Any serial with ts >= start satisfies serial >= lower.
+//   - upper is the smallest possible channelSerial with ts == end+1
+//     ("<end+1>-"). Any serial with ts <= end satisfies serial < upper.
+//
+// So the inclusive range start <= ts <= end maps to
+// (lower == "" || serial >= lower) && (upper == "" || serial < upper).
+func TimestampBounds(start, end int64) (lower, upper string) {
+	if start > 0 {
+		lower = fmt.Sprintf("%0*d-", timestampWidth, start)
+	}
+	if end > 0 {
+		upper = fmt.Sprintf("%0*d-", timestampWidth, end+1)
+	}
+	return
 }
