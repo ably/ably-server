@@ -1,5 +1,27 @@
 # ably-server — Design
 
+> **Status.** This document describes the target design, not the current
+> state of the code. Substantial parts are aspirational and read in
+> present tense as if implemented — they aren't yet. Notable gaps at the
+> time of writing:
+>
+> - **§3 auth** — only API-key Basic auth exists. JWT (HS256),
+>   capabilities, and `clientId` resolution are not yet implemented.
+> - **§9 configuration** — `--tls-cert/--tls-key`, `--message-ttl`,
+>   `--max-messages-per-channel`, `--log-format` are not wired up; the
+>   `ABLY_SERVER_*` env-var coverage is partial.
+> - **§10 observability** — Prometheus `/metrics`, OpenTelemetry, and
+>   pprof are not implemented.
+> - **§11 graceful shutdown** — the server does not currently send
+>   `DISCONNECTED` to existing WebSockets on SIGTERM.
+> - **§4.4 / §5.1 backpressure** — the lag threshold and `ERROR 50000`
+>   slow-attachment disconnect are not implemented.
+> - **§6 retention** — TTL / per-channel cap policy is still being
+>   decided.
+>
+> See [`backlog/`](backlog/) for the live task list. The package layout
+> listed in §5 is "proposed" and only loosely matches `internal/`.
+
 ## 1. Goals & non-goals
 
 ### Goals
