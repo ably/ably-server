@@ -24,26 +24,32 @@ import (
 
 // Appender is the bridge between the storage backend and the in-process
 // channel state. The backend calls Initialize exactly once, before any
-// Append, to hand the channel its initial channelSerial — the cursor
-// fresh attachments use as their resume point until the first real
-// publish lands. After Initialize, Append delivers each persisted
-// ChannelMessage (synchronously for memory/bbolt, asynchronously via
-// the Postgres LISTEN goroutine in cluster mode).
+// Append, to hand the channel two channelSerials — the current cursor
+// (used as the attach point for fresh attaches) and the channel's
+// immutable initial serial (used as the attach point for rewinds that
+// reach back past every persisted cm). After Initialize, Append
+// delivers each persisted ChannelMessage (synchronously for
+// memory/bbolt, asynchronously via the Postgres LISTEN goroutine in
+// cluster mode).
 //
 // In core, *Channel implements Appender — Initialize seeds the channel
-// sentinel's serial and unblocks Attach; Append links the cm onto the
-// live linked list so attached streams observe it.
+// sentinel's serial, records the initial value, and unblocks Attach;
+// Append links the cm onto the live linked list so attached streams
+// observe it.
 type Appender interface {
-	// Initialize is called once by the storage backend with the
-	// channel's initial channelSerial — the watermark from which fresh
-	// attachers begin. Until Initialize returns, the channel is "not
-	// ready" and Attach blocks.
-	Initialize(channelSerial string)
+	// Initialize is called once by the storage backend with two
+	// channelSerials. current is the channel's current cursor at
+	// materialisation time (== latest persisted cm's serial, or the
+	// freshly-minted seed for an empty channel). initial is the
+	// channel's immutable seed serial, guaranteed to sort strictly
+	// less than every cm ever persisted on this channel. Until
+	// Initialize returns, the channel is "not ready" and Attach blocks.
+	Initialize(current, initial string)
 
 	// Append delivers one persisted ChannelMessage to the live linked
 	// list. Backends guarantee monotonicity: every Append's serial is
 	// strictly greater than every prior Append's serial and strictly
-	// greater than the Initialize serial.
+	// greater than the Initialize current/initial serials.
 	Append(cm *protocol.ChannelMessage)
 }
 

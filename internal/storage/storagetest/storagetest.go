@@ -838,7 +838,8 @@ func threeDigit(i int) string {
 // behaviour without needing a real core.Channel.
 type capturingAppender struct {
 	mu             sync.Mutex
-	initSerial     string
+	initCurrent    string
+	initInitial    string
 	initCount      int
 	appends        []*protocol.ChannelMessage
 }
@@ -847,10 +848,11 @@ func newCapturingAppender() *capturingAppender {
 	return &capturingAppender{}
 }
 
-func (a *capturingAppender) Initialize(channelSerial string) {
+func (a *capturingAppender) Initialize(current, initial string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.initSerial = channelSerial
+	a.initCurrent = current
+	a.initInitial = initial
 	a.initCount++
 }
 
@@ -863,7 +865,13 @@ func (a *capturingAppender) Append(cm *protocol.ChannelMessage) {
 func (a *capturingAppender) initialized() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.initSerial
+	return a.initCurrent
+}
+
+func (a *capturingAppender) initialInitial() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.initInitial
 }
 
 func (a *capturingAppender) initializeCount() int {

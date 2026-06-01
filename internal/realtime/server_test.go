@@ -766,19 +766,24 @@ func TestResumeWhenCaughtUpHasNoReplay(t *testing.T) {
 	}
 }
 
-func TestResumeAgainstEmptyChannelFallsThroughToFreshAttach(t *testing.T) {
+func TestResumeAgainstEmptyChannelIsCaughtUp(t *testing.T) {
 	srv, _ := newTestServer(t, time.Hour)
 
-	// "empty-chan" has no publishes. Resume with a fabricated cursor.
+	// "empty-chan" has no publishes. The client supplies a cursor and
+	// asks to resume. Without retention, "exhausted the backwards walk
+	// with the client's cursor not matched" is treated as "you're
+	// caught up, here's nothing" — RESUMED set, no error, no replay.
+	// (TASK-26 will refine this once retention can drop cms below an
+	// in-storage cursor.)
 	attached, replayed := resumeAttachAndDrain(t, srv, "empty-chan", "00000000000001-000@aaaaaaaaaa:000")
-	if attached.Flags&protocol.FlagResumed != 0 {
-		t.Errorf("Flags = %v, want RESUMED clear (no replay possible)", attached.Flags)
+	if attached.Flags&protocol.FlagResumed == 0 {
+		t.Errorf("Flags = %v, want RESUMED set (exhausted storage, nothing to deliver)", attached.Flags)
 	}
 	if len(replayed) != 0 {
 		t.Errorf("replayed len = %d, want 0", len(replayed))
 	}
-	if attached.Error == nil {
-		t.Error("Error = nil, want an ErrorInfo explaining the discontinuity")
+	if attached.Error != nil {
+		t.Errorf("Error = %+v, want nil", attached.Error)
 	}
 }
 
@@ -812,4 +817,197 @@ func TestResumeCapExceededDeliversNewestCapWithError(t *testing.T) {
 			t.Fatalf("replayed[%d].Messages[0].ID = %q, want %q", i, got, want)
 		}
 	}
+}
+
+// rewindAttachAndDrain ATTACHes on a new WS with params={"rewind": v},
+// reads frames until ATTACHED, collects subsequent MESSAGE frames
+// until idle, and returns the ATTACHED frame plus the replayed cms in
+// order.
+func rewindAttachAndDrain(t *testing.T, srv *httptest.Server, channel, rewind string) (attached *protocol.ProtocolMessage, replayed []*protocol.ProtocolMessage) {
+	t.Helper()
+	ws := dial(t, srv, "")
+	drainConnected(t, ws)
+
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:  protocol.ActionAttach,
+		Channel: channel,
+		Params:  map[string]string{"rewind": rewind},
+	})
+
+	attached = readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if attached.Action != protocol.ActionAttached {
+		t.Fatalf("first frame = %v, want ATTACHED", attached.Action)
+	}
+	for {
+		if err := ws.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+			t.Fatalf("SetReadDeadline: %v", err)
+		}
+		_, data, err := ws.ReadMessage()
+		if err != nil {
+			break
+		}
+		var f protocol.ProtocolMessage
+		if err := protocol.Unmarshal(data, protocol.FormatJSON, &f); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if f.Action != protocol.ActionMessage {
+			t.Fatalf("unexpected frame: %v", f.Action)
+		}
+		replayed = append(replayed, &f)
+	}
+	_ = ws.Close()
+	return attached, replayed
+}
+
+func TestRewindCountReplaysNewestN(t *testing.T) {
+	srv, h := newTestServer(t, time.Hour)
+	for i := range 5 {
+		h.publish(t, "rwc", &protocol.Message{ID: fmt.Sprintf("m%d", i)})
+	}
+
+	attached, replayed := rewindAttachAndDrain(t, srv, "rwc", "3")
+	if attached.Flags&protocol.FlagResumed != 0 {
+		t.Errorf("Flags = %v, want RESUMED clear (rewind is not a resume)", attached.Flags)
+	}
+	if attached.Error != nil {
+		t.Errorf("Error = %+v, want nil for a clean rewind", attached.Error)
+	}
+	if got := attached.Params["rewind"]; got != "3" {
+		t.Errorf("ATTACHED.Params[rewind] = %q, want %q", got, "3")
+	}
+	if len(replayed) != 3 {
+		t.Fatalf("replayed len = %d, want 3", len(replayed))
+	}
+	for i, want := range []string{"m2", "m3", "m4"} {
+		if got := replayed[i].Messages[0].ID; got != want {
+			t.Errorf("replayed[%d] = %q, want %q", i, got, want)
+		}
+	}
+	// ATTACHED.channelSerial must sort strictly before the first
+	// replayed message — the "predecessor" serial.
+	if !(attached.ChannelSerial < replayed[0].ChannelSerial) {
+		t.Errorf("attached.ChannelSerial %q not < first replayed %q", attached.ChannelSerial, replayed[0].ChannelSerial)
+	}
+}
+
+func TestRewindCountCoveringEntireChannelUsesInitialSerial(t *testing.T) {
+	srv, h := newTestServer(t, time.Hour)
+	for i := range 2 {
+		h.publish(t, "rwa", &protocol.Message{ID: fmt.Sprintf("m%d", i)})
+	}
+
+	// Rewind asks for more than exists: deliver all, use channel's
+	// initial serial as the attach point.
+	attached, replayed := rewindAttachAndDrain(t, srv, "rwa", "10")
+	if len(replayed) != 2 {
+		t.Fatalf("replayed len = %d, want 2", len(replayed))
+	}
+	if !(attached.ChannelSerial < replayed[0].ChannelSerial) {
+		t.Errorf("attached.ChannelSerial %q not < first replayed %q (should be channel initial serial)",
+			attached.ChannelSerial, replayed[0].ChannelSerial)
+	}
+}
+
+func TestRewindDurationReplaysWindow(t *testing.T) {
+	srv, h := newTestServer(t, time.Hour)
+	// Publish 3 messages, sleep, publish 3 more — the rewind window
+	// should capture only the recent batch.
+	for i := range 3 {
+		h.publish(t, "rwd", &protocol.Message{ID: fmt.Sprintf("old%d", i)})
+	}
+	time.Sleep(750 * time.Millisecond)
+	for i := range 3 {
+		h.publish(t, "rwd", &protocol.Message{ID: fmt.Sprintf("new%d", i)})
+	}
+
+	attached, replayed := rewindAttachAndDrain(t, srv, "rwd", "0.5s")
+	if attached.Flags&protocol.FlagResumed != 0 {
+		t.Errorf("Flags = %v, want RESUMED clear", attached.Flags)
+	}
+	if len(replayed) != 3 {
+		t.Fatalf("replayed len = %d, want 3 (only the 'new' batch); got %d", len(replayed), len(replayed))
+	}
+	for i, want := range []string{"new0", "new1", "new2"} {
+		if got := replayed[i].Messages[0].ID; got != want {
+			t.Errorf("replayed[%d] = %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestRewindInvalidParamYieldsErrorNoReplay(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+	attached, replayed := rewindAttachAndDrain(t, srv, "rwbad", "abc")
+	if attached.Error == nil {
+		t.Error("Error = nil, want a 400-class ErrorInfo for invalid rewind")
+	}
+	if len(replayed) != 0 {
+		t.Errorf("replayed len = %d, want 0 on invalid rewind", len(replayed))
+	}
+}
+
+func TestRewindIsIgnoredWhenChannelSerialIsSupplied(t *testing.T) {
+	srv, h := newTestServer(t, time.Hour)
+	// Publish 5 to establish history with known serials.
+	ws := dial(t, srv, "")
+	drainConnected(t, ws)
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "rwconflict"})
+	if first := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); first.Action != protocol.ActionAttached {
+		t.Fatalf("ATTACHED expected, got %v", first.Action)
+	}
+	var serials []string
+	for i := range 5 {
+		h.publish(t, "rwconflict", &protocol.Message{ID: fmt.Sprintf("m%d", i)})
+		f := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+		serials = append(serials, f.ChannelSerial)
+	}
+	_ = ws.Close()
+
+	// Resume with channelSerial=serials[2] AND rewind=999. Resume wins:
+	// replay must be the gap m3..m4 (2 messages), not the rewind window.
+	ws2 := dial(t, srv, "")
+	drainConnected(t, ws2)
+	sendFrame(t, ws2, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:        protocol.ActionAttach,
+		Channel:       "rwconflict",
+		ChannelSerial: serials[2],
+		Params:        map[string]string{"rewind": "999"},
+	})
+	attached := readFrame(t, ws2, protocol.FormatJSON, 2*time.Second)
+	if attached.Action != protocol.ActionAttached {
+		t.Fatalf("first = %v, want ATTACHED", attached.Action)
+	}
+	if attached.Flags&protocol.FlagResumed == 0 {
+		t.Errorf("Flags = %v, want RESUMED set (channelSerial wins → resume path)", attached.Flags)
+	}
+	var got []string
+	for {
+		if err := ws2.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+			t.Fatalf("SetReadDeadline: %v", err)
+		}
+		_, data, err := ws2.ReadMessage()
+		if err != nil {
+			break
+		}
+		var f protocol.ProtocolMessage
+		if err := protocol.Unmarshal(data, protocol.FormatJSON, &f); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		got = append(got, f.Messages[0].ID)
+	}
+	_ = ws2.Close()
+	if !equalStringSlices(got, []string{"m3", "m4"}) {
+		t.Errorf("got %v, want [m3 m4] (rewind=999 ignored, channelSerial gap replayed)", got)
+	}
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

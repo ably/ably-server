@@ -40,12 +40,14 @@ type entry struct {
 //
 // A Channel is created in a not-ready state; storage.Storage.Channel
 // calls Initialize on it before returning to seed the sentinel's
-// watermark serial and close ready. Attach blocks on ready, so a
-// caller cannot observe an empty channelSerial.
+// watermark serial, record the channel's immutable initial serial,
+// and close ready. Attach blocks on ready, so a caller cannot observe
+// an empty channelSerial.
 type Channel struct {
-	name  string
-	store storage.ChannelStore
-	ready chan struct{}
+	name           string
+	store          storage.ChannelStore
+	ready          chan struct{}
+	initialSerial  string // immutable after Initialize; sorts strictly less than every cm in this channel
 
 	mu   sync.Mutex
 	tail *entry // never nil: a sentinel is installed at construction
@@ -86,12 +88,19 @@ func (c *Channel) History(ctx context.Context, q storage.HistoryQuery) (storage.
 	return c.store.History(ctx, q)
 }
 
-// Initialize seeds the sentinel with the channel's initial watermark
-// serial and marks the channel ready. The storage backend calls this
-// exactly once before any Append. Subsequent calls are no-ops.
+// Initialize seeds the sentinel with the channel's current watermark
+// serial, records the channel's immutable initial serial, and marks
+// the channel ready. The storage backend calls this exactly once
+// before any Append. Subsequent calls are no-ops.
+//
+// current is the cursor fresh attachments use as their attach point
+// (== latest persisted cm's serial, or the freshly-minted seed for an
+// empty channel). initial is the channel's immutable seed — strictly
+// less than every cm ever persisted on this channel — used as the
+// attach point for rewinds that cover the entire channel history.
 //
 // Implements storage.Appender.
-func (c *Channel) Initialize(channelSerial string) {
+func (c *Channel) Initialize(current, initial string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	select {
@@ -101,8 +110,19 @@ func (c *Channel) Initialize(channelSerial string) {
 		return
 	default:
 	}
-	c.tail.cm = &protocol.ChannelMessage{ChannelSerial: channelSerial}
+	c.tail.cm = &protocol.ChannelMessage{ChannelSerial: current}
+	c.initialSerial = initial
 	close(c.ready)
+}
+
+// InitialChannelSerial returns the channel's immutable initial serial,
+// recorded at Initialize time. Used as the ATTACHED.channelSerial for
+// rewind ATTACHes that cover the entire channel history (no
+// predecessor cm exists in storage to use instead).
+//
+// Safe to call only after the channel is ready (Attach has unblocked).
+func (c *Channel) InitialChannelSerial() string {
+	return c.initialSerial
 }
 
 // Append links an already-minted ChannelMessage at the tail as a

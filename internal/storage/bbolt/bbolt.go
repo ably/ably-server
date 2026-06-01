@@ -35,6 +35,13 @@ import (
 var (
 	messagesBucket = []byte("messages")
 	idsBucket      = []byte("ids")
+	// initialsBucket maps channel name → the immutable initial serial
+	// minted when that channel was first materialised. Persisted so the
+	// invariant "initial < every cm in this channel" survives process
+	// restarts — otherwise a fresh process-local generator would mint
+	// a seed at the current wall-clock time, AFTER existing pre-restart
+	// cms.
+	initialsBucket = []byte("initials")
 )
 
 // keySep separates the channel name from the rest of a composite key.
@@ -79,6 +86,9 @@ func Open(opts Options) (*Storage, error) {
 		if _, err := tx.CreateBucketIfNotExists(idsBucket); err != nil {
 			return err
 		}
+		if _, err := tx.CreateBucketIfNotExists(initialsBucket); err != nil {
+			return err
+		}
 		return nil
 	}); err != nil {
 		_ = db.Close()
@@ -92,11 +102,14 @@ func Open(opts Options) (*Storage, error) {
 	}, nil
 }
 
-// Channel returns the ChannelStore for name, binding it to appender
-// on first access. Subsequent calls with the same name return the
-// same instance and ignore the new appender. On first creation the
-// shared generator mints an initial channelSerial and the appender's
-// Initialize is invoked with it before this call returns.
+// Channel returns the ChannelStore for name, binding it to appender on
+// first access. Subsequent calls with the same name return the same
+// instance and ignore the new appender. On first creation the initial
+// channelSerial is loaded from the persisted initials bucket (or
+// minted fresh and persisted if the channel is brand-new); the
+// current channelSerial is the latest persisted cm's serial, or the
+// initial if the channel has no persisted cms. Both are handed to
+// appender.Initialize before this call returns.
 func (s *Storage) Channel(_ context.Context, name string, appender storage.Appender) (storage.ChannelStore, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -110,10 +123,60 @@ func (s *Storage) Channel(_ context.Context, name string, appender storage.Appen
 		appender: appender,
 	}
 	s.channels[name] = cs
-	if appender != nil {
-		appender.Initialize(s.gen.Mint())
+
+	if appender == nil {
+		return cs, nil
 	}
+
+	current, initial, err := s.loadOrMintInitial(name)
+	if err != nil {
+		delete(s.channels, name)
+		return nil, err
+	}
+	appender.Initialize(current, initial)
 	return cs, nil
+}
+
+// loadOrMintInitial returns the channel's (current, initial) serials.
+// initial is loaded from the initials bucket if present; otherwise a
+// fresh seed is minted and persisted. current is the latest persisted
+// cm's serial within the channel's prefix, or initial if there are no
+// persisted cms.
+func (s *Storage) loadOrMintInitial(name string) (current, initial string, err error) {
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		initials := tx.Bucket(initialsBucket)
+		if v := initials.Get([]byte(name)); v != nil {
+			initial = string(v)
+		} else {
+			initial = s.gen.Mint()
+			if perr := initials.Put([]byte(name), []byte(initial)); perr != nil {
+				return fmt.Errorf("persist initial for %q: %w", name, perr)
+			}
+		}
+		// current: latest cm's channelSerial in the messages bucket, or
+		// initial if no cms exist for this channel.
+		messages := tx.Bucket(messagesBucket)
+		prefix := channelPrefix(name)
+		c := messages.Cursor()
+		// Seek to the lex successor of the channel's prefix range, then
+		// step back to land on the channel's last key (if any).
+		k, _ := c.Seek(nextPrefix(prefix))
+		if k == nil {
+			k, _ = c.Last()
+		} else {
+			k, _ = c.Prev()
+		}
+		if k != nil && bytes.HasPrefix(k, prefix) {
+			current = string(k[len(prefix):])
+		} else {
+			current = initial
+		}
+		return nil
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("storage/bbolt: load initial for %q: %w", name, err)
+	}
+	return current, initial, nil
 }
 
 // Close closes the underlying bolt DB.

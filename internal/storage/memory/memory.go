@@ -59,8 +59,9 @@ func New(opts Options) *Storage {
 //
 // On first creation the channel mints an initial channelSerial from
 // the shared generator and hands it to the appender via Initialize
-// before returning — so Attach against a brand-new channel always
-// observes a non-empty watermark.
+// before returning — current and initial are the same value on first
+// materialisation (no publishes yet exist), and both sort strictly
+// less than every cm subsequently persisted on this channel.
 func (s *Storage) Channel(_ context.Context, name string, appender storage.Appender) (storage.ChannelStore, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -70,7 +71,8 @@ func (s *Storage) Channel(_ context.Context, name string, appender storage.Appen
 	cs := newChannelStore(s.gen, appender)
 	s.channels[name] = cs
 	if appender != nil {
-		appender.Initialize(s.gen.Mint())
+		seed := s.gen.Mint()
+		appender.Initialize(seed, seed)
 	}
 	return cs, nil
 }

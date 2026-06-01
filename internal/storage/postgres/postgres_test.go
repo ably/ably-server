@@ -109,8 +109,9 @@ func TestPostgresMigrateIsConcurrentSafe(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate: %v", err)
 	}
-	if !slices.Equal(versions, []string{"0001_initial", "0002_channels_and_serial_mint"}) {
-		t.Errorf("schema_migrations rows = %v, want [0001_initial 0002_channels_and_serial_mint]", versions)
+	want := []string{"0001_initial", "0002_channels_and_serial_mint", "0003_channels_initial_serial"}
+	if !slices.Equal(versions, want) {
+		t.Errorf("schema_migrations rows = %v, want %v", versions, want)
 	}
 
 	// The messages and channels tables must exist and be queryable.
@@ -297,9 +298,9 @@ func newRecordingAppender() *recordingAppender {
 	return &recordingAppender{got: make(chan *protocol.ChannelMessage, 16)}
 }
 
-func (a *recordingAppender) Initialize(channelSerial string) {
+func (a *recordingAppender) Initialize(current, initial string) {
 	// noop for this test: we only assert on Append delivery.
-	_ = channelSerial
+	_, _ = current, initial
 }
 
 func (a *recordingAppender) Append(cm *protocol.ChannelMessage) {

@@ -173,8 +173,8 @@ func (s *Storage) Channel(ctx context.Context, name string, appender storage.App
 	if appender == nil {
 		return cs, nil
 	}
-	var initial string
-	if err := s.pool.QueryRow(ctx, `SELECT ensure_channel($1, $2)`, name, s.series).Scan(&initial); err != nil {
+	var current, initial string
+	if err := s.pool.QueryRow(ctx, `SELECT current_serial, initial_serial FROM ensure_channel($1, $2)`, name, s.series).Scan(&current, &initial); err != nil {
 		// Unwind: the channelStore exists in the map but was never
 		// Initialize'd. Remove it so a retry can re-attempt.
 		s.mu.Lock()
@@ -182,7 +182,7 @@ func (s *Storage) Channel(ctx context.Context, name string, appender storage.App
 		s.mu.Unlock()
 		return nil, fmt.Errorf("storage/postgres: ensure_channel: %w", err)
 	}
-	appender.Initialize(initial)
+	appender.Initialize(current, initial)
 	return cs, nil
 }
 

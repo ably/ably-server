@@ -32,7 +32,7 @@ func newCM(serial string, ids ...string) *protocol.ChannelMessage {
 // they don't have to wire up a real storage to get a ready channel.
 func newReadyChannel(name, seedSerial string) *Channel {
 	c := newChannel(name)
-	c.Initialize(seedSerial)
+	c.Initialize(seedSerial, seedSerial)
 	return c
 }
 
@@ -333,7 +333,7 @@ func TestChannelAttachBlocksUntilInitialize(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	c.Initialize("seed")
+	c.Initialize("seed", "seed")
 
 	select {
 	case err := <-attached:
