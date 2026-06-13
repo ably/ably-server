@@ -41,11 +41,13 @@ the full spec):
 
 - **WebSocket** at `GET /` — `ATTACH` / `DETACH` / `MESSAGE` with
   `channelSerial`-based attachment continuity and `rewind`.
-- **REST** — `POST/GET /channels/{name}/messages`, `GET /time`,
+- **REST** — `POST/GET /channels/{name}/messages`,
+  `GET /channels/{name}/presence[/history]`, `GET /time`,
   `GET /healthz`, `GET /readyz`.
+- **Presence** — enter/update/leave, sync on attach, presence history.
 - **Auth** — API key (Basic) or JWT (HS256) with Ably-style capabilities.
 
-Out of scope: presence, push, integrations, multi-region, Spaces, Chat,
+Out of scope: push, integrations, multi-region, Spaces, Chat,
 LiveObjects, and the rest of the cloud-only product surface.
 
 ## Quickstart

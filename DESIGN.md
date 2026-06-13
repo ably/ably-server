@@ -16,6 +16,10 @@
 >   `DISCONNECTED` to existing WebSockets on SIGTERM.
 > - **§6 retention** — TTL / per-channel cap policy is still being
 >   decided.
+> - **§12 presence** — newly in scope as of this revision; none of it is
+>   implemented yet. The crashed-node membership reaper and lease bump
+>   (§12.5) and `SYNC` paging for very large sets are expected to land
+>   after the core enter/update/leave + sync path.
 >
 > See [`backlog/`](backlog/) for the live task list. The package layout
 > listed in §5 is "proposed" and only loosely matches `internal/`.
@@ -25,7 +29,7 @@
 ### Goals
 
 - A single Go binary, `ably-server`, that speaks Ably's realtime WebSocket
-  protocol and the core REST pub/sub endpoints.
+  protocol and the core REST pub/sub and presence endpoints.
 - Drop-in for **local development** and **CI** — existing Ably client SDKs
   should connect to it without code changes (only host/port/TLS overrides).
 - **Self-hostable** for single-region deployments where the operator does not
@@ -40,9 +44,6 @@
 ### Non-goals
 
 - Multi-region / global distribution.
-- Presence (members on a channel, presence enter/update/leave, presence
-  sync, presence history) — out of scope for this design; will be
-  considered separately.
 - Ably-cloud-only product surface: integrations / rules, push notifications,
   Spaces, Chat, LiveObjects/LiveSync, message queues, account/app management
   APIs, statistics endpoints, the `/keys` admin API.
@@ -84,7 +85,9 @@ Supported `Action` values:
 | `ATTACHED` (11) | | ✓ | attach ack (see §4) |
 | `DETACH` (12) | ✓ | | client requests channel detach |
 | `DETACHED` (13) | | ✓ | detach ack |
+| `PRESENCE` (14) | ✓ | ✓ | presence enter/update/leave + delivery (see §12) |
 | `MESSAGE` (15) | ✓ | ✓ | publish + delivery |
+| `SYNC` (16) | | ✓ | presence set sync after attach (see §12) |
 
 ### 2.2 REST
 
@@ -96,6 +99,8 @@ All REST endpoints live under the root and accept either `application/json` or
 |---|---|---|
 | POST | `/channels/{channel}/messages` | publish 1..N messages |
 | GET | `/channels/{channel}/messages` | history (paginated) |
+| GET | `/channels/{channel}/presence` | current presence members (see §12) |
+| GET | `/channels/{channel}/presence/history` | presence history (paginated) |
 | GET | `/time` | server time (ms since epoch) |
 | GET | `/healthz` | liveness — no auth |
 | GET | `/readyz` | readiness — DB ping in `cluster` mode |
@@ -140,7 +145,11 @@ JWT claims:
   channel name. Character classes (`[a-z]`) and `**` are not supported.
   The `[queue]*` / `[meta]*` resource prefixes do not apply since neither
   queues nor metachannels are in scope.
-- `<op>` is one of `publish`, `subscribe`, `history`. `*` matches any op.
+- `<op>` is one of `publish`, `subscribe`, `presence`, `history`. `*`
+  matches any op. `subscribe` covers both receiving messages and
+  receiving presence (events + sync + the current set); `presence`
+  covers registering presence (enter/update/leave); `history` covers
+  both message and presence history.
 
 Every authenticated request resolves to a **capability set**. For each
 operation the server computes the union of granted ops across all matching
@@ -151,9 +160,14 @@ operation is rejected:
 |---|---|
 | WS `ATTACH` flag `SUBSCRIBE` | `subscribe` |
 | WS `ATTACH` flag `PUBLISH` | `publish` |
+| WS `ATTACH` flag `PRESENCE` | `presence` |
+| WS `ATTACH` flag `PRESENCE_SUBSCRIBE` | `subscribe` |
 | WS inbound `MESSAGE` | `publish` (and the attachment must hold the `PUBLISH` mode flag, granted at attach time) |
+| WS inbound `PRESENCE` | `presence` (and the attachment must hold the `PRESENCE` mode flag) |
 | REST `POST .../messages` | `publish` |
 | REST `GET .../messages` | `history` |
+| REST `GET .../presence` | `subscribe` |
+| REST `GET .../presence/history` | `history` |
 
 `ATTACH` mode resolution: the effective mode set delivered in `ATTACHED.flags`
 is `requested ∩ capability-permitted`. Empty intersection → `ERROR` with
@@ -188,6 +202,11 @@ the `clientId` query parameter.
 
 A connection or REST request that fails the table above is rejected at
 auth time (WS: `ERROR` then close; REST: `401`).
+
+Presence imposes a further requirement at *use* time rather than auth
+time: a member must be identified, so a connection that resolved to no
+`clientId` (anonymous) cannot enter presence, and a wildcard bearer must
+select a concrete `clientId` to enter (see §12.3).
 
 ## 4. Attachments
 
@@ -224,25 +243,43 @@ any replay or live messages follow it. Its fields:
 
 ### 4.2 Modes
 
-The `ATTACH.flags` bitfield selects the subset of `SUBSCRIBE`, `PUBLISH`
-the client wants on this attachment. If `flags` is absent or zero the
-server treats it as the full set (matches SDK default).
+The `ATTACH.flags` bitfield selects the subset of the channel modes the
+client wants on this attachment. The mode bits occupy the high end of
+the flags word, matching Ably's wire constants:
+
+| Mode | Bit | Grants |
+|---|---|---|
+| `PRESENCE` | `1 << 16` | enter/update/leave presence (see §12) |
+| `PUBLISH` | `1 << 17` | publish `MESSAGE` |
+| `SUBSCRIBE` | `1 << 18` | receive `MESSAGE` |
+| `PRESENCE_SUBSCRIBE` | `1 << 19` | receive `PRESENCE` + presence sync |
+
+If `flags` carries no mode bits the server treats it as the full set
+(matches SDK default).
 
 The effective mode set is `requested ∩ capability-permitted`, where the
 permitted set is derived from the per-op capability mapping in §3:
 
-- `SUBSCRIBE` permitted iff cap grants `subscribe` on the channel.
+- `SUBSCRIBE` and `PRESENCE_SUBSCRIBE` permitted iff cap grants
+  `subscribe` on the channel.
 - `PUBLISH` permitted iff cap grants `publish`.
+- `PRESENCE` permitted iff cap grants `presence`.
 
 Empty intersection → the attach is rejected with `ERROR` (`code: 40160`)
 and no channel state is created. Otherwise `ATTACHED.flags` carries the
-effective set.
+effective set, plus the `HAS_PRESENCE` flag (`1 << 0`) when the channel
+has a non-empty presence set, so the SDK knows a `SYNC` will follow
+(§12.4).
 
 Once attached, modes gate frame flow:
 
 - An attachment without `SUBSCRIBE` does not receive `MESSAGE` frames.
+- An attachment without `PRESENCE_SUBSCRIBE` receives neither live
+  `PRESENCE` frames nor the post-attach `SYNC`.
 - Inbound `MESSAGE` from an attachment without `PUBLISH` is rejected with
   `NACK`.
+- Inbound `PRESENCE` from an attachment without `PRESENCE` is rejected
+  with `NACK`.
 
 ### 4.3 Replay (`channelSerial` and `rewind`)
 
@@ -442,7 +479,20 @@ exposing two operations:
   written.
 - `History(ctx, query)` — bounded forward range scan ordered by
   channelSerial; backs both the REST history endpoint and attachment
-  resume gap-fills (§4.3).
+  resume gap-fills (§4.3). Messages and presence share one stream and
+  one channelSerial namespace (§12.1), so the query carries a kind
+  selector: a message-history scan skips presence cms and vice versa.
+- `StorePresence(ctx, presence)` — the presence analogue of `Store`
+  (§12.2): mints a channelSerial, stamps each `PresenceMessage.serial`,
+  persists the presence cm onto the same stream, and in the same atomic
+  step folds it into the channel's **membership set** (ENTER/UPDATE
+  upsert the member keyed by `connectionId:clientId`, LEAVE removes it).
+  The Appender then delivers the cm exactly as for a message publish.
+- `Members(ctx)` — returns the current membership set plus the
+  channelSerial it is current as-of; backs presence sync (§12.4) and the
+  REST `GET .../presence` endpoint. The set is owned by the backend
+  (§12.5): a map in memory, in-memory in bbolt, a `presence` table in
+  Postgres.
 
 Each `ChannelStore` is created with an `Appender` callback —
 `Storage.Channel(name, appender) ChannelStore`. The Appender is the
@@ -520,11 +570,12 @@ Schema sketch:
 -- history reads AND time-based retention without a separate
 -- created_at column.
 CREATE TABLE messages (
-  channel        TEXT  NOT NULL,
-  channel_serial TEXT  NOT NULL,    -- "<ts>-<ctr>@<series>" (§8)
-  idx            INT   NOT NULL,    -- position within the publish batch
-  id             TEXT,              -- nullable, client-supplied idempotency key
-  payload        BYTEA NOT NULL,    -- msgpack-encoded protocol.Message
+  channel        TEXT     NOT NULL,
+  channel_serial TEXT     NOT NULL,    -- "<ts>-<ctr>@<series>" (§8)
+  idx            INT      NOT NULL,    -- position within the publish batch
+  id             TEXT,                 -- nullable, client-supplied idempotency key
+  kind           TEXT     NOT NULL DEFAULT 'message',  -- 'message' | 'presence' (§12.1)
+  payload        BYTEA    NOT NULL,    -- msgpack protocol.Message or PresenceMessage, per kind
   PRIMARY KEY (channel, channel_serial, idx)
 );
 
@@ -533,7 +584,28 @@ CREATE TABLE messages (
 -- publishes without an id never collide.
 CREATE UNIQUE INDEX messages_idempotency_idx
   ON messages (channel, id) WHERE id IS NOT NULL;
+
+-- Derived presence membership set: one row per live member, keyed by
+-- connectionId:clientId. ENTER/UPDATE upsert, LEAVE deletes — maintained
+-- in the same transaction as the presence cm's INSERT above, so the set
+-- stays consistent with the stream. node_id + expires_at drive the
+-- crashed-node reaper (§12.5).
+CREATE TABLE presence (
+  channel        TEXT        NOT NULL,
+  connection_id  TEXT        NOT NULL,
+  client_id      TEXT        NOT NULL,
+  channel_serial TEXT        NOT NULL,  -- serial of the latest ENTER/UPDATE
+  payload        BYTEA       NOT NULL,  -- msgpack-encoded protocol.PresenceMessage
+  node_id        TEXT        NOT NULL,  -- owning node, for lease bump + reap
+  expires_at     TIMESTAMPTZ NOT NULL,  -- liveness lease; reaper deletes once past
+  PRIMARY KEY (channel, connection_id, client_id)
+);
 ```
+
+History scans add `kind = 'message'` (or `'presence'`) to the predicates
+above; the retention sweep deletes both kinds by channel_serial range.
+The membership-set `presence` table is independent of the message-stream
+retention sweep.
 
 The DDL ships as versioned migrations under
 `internal/storage/postgres/migrations/*.sql` (e.g. `0001_initial.sql`)
@@ -594,6 +666,11 @@ unified across deployment modes: publish-path callers call
 Appender callback registered against each ChannelStore delivers the
 committed cm to `channel.Append(cm)`. The Appender is the only
 writer to the linked list in every mode.
+
+Presence enter/update/leave ride this exact path: a presence operation
+is a cm like any other (carrying `Presence` rather than `Messages`) and
+reaches subscribers through the identical `storage → Append` mechanism,
+including the cross-node NOTIFY round-trip in cluster mode (§12.2).
 
 ### 7.1 Single-process modes (`memory`, `disk`)
 
@@ -681,7 +758,16 @@ should use Ably or fork.
   on a channel as exactly one ChannelMessage containing one or more
   contained Messages. It is also the unit subscribers observe on the
   wire (one outbound `MESSAGE` frame per ChannelMessage) and the
-  unit storage persists.
+  unit storage persists. A presence publish is the same unit carrying
+  `Presence []*PresenceMessage` instead of `Messages` (§12.1), observed
+  on the wire as one `PRESENCE` frame.
+- **PresenceMessage**: a single presence operation within a presence
+  ChannelMessage — the presence-stream analogue of Message. It carries
+  an `action` (ENTER/UPDATE/LEAVE inbound; PRESENT in sync; LEAVE/ABSENT
+  outbound), a `clientId`, a server-stamped `connectionId`, and optional
+  `data`. Like Message it splits `id` (optional, client-supplied
+  idempotency key) from `serial` (server-assigned, `<channelSerial>:<idx>`).
+  A member's key in the presence set is `connectionId:clientId`.
 - **channelSerial** (atomic-publish identifier): a
   lexicographically-sortable string assigned by the server when a
   ChannelMessage lands on a channel, modelled on Ably cloud's
@@ -791,7 +877,191 @@ clients are told to reconnect; the next node accepts the new connection
 and, on each `ATTACH`, replays missed messages from Postgres using the
 client-supplied `channelSerial`. No connection state crosses nodes.
 
-## 12. Testing strategy
+## 12. Presence
+
+Presence lets clients announce themselves as **members** of a channel —
+each identified by a `clientId` — and observe other members entering,
+updating their state, and leaving. It is modelled as a second kind of
+message riding the channel's existing stream, plus a derived
+**membership set** the server materialises so a late-arriving subscriber
+can be brought up to date without replaying the whole stream.
+
+### 12.1 Model
+
+A presence operation is a publish like any other: it lands on the
+channel as one ChannelMessage and flows through the unified
+`storage → Appender.Append` path (§7). The only difference is the
+payload — a ChannelMessage carries **either** `Messages` (a data
+publish) **or** `Presence` (a presence publish), never both:
+
+```go
+type PresenceMessage struct {
+    ID           string         // client-supplied, optional, idempotency (§8)
+    Serial       string         // server-assigned, "<channelSerial>:<idx>" (§8)
+    Action       PresenceAction // ENTER | LEAVE | UPDATE | PRESENT | ABSENT
+    ClientID     string
+    ConnectionID string
+    Data         any
+    Encoding     string
+    Timestamp    int64
+}
+```
+
+`ID` and `Serial` carry the same split as on `Message` (§8): `ID` is the
+optional client-supplied idempotency key, `Serial` is the server-assigned
+`<channelSerial>:<idx>`.
+
+`PresenceAction` matches Ably's wire enum: `ABSENT (0)`, `PRESENT (1)`,
+`ENTER (2)`, `LEAVE (3)`, `UPDATE (4)`. A member's identity — its key in
+the set — is `connectionId:clientId`, so the same `clientId` present
+over two connections is two distinct members.
+
+Messages and presence share **one ordered stream and one channelSerial
+namespace**, so a single live list, a single Appender, and a single
+NOTIFY path serve both. channelSerials are sortable cursors, not a dense
+sequence, so the presence cms interleaved among data cms simply occupy
+their own serials; a message-history scan skips them and a
+presence-history scan skips data cms (the `kind` selector on
+`storage.History`, §6). On the live linked list a subscriber's cursor
+walks every cm and forwards each per its mode flags (§4.2): a
+`SUBSCRIBE`-only attachment emits `MESSAGE` frames and ignores presence
+cms; a `PRESENCE_SUBSCRIBE`-only attachment does the reverse.
+
+The **membership set** is the fold of the presence stream: ENTER/UPDATE
+establish or refresh a member (latest data wins), LEAVE removes it. The
+server materialises this set (§12.5) so it can answer sync and
+`GET .../presence` directly rather than re-deriving it from history on
+every read.
+
+### 12.2 Publishing presence (enter / update / leave)
+
+An inbound `PRESENCE` frame carries `presence[]` of PresenceMessages with
+action ENTER, UPDATE, or LEAVE, plus a `msgSerial` for flow control. The
+connection:
+
+1. Authorises — the attachment must hold the `PRESENCE` mode flag (which
+   required the `presence` capability at attach time, §3.1); otherwise
+   `NACK`.
+2. Resolves and validates `clientId` (§12.3); a bad clientId → `NACK`.
+3. Stamps `connectionId` and calls `channel.StorePresence(ctx, presence)`,
+   which mints the channelSerial, stamps each `PresenceMessage.serial`,
+   persists the presence cm onto the stream, folds it into the
+   membership set, and — via the Appender — links it onto the live list.
+   A client-supplied `PresenceMessage.id` is honoured for idempotency on
+   the same per-channel index as message `id`s (§6).
+4. Replies `ACK` / `NACK` on the `msgSerial`, exactly as for a data
+   publish (§5.2).
+
+Subscribers with `PRESENCE_SUBSCRIBE` observe the event as an outbound
+`PRESENCE` frame delivered by their attachment cursor, identically to
+how `MESSAGE` frames are delivered (§4.4).
+
+### 12.3 Client identity
+
+A presence member must be identified, so presence requires a concrete
+`clientId`. The rules extend §3.2:
+
+- The PresenceMessage's `clientId` must equal the connection's resolved
+  `clientId`. A connection with a concrete resolved clientId may omit it
+  on the frame (the server stamps its own); supplying a *different* one
+  → `NACK`.
+- A connection whose token asserts the `*` (wildcard) clientId may enter
+  any concrete clientId but must supply one — `*` is never itself a
+  member identity (§3.2).
+- A connection with no resolved clientId (anonymous) cannot enter
+  presence → `NACK` (`code: 91000`).
+
+`connectionId` is always stamped by the server and cannot be set by the
+client.
+
+### 12.4 Sync
+
+When a client attaches with `PRESENCE_SUBSCRIBE` to a channel whose
+membership set is non-empty, the server sets the `HAS_PRESENCE` flag on
+`ATTACHED` and then delivers the current set as one or more `SYNC`
+frames before resuming live delivery:
+
+```
+client                         server
+  │ ── ATTACH(flags incl. PRESENCE_SUBSCRIBE) ──▶
+  │   ◀── ATTACHED(flags incl. HAS_PRESENCE) ───│
+  │   ◀── SYNC(presence[], channelSerial="<s>:<cursor>") ─│  × pages
+  │   ◀── SYNC(presence[], channelSerial="<s>:") ────────│  final (empty cursor)
+  │   ◀── PRESENCE … (live) ─────────────────────│
+```
+
+Each `SYNC` frame carries a page of members as PresenceMessages with
+action `PRESENT`. The `channelSerial` field doubles as the sync cursor:
+`<serial>:<cursor>` while pages follow, `<serial>:` (empty cursor part)
+on the final page to mark completion. At the scale we target the set
+usually fits a single frame; paging exists for large sets and can land
+incrementally (see the Status callout).
+
+Consistency between the snapshot and live delivery is resolved by the
+**client's merge**, exactly as in Ably: every PresenceMessage carries a
+serial-based `serial` and the SDK keeps the newest per member key. A member
+that enters or leaves in the window between the snapshot's as-of serial
+and the live attach point arrives again on the cursor — a duplicate
+ENTER is idempotent and a later LEAVE supersedes a stale PRESENT — so no
+server-side coordination beyond taking the snapshot at-or-after the
+attach point is required.
+
+### 12.5 Membership set & liveness
+
+The membership set is owned by the **storage backend**, alongside serial
+state and the idempotency index — `StorePresence` folds each operation
+into it transactionally and `Members` reads it (§6). Per backend:
+
+- **memory** — a `map[memberKey]*PresenceMessage` per channel.
+- **disk (bbolt)** — held in memory, *not* persisted. Presence is
+  connection-scoped and no connection survives a process restart (§4.3),
+  so the set is correctly empty on boot. Presence *history* still
+  persists, as ordinary cms on the messages stream.
+- **cluster (Postgres)** — the `presence` table (§6.3), upserted/deleted
+  in the same transaction as the stream insert so the set is globally
+  authoritative across nodes. A node serves sync and `GET .../presence`
+  straight from `Members` (a `SELECT` against this table); it need never
+  have witnessed the original ENTERs.
+
+**Liveness.** A member lives exactly as long as the connection that
+entered it. There is no presence grace period — consistent with §4.3 the
+server holds no per-connection state across disconnects, so there is no
+connection-resume window to keep a member alive for. (SDKs re-enter
+presence on reconnect; the server treats that as a fresh ENTER under the
+new `connectionId`.) Departure:
+
+- **Explicit LEAVE, DETACH, or CLOSE** — processed as a LEAVE publish.
+- **Connection drop (read error, heartbeat timeout) and graceful
+  shutdown (§11)** — when the connection loop exits it synthesises a
+  LEAVE for every member it entered (it tracks its own
+  `(channel, clientId)` entries) and publishes them through
+  `StorePresence`, so the departures persist, fold out of the set, and
+  reach every subscriber on every node via the normal NOTIFY path.
+
+**Crashed cluster nodes.** A node that dies without running teardown
+leaves orphaned rows in the `presence` table — the one case the LEAVE
+path cannot cover, and a cluster-only one (a single-process crash takes
+the whole set down with it). Each `presence` row therefore records its
+owning `node_id` and an `expires_at`; a live node bumps `expires_at` for
+all of its rows on the heartbeat tick (§5.2). A periodic reaper runs
+`DELETE FROM presence WHERE expires_at < now() RETURNING …` — Postgres
+row locking means exactly one node's `RETURNING` yields a given row, and
+that node synthesises the LEAVE for it through the normal publish path.
+This bounds orphan visibility to one lease window.
+
+### 12.6 REST
+
+- `GET /channels/{channel}/presence` — the current membership set,
+  served from `Members`; requires `subscribe`. Returns a PresenceMessage
+  array (each with action `PRESENT`).
+- `GET /channels/{channel}/presence/history` — presence history, a
+  `kind=presence` history scan (§12.1) paginated with the same `Link`
+  convention as message history (§2.2); requires `history`.
+
+There is no REST *write* surface for presence: a member is inherently
+bound to a realtime connection, so entering presence is realtime-only.
+
+## 13. Testing strategy
 
 - **Unit**: per-package; mock-free where practical (the storage interface
   has an in-memory implementation, exercised by the same test suite as the
@@ -806,7 +1076,7 @@ There is no existing Ably protocol conformance suite to target; the
 ably-go integration tests are the de-facto external check on SDK
 compatibility.
 
-## 13. Project layout & licensing
+## 14. Project layout & licensing
 
 - License: **Apache 2.0** (matches ably-go).
 - Module: `github.com/ably/ably-server`.
