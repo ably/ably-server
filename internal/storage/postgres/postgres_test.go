@@ -109,14 +109,17 @@ func TestPostgresMigrateIsConcurrentSafe(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate: %v", err)
 	}
-	want := []string{"0001_initial", "0002_channels_and_serial_mint", "0003_channels_initial_serial"}
+	want := []string{"0001_initial", "0002_channels_and_serial_mint", "0003_channels_initial_serial", "0004_presence"}
 	if !slices.Equal(versions, want) {
 		t.Errorf("schema_migrations rows = %v, want %v", versions, want)
 	}
 
-	// The messages and channels tables must exist and be queryable.
-	if _, err := conn.Exec(ctx, `SELECT 1 FROM messages LIMIT 0`); err != nil {
-		t.Errorf("messages table not present: %v", err)
+	// The log, channels, and presence tables must exist and be queryable.
+	if _, err := conn.Exec(ctx, `SELECT 1 FROM channel_messages LIMIT 0`); err != nil {
+		t.Errorf("channel_messages table not present: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `SELECT 1 FROM presence LIMIT 0`); err != nil {
+		t.Errorf("presence table not present: %v", err)
 	}
 	if _, err := conn.Exec(ctx, `SELECT 1 FROM channels LIMIT 0`); err != nil {
 		t.Errorf("channels table not present: %v", err)

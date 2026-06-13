@@ -44,10 +44,10 @@ type entry struct {
 // and close ready. Attach blocks on ready, so a caller cannot observe
 // an empty channelSerial.
 type Channel struct {
-	name           string
-	store          storage.ChannelStore
-	ready          chan struct{}
-	initialSerial  string // immutable after Initialize; sorts strictly less than every cm in this channel
+	name          string
+	store         storage.ChannelStore
+	ready         chan struct{}
+	initialSerial string // immutable after Initialize; sorts strictly less than every cm in this channel
 
 	mu   sync.Mutex
 	tail *entry // never nil: a sentinel is installed at construction
@@ -131,9 +131,11 @@ func (c *Channel) InitialChannelSerial() string {
 // deliver a persisted cm to subscribers (the publisher's own publish
 // in memory/bbolt; every node's publish in cluster mode).
 //
-// A no-op when cm is nil or carries no Messages.
+// A no-op when cm is nil or carries neither Messages nor Presence — a
+// presence cm (Presence populated, Messages empty) links onto the list
+// exactly like a message cm (DESIGN.md §12.2).
 func (c *Channel) Append(cm *protocol.ChannelMessage) {
-	if cm == nil || len(cm.Messages) == 0 {
+	if cm == nil || (len(cm.Messages) == 0 && len(cm.Presence) == 0) {
 		return
 	}
 	c.mu.Lock()

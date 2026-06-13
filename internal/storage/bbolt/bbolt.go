@@ -2,14 +2,21 @@
 // State lives in a single bolt file at the configured data path with
 // two top-level buckets:
 //
-//   - messages: keyed "<channel>\0<channelSerial>", value is the
-//     msgpack-encoded protocol.ChannelMessage. bbolt's byte-order
-//     iteration over a "<channel>\0" prefix yields a channel's
-//     ChannelMessages in publish order.
+//   - channel_messages: the append-only log, keyed
+//     "<channel>\0<channelSerial>", value is the msgpack-encoded
+//     protocol.ChannelMessage (a message or presence cm). bbolt's
+//     byte-order iteration over a "<channel>\0" prefix yields a
+//     channel's ChannelMessages in publish order.
 //   - ids: keyed "<channel>\0<Message.id>", value is the channelSerial
 //     the ID landed in. bbolt has no secondary indexes, so this is
 //     the manual equivalent of Postgres's partial UNIQUE
 //     idempotency index.
+//
+// The presence membership set is held in memory (per channelStore),
+// NOT persisted: presence is connection-scoped and no connection
+// survives a process restart, so the set is correctly empty on Open
+// (DESIGN.md §12.5). Presence history still persists as ordinary cms
+// in channel_messages.
 //
 // Per-process seriesId is regenerated on every Open — the same
 // rationale as the Postgres backend (DESIGN.md §8). Generator
@@ -22,6 +29,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/vmihailenco/msgpack/v5"
@@ -33,8 +41,8 @@ import (
 )
 
 var (
-	messagesBucket = []byte("messages")
-	idsBucket      = []byte("ids")
+	channelMessagesBucket = []byte("channel_messages")
+	idsBucket             = []byte("ids")
 	// initialsBucket maps channel name → the immutable initial serial
 	// minted when that channel was first materialised. Persisted so the
 	// invariant "initial < every cm in this channel" survives process
@@ -80,7 +88,7 @@ func Open(opts Options) (*Storage, error) {
 		return nil, fmt.Errorf("storage/bbolt: open %q: %w", opts.Path, err)
 	}
 	if err := db.Update(func(tx *bolt.Tx) error {
-		if _, err := tx.CreateBucketIfNotExists(messagesBucket); err != nil {
+		if _, err := tx.CreateBucketIfNotExists(channelMessagesBucket); err != nil {
 			return err
 		}
 		if _, err := tx.CreateBucketIfNotExists(idsBucket); err != nil {
@@ -155,7 +163,7 @@ func (s *Storage) loadOrMintInitial(name string) (current, initial string, err e
 		}
 		// current: latest cm's channelSerial in the messages bucket, or
 		// initial if no cms exist for this channel.
-		messages := tx.Bucket(messagesBucket)
+		messages := tx.Bucket(channelMessagesBucket)
 		prefix := channelPrefix(name)
 		c := messages.Cursor()
 		// Seek to the lex successor of the channel's prefix range, then
@@ -211,6 +219,11 @@ type channelStore struct {
 	gen      *serial.Generator
 	name     string
 	appender storage.Appender
+
+	// members is the in-memory presence set, guarded by mu. Not
+	// persisted — empty on Open (DESIGN.md §12.5). Lazily allocated.
+	mu      sync.Mutex
+	members map[string]*protocol.PresenceMessage
 }
 
 func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
@@ -226,7 +239,7 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 		idempotent bool
 	)
 	err := cs.db.Update(func(tx *bolt.Tx) error {
-		messages := tx.Bucket(messagesBucket)
+		messages := tx.Bucket(channelMessagesBucket)
 		ids := tx.Bucket(idsBucket)
 
 		// Idempotency: any contained ID that's already indexed makes
@@ -293,6 +306,137 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	return resultCM, idempotent, nil
 }
 
+// StorePresence persists a presence publish onto the channel_messages
+// log (so it appears in presence history) and folds it into the
+// in-memory membership set. The membership set is process-lifetime, not
+// persisted (DESIGN.md §12.5). Idempotency shares the ids bucket with
+// messages. cs.mu is held across the persist + fold so a concurrent
+// Members observes a consistent set; the appender fires after unlock.
+func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.PresenceMessage) (*protocol.ChannelMessage, bool, error) {
+	if len(presence) == 0 {
+		return nil, false, errors.New("storage/bbolt: StorePresence with no messages")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+
+	cs.mu.Lock()
+
+	var (
+		resultCM   *protocol.ChannelMessage
+		idempotent bool
+	)
+	err := cs.db.Update(func(tx *bolt.Tx) error {
+		messages := tx.Bucket(channelMessagesBucket)
+		ids := tx.Bucket(idsBucket)
+
+		for _, p := range presence {
+			if p.ID == "" {
+				continue
+			}
+			if existingCS := ids.Get(channelKey(cs.name, p.ID)); existingCS != nil {
+				blob := messages.Get(channelKey(cs.name, string(existingCS)))
+				if blob == nil {
+					return fmt.Errorf("storage/bbolt: id index points to missing ChannelMessage %q", existingCS)
+				}
+				var original protocol.ChannelMessage
+				if err := msgpack.Unmarshal(blob, &original); err != nil {
+					return fmt.Errorf("storage/bbolt: decode original ChannelMessage: %w", err)
+				}
+				resultCM = &original
+				idempotent = true
+				return nil
+			}
+		}
+
+		channelSerial := cs.gen.Mint()
+		for i, p := range presence {
+			p.Serial = serial.MessageSerial(channelSerial, i)
+		}
+		cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Presence: presence}
+		blob, err := msgpack.Marshal(cm)
+		if err != nil {
+			return fmt.Errorf("storage/bbolt: encode presence ChannelMessage: %w", err)
+		}
+		if err := messages.Put(channelKey(cs.name, channelSerial), blob); err != nil {
+			return err
+		}
+		for _, p := range presence {
+			if p.ID == "" {
+				continue
+			}
+			if err := ids.Put(channelKey(cs.name, p.ID), []byte(channelSerial)); err != nil {
+				return err
+			}
+		}
+		resultCM = cm
+		return nil
+	})
+	if err != nil {
+		cs.mu.Unlock()
+		return nil, false, err
+	}
+
+	if !idempotent {
+		if cs.members == nil {
+			cs.members = make(map[string]*protocol.PresenceMessage)
+		}
+		for _, p := range resultCM.Presence {
+			key := storage.MemberKey(p.ConnectionID, p.ClientID)
+			switch p.Action {
+			case protocol.PresenceLeave, protocol.PresenceAbsent:
+				delete(cs.members, key)
+			default: // Enter, Update, Present
+				cs.members[key] = p
+			}
+		}
+	}
+	cs.mu.Unlock()
+
+	if !idempotent && cs.appender != nil {
+		cs.appender.Append(resultCM)
+	}
+	return resultCM, idempotent, nil
+}
+
+// Members returns the in-memory membership set (sorted by Serial) plus
+// the channel's current watermark — the last channelSerial persisted in
+// the log, or empty if the channel has no cms.
+func (cs *channelStore) Members(ctx context.Context) ([]*protocol.PresenceMessage, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+
+	cs.mu.Lock()
+	out := make([]*protocol.PresenceMessage, 0, len(cs.members))
+	for _, p := range cs.members {
+		out = append(out, p)
+	}
+	cs.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].Serial < out[j].Serial })
+
+	var asOf string
+	err := cs.db.View(func(tx *bolt.Tx) error {
+		messages := tx.Bucket(channelMessagesBucket)
+		prefix := channelPrefix(cs.name)
+		c := messages.Cursor()
+		k, _ := c.Seek(nextPrefix(prefix))
+		if k == nil {
+			k, _ = c.Last()
+		} else {
+			k, _ = c.Prev()
+		}
+		if k != nil && bytes.HasPrefix(k, prefix) {
+			asOf = string(k[len(prefix):])
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("storage/bbolt: Members watermark: %w", err)
+	}
+	return out, asOf, nil
+}
+
 // History runs a direction-aware range scan over the channel's
 // ChannelMessages. Time bounds (q.Start / q.End) are translated to
 // byte-comparable lower/upper key bounds against the
@@ -311,6 +455,7 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 	}
 
 	prefix := channelPrefix(cs.name)
+	wantKind := q.Kind.Normalize()
 	timeLower, timeUpper := serial.TimestampBounds(q.Start, q.End)
 	forwards := q.Direction == storage.DirectionForwards
 	limit := q.Limit
@@ -337,10 +482,10 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 	var page storage.HistoryPage
 	count := 0
 
-	// emitMessage appends m onto the trailing ChannelMessage when its
-	// channelSerial matches, or starts a fresh entry otherwise. It
-	// returns false once Limit is reached, signalling outer-loop exit.
-	emitMessage := func(channelSerial string, m *protocol.Message) bool {
+	// emit appends one item (Message or PresenceMessage, via put) onto
+	// the trailing ChannelMessage when its channelSerial matches, or
+	// starts a fresh entry otherwise. Returns false once Limit is hit.
+	emit := func(channelSerial string, put func(dst *protocol.ChannelMessage)) bool {
 		if limit > 0 && count >= limit {
 			page.HasMore = true
 			return false
@@ -352,13 +497,13 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 			current = &protocol.ChannelMessage{ChannelSerial: channelSerial}
 			page.ChannelMessages = append(page.ChannelMessages, current)
 		}
-		current.Messages = append(current.Messages, m)
+		put(current)
 		count++
 		return true
 	}
 
 	err := cs.db.View(func(tx *bolt.Tx) error {
-		messages := tx.Bucket(messagesBucket)
+		messages := tx.Bucket(channelMessagesBucket)
 		if messages == nil {
 			return nil
 		}
@@ -381,11 +526,11 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 				if err != nil {
 					return err
 				}
-				for idx, m := range cm.Messages {
-					if cursor != "" && serial.MessageSerial(cm.ChannelSerial, idx) <= cursor {
+				for _, it := range storage.CMItems(cm, wantKind) {
+					if cursor != "" && it.Serial <= cursor {
 						continue
 					}
-					if !emitMessage(cm.ChannelSerial, m) {
+					if !emit(cm.ChannelSerial, it.Append) {
 						return nil
 					}
 				}
@@ -410,11 +555,12 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 			if err != nil {
 				return err
 			}
-			for idx := len(cm.Messages) - 1; idx >= 0; idx-- {
-				if cursor != "" && serial.MessageSerial(cm.ChannelSerial, idx) >= cursor {
+			items := storage.CMItems(cm, wantKind)
+			for idx := len(items) - 1; idx >= 0; idx-- {
+				if cursor != "" && items[idx].Serial >= cursor {
 					continue
 				}
-				if !emitMessage(cm.ChannelSerial, cm.Messages[idx]) {
+				if !emit(cm.ChannelSerial, items[idx].Append) {
 					return nil
 				}
 			}

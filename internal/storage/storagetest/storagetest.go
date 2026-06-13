@@ -825,6 +825,169 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 			prev = cm.ChannelSerial
 		}
 	})
+
+	t.Run("PresenceEnterPopulatesMembers", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "room")
+		mustEnter(t, ch, "conn-1", "alice", "hi")
+		mustEnter(t, ch, "conn-2", "bob", "yo")
+
+		members, asOf, err := ch.Members(context.Background())
+		if err != nil {
+			t.Fatalf("Members: %v", err)
+		}
+		if asOf == "" {
+			t.Error("asOf serial empty after presence publishes")
+		}
+		got := membersByKey(members)
+		if len(got) != 2 {
+			t.Fatalf("members = %d, want 2", len(got))
+		}
+		if got[storage.MemberKey("conn-1", "alice")] == nil {
+			t.Error("alice (conn-1) missing from members")
+		}
+		if got[storage.MemberKey("conn-2", "bob")] == nil {
+			t.Error("bob (conn-2) missing from members")
+		}
+	})
+
+	t.Run("PresenceUpdateReplacesMember", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "room")
+		mustEnter(t, ch, "conn-1", "alice", "v1")
+		mustPresence(t, ch, &protocol.PresenceMessage{
+			Action: protocol.PresenceUpdate, ConnectionID: "conn-1", ClientID: "alice", Data: "v2",
+		})
+		members, _, err := ch.Members(context.Background())
+		if err != nil {
+			t.Fatalf("Members: %v", err)
+		}
+		if len(members) != 1 {
+			t.Fatalf("members = %d, want 1 (update replaces, not adds)", len(members))
+		}
+		if members[0].Data != "v2" {
+			t.Errorf("member Data = %v, want v2 (latest wins)", members[0].Data)
+		}
+	})
+
+	t.Run("PresenceLeaveRemovesMember", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "room")
+		mustEnter(t, ch, "conn-1", "alice", "hi")
+		mustPresence(t, ch, &protocol.PresenceMessage{
+			Action: protocol.PresenceLeave, ConnectionID: "conn-1", ClientID: "alice",
+		})
+		members, _, err := ch.Members(context.Background())
+		if err != nil {
+			t.Fatalf("Members: %v", err)
+		}
+		if len(members) != 0 {
+			t.Errorf("members = %d, want 0 after leave", len(members))
+		}
+	})
+
+	t.Run("PresenceSameClientDistinctConnsAreDistinctMembers", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "room")
+		mustEnter(t, ch, "conn-1", "alice", "")
+		mustEnter(t, ch, "conn-2", "alice", "")
+		members, _, err := ch.Members(context.Background())
+		if err != nil {
+			t.Fatalf("Members: %v", err)
+		}
+		if len(members) != 2 {
+			t.Errorf("members = %d, want 2 (same clientId over two connections)", len(members))
+		}
+	})
+
+	t.Run("PresenceIdempotentByID", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "room")
+		first, idemp, err := ch.StorePresence(context.Background(), []*protocol.PresenceMessage{
+			{ID: "p1", Action: protocol.PresenceEnter, ConnectionID: "conn-1", ClientID: "alice", Data: "v1"},
+		})
+		if err != nil || idemp {
+			t.Fatalf("first StorePresence: err=%v idempotent=%v", err, idemp)
+		}
+		second, idemp, err := ch.StorePresence(context.Background(), []*protocol.PresenceMessage{
+			{ID: "p1", Action: protocol.PresenceEnter, ConnectionID: "conn-1", ClientID: "alice", Data: "v2"},
+		})
+		if err != nil {
+			t.Fatalf("second StorePresence: %v", err)
+		}
+		if !idemp {
+			t.Error("idempotent=false on duplicate presence id")
+		}
+		if second.ChannelSerial != first.ChannelSerial {
+			t.Errorf("returned serial = %q, want original %q", second.ChannelSerial, first.ChannelSerial)
+		}
+		members, _, _ := ch.Members(context.Background())
+		if len(members) != 1 || members[0].Data != "v1" {
+			t.Errorf("members = %+v, want single alice with original v1", members)
+		}
+	})
+
+	t.Run("PresenceAndMessageStreamsAreKindFiltered", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "room")
+		if _, _, err := ch.Store(context.Background(), []*protocol.Message{{Name: "m"}}); err != nil {
+			t.Fatalf("Store: %v", err)
+		}
+		mustEnter(t, ch, "conn-1", "alice", "hi")
+
+		// Message history (default kind) excludes the presence cm.
+		msgPage, err := ch.History(context.Background(), storage.HistoryQuery{Direction: storage.DirectionForwards})
+		if err != nil {
+			t.Fatalf("message History: %v", err)
+		}
+		if len(msgPage.ChannelMessages) != 1 || len(msgPage.ChannelMessages[0].Messages) != 1 {
+			t.Fatalf("message history = %v, want exactly one message cm", channelSerialsOf(msgPage))
+		}
+		for _, cm := range msgPage.ChannelMessages {
+			if len(cm.Presence) != 0 {
+				t.Error("message history leaked a presence cm")
+			}
+		}
+
+		// Presence history excludes the message cm.
+		presPage, err := ch.History(context.Background(), storage.HistoryQuery{Kind: storage.KindPresence, Direction: storage.DirectionForwards})
+		if err != nil {
+			t.Fatalf("presence History: %v", err)
+		}
+		if len(presPage.ChannelMessages) != 1 || len(presPage.ChannelMessages[0].Presence) != 1 {
+			t.Fatalf("presence history = %v, want exactly one presence cm", channelSerialsOf(presPage))
+		}
+		if got := presPage.ChannelMessages[0].Presence[0].ClientID; got != "alice" {
+			t.Errorf("presence history clientId = %q, want alice", got)
+		}
+	})
+}
+
+// mustEnter publishes a single ENTER for (connID, clientID) with data.
+func mustEnter(t *testing.T, ch storage.ChannelStore, connID, clientID string, data any) {
+	t.Helper()
+	mustPresence(t, ch, &protocol.PresenceMessage{
+		Action: protocol.PresenceEnter, ConnectionID: connID, ClientID: clientID, Data: data,
+	})
+}
+
+// mustPresence calls StorePresence and fails the test on error.
+func mustPresence(t *testing.T, ch storage.ChannelStore, pms ...*protocol.PresenceMessage) *protocol.ChannelMessage {
+	t.Helper()
+	cm, _, err := ch.StorePresence(context.Background(), pms)
+	if err != nil {
+		t.Fatalf("StorePresence: %v", err)
+	}
+	return cm
+}
+
+// membersByKey indexes a membership set by its (connectionId, clientId) key.
+func membersByKey(members []*protocol.PresenceMessage) map[string]*protocol.PresenceMessage {
+	out := make(map[string]*protocol.PresenceMessage, len(members))
+	for _, p := range members {
+		out[storage.MemberKey(p.ConnectionID, p.ClientID)] = p
+	}
+	return out
 }
 
 // threeDigit zero-pads i to a 3-digit string ("042"). Mirrors the
@@ -837,11 +1000,11 @@ func threeDigit(i int) string {
 // contract tests can assert on the backend's appender-callback
 // behaviour without needing a real core.Channel.
 type capturingAppender struct {
-	mu             sync.Mutex
-	initCurrent    string
-	initInitial    string
-	initCount      int
-	appends        []*protocol.ChannelMessage
+	mu          sync.Mutex
+	initCurrent string
+	initInitial string
+	initCount   int
+	appends     []*protocol.ChannelMessage
 }
 
 func newCapturingAppender() *capturingAppender {

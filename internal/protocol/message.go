@@ -30,25 +30,30 @@ type Message struct {
 // one ChannelMessage; subscribers receive ChannelMessages as the
 // atomic delivery unit (one outbound MESSAGE frame per ChannelMessage).
 // Storage persists ChannelMessages keyed by ChannelSerial.
+// A ChannelMessage carries either Messages (a data publish) or Presence
+// (a presence publish), never both — the two ride one ordered stream
+// distinguished by which slice is populated (DESIGN.md §12.1).
 type ChannelMessage struct {
-	ChannelSerial string     `json:"channelSerial,omitempty" msgpack:"channelSerial,omitempty"`
-	Messages      []*Message `json:"messages,omitempty"      msgpack:"messages,omitempty"`
+	ChannelSerial string             `json:"channelSerial,omitempty" msgpack:"channelSerial,omitempty"`
+	Messages      []*Message         `json:"messages,omitempty"      msgpack:"messages,omitempty"`
+	Presence      []*PresenceMessage `json:"presence,omitempty"      msgpack:"presence,omitempty"`
 }
 
 // ProtocolMessage is one frame on the realtime WebSocket connection.
 type ProtocolMessage struct {
-	Action        Action            `json:"action"                  msgpack:"action"`
-	ID            string            `json:"id,omitempty"            msgpack:"id,omitempty"`
-	ConnectionID  string            `json:"connectionId,omitempty"  msgpack:"connectionId,omitempty"`
-	Channel       string            `json:"channel,omitempty"       msgpack:"channel,omitempty"`
-	ChannelSerial string            `json:"channelSerial,omitempty" msgpack:"channelSerial,omitempty"`
-	MsgSerial     int64             `json:"msgSerial,omitempty"     msgpack:"msgSerial,omitempty"`
-	Timestamp     int64             `json:"timestamp,omitempty"     msgpack:"timestamp,omitempty"`
-	Count         int               `json:"count,omitempty"         msgpack:"count,omitempty"`
-	Flags         int64             `json:"flags,omitempty"         msgpack:"flags,omitempty"`
-	Messages      []*Message        `json:"messages,omitempty"      msgpack:"messages,omitempty"`
-	Error         *ErrorInfo        `json:"error,omitempty"         msgpack:"error,omitempty"`
-	Params        map[string]string `json:"params,omitempty"        msgpack:"params,omitempty"`
+	Action        Action             `json:"action"                  msgpack:"action"`
+	ID            string             `json:"id,omitempty"            msgpack:"id,omitempty"`
+	ConnectionID  string             `json:"connectionId,omitempty"  msgpack:"connectionId,omitempty"`
+	Channel       string             `json:"channel,omitempty"       msgpack:"channel,omitempty"`
+	ChannelSerial string             `json:"channelSerial,omitempty" msgpack:"channelSerial,omitempty"`
+	MsgSerial     int64              `json:"msgSerial,omitempty"     msgpack:"msgSerial,omitempty"`
+	Timestamp     int64              `json:"timestamp,omitempty"     msgpack:"timestamp,omitempty"`
+	Count         int                `json:"count,omitempty"         msgpack:"count,omitempty"`
+	Flags         int64              `json:"flags,omitempty"         msgpack:"flags,omitempty"`
+	Messages      []*Message         `json:"messages,omitempty"      msgpack:"messages,omitempty"`
+	Presence      []*PresenceMessage `json:"presence,omitempty"      msgpack:"presence,omitempty"`
+	Error         *ErrorInfo         `json:"error,omitempty"         msgpack:"error,omitempty"`
+	Params        map[string]string  `json:"params,omitempty"        msgpack:"params,omitempty"`
 }
 
 // ErrorInfo describes an error in Ably's standard wire form, attached
@@ -61,8 +66,15 @@ type ErrorInfo struct {
 	HRef       string `json:"href,omitempty"       msgpack:"href,omitempty"`
 }
 
-// Flags carried on ATTACHED.
+// Flags carried on ATTACH / ATTACHED. The low bits are server-set
+// status flags; the high bits (1<<16 and up) are the channel-mode
+// bitfield, matching Ably's wire constants (DESIGN.md §4.2, §12).
 const (
+	// FlagHasPresence is set on ATTACHED when the channel has a
+	// non-empty presence set, signalling the SDK that a SYNC will
+	// follow (DESIGN.md §12.4).
+	FlagHasPresence int64 = 1 << 0
+
 	// FlagResumed indicates the channel state was resumed from the
 	// client's supplied channelSerial: the gap between the client's
 	// cursor and the live tail was replayed in full. Cleared when the
@@ -70,4 +82,11 @@ const (
 	// retention aged-out) — clients should treat the absence of this
 	// flag as a discontinuity.
 	FlagResumed int64 = 1 << 2
+
+	// Channel-mode flags (DESIGN.md §4.2). ATTACH.flags selects the
+	// requested modes; ATTACHED.flags carries the effective set.
+	FlagPresence          int64 = 1 << 16 // enter/update/leave presence
+	FlagPublish           int64 = 1 << 17 // publish MESSAGE
+	FlagSubscribe         int64 = 1 << 18 // receive MESSAGE
+	FlagPresenceSubscribe int64 = 1 << 19 // receive PRESENCE + presence sync
 )

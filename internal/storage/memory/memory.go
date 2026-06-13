@@ -91,10 +91,11 @@ type channelStore struct {
 	gen      *serial.Generator
 	appender storage.Appender
 
-	mu    sync.Mutex
-	order []string // append-only, sorted (serials are monotonic)
-	byCS  map[string]*protocol.ChannelMessage
-	byID  map[string]string // Message.id -> channelSerial
+	mu      sync.Mutex
+	order   []string // append-only, sorted (serials are monotonic): both kinds
+	byCS    map[string]*protocol.ChannelMessage
+	byID    map[string]string                    // Message.id / PresenceMessage.id -> channelSerial
+	members map[string]*protocol.PresenceMessage // "<connId>:<clientId>" -> latest member (DESIGN.md §12.5)
 }
 
 func newChannelStore(gen *serial.Generator, appender storage.Appender) *channelStore {
@@ -103,6 +104,7 @@ func newChannelStore(gen *serial.Generator, appender storage.Appender) *channelS
 		appender: appender,
 		byCS:     make(map[string]*protocol.ChannelMessage),
 		byID:     make(map[string]string),
+		members:  make(map[string]*protocol.PresenceMessage),
 	}
 }
 
@@ -158,6 +160,82 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	return cm, false, nil
 }
 
+// StorePresence persists a presence publish on the same stream as
+// messages and folds it into the membership set, all under the single
+// channel mutex (DESIGN.md §12.2, §12.5). Idempotency shares the byID
+// index with messages.
+func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.PresenceMessage) (*protocol.ChannelMessage, bool, error) {
+	if len(presence) == 0 {
+		return nil, false, errors.New("storage/memory: StorePresence with no messages")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	for _, p := range presence {
+		if p.ID == "" {
+			continue
+		}
+		if existingCS, ok := cs.byID[p.ID]; ok {
+			return cs.byCS[existingCS], true, nil
+		}
+	}
+
+	channelSerial := cs.gen.Mint()
+	for i, p := range presence {
+		p.Serial = serial.MessageSerial(channelSerial, i)
+	}
+	cm := &protocol.ChannelMessage{
+		ChannelSerial: channelSerial,
+		Presence:      presence,
+	}
+
+	cs.byCS[channelSerial] = cm
+	cs.order = append(cs.order, channelSerial)
+	for _, p := range presence {
+		if p.ID != "" {
+			cs.byID[p.ID] = channelSerial
+		}
+		key := storage.MemberKey(p.ConnectionID, p.ClientID)
+		switch p.Action {
+		case protocol.PresenceLeave, protocol.PresenceAbsent:
+			delete(cs.members, key)
+		default: // Enter, Update, Present
+			cs.members[key] = p
+		}
+	}
+
+	if cs.appender != nil {
+		cs.appender.Append(cm)
+	}
+	return cm, false, nil
+}
+
+// Members returns the current membership set (sorted by Serial for a
+// stable order) and the channel's current watermark as the as-of serial.
+func (cs *channelStore) Members(ctx context.Context) ([]*protocol.PresenceMessage, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	out := make([]*protocol.PresenceMessage, 0, len(cs.members))
+	for _, p := range cs.members {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Serial < out[j].Serial })
+
+	var asOf string
+	if n := len(cs.order); n > 0 {
+		asOf = cs.order[n-1]
+	}
+	return out, asOf, nil
+}
+
 // History implements storage.ChannelStore. The walk over cs.order is
 // direction-aware: forwards starts at the lower-bound index and walks
 // up; backwards starts at the upper-bound index and walks down. Within
@@ -178,6 +256,7 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
+	wantKind := q.Kind.Normalize()
 	lower, upper := serial.TimestampBounds(q.Start, q.End)
 
 	lo := 0
@@ -206,29 +285,34 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 	var page storage.HistoryPage
 	count := 0
 
-	emit := func(m *protocol.Message, current **protocol.ChannelMessage, channelSerial string) bool {
+	// emit appends one item (a Message or a PresenceMessage, via put)
+	// onto the trailing ChannelMessage when its channelSerial matches,
+	// or a fresh entry otherwise. Returns false once Limit is reached.
+	emit := func(channelSerial string, put func(dst *protocol.ChannelMessage)) bool {
 		if limit > 0 && count >= limit {
 			page.HasMore = true
 			return false
 		}
-		if *current == nil || (*current).ChannelSerial != channelSerial {
-			*current = &protocol.ChannelMessage{ChannelSerial: channelSerial}
-			page.ChannelMessages = append(page.ChannelMessages, *current)
+		var current *protocol.ChannelMessage
+		if n := len(page.ChannelMessages); n > 0 && page.ChannelMessages[n-1].ChannelSerial == channelSerial {
+			current = page.ChannelMessages[n-1]
+		} else {
+			current = &protocol.ChannelMessage{ChannelSerial: channelSerial}
+			page.ChannelMessages = append(page.ChannelMessages, current)
 		}
-		(*current).Messages = append((*current).Messages, m)
+		put(current)
 		count++
 		return true
 	}
 
 	if forwards {
-		var current *protocol.ChannelMessage
 		for i := lo; i < hi; i++ {
 			cm := cs.byCS[cs.order[i]]
-			for idx, m := range cm.Messages {
-				if cursor != "" && serial.MessageSerial(cm.ChannelSerial, idx) <= cursor {
+			for _, it := range storage.CMItems(cm, wantKind) {
+				if cursor != "" && it.Serial <= cursor {
 					continue
 				}
-				if !emit(m, &current, cm.ChannelSerial) {
+				if !emit(cm.ChannelSerial, it.Append) {
 					return page, nil
 				}
 			}
@@ -236,14 +320,14 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 		return page, nil
 	}
 
-	var current *protocol.ChannelMessage
 	for i := hi - 1; i >= lo; i-- {
 		cm := cs.byCS[cs.order[i]]
-		for idx := len(cm.Messages) - 1; idx >= 0; idx-- {
-			if cursor != "" && serial.MessageSerial(cm.ChannelSerial, idx) >= cursor {
+		items := storage.CMItems(cm, wantKind)
+		for j := len(items) - 1; j >= 0; j-- {
+			if cursor != "" && items[j].Serial >= cursor {
 				continue
 			}
-			if !emit(cm.Messages[idx], &current, cm.ChannelSerial) {
+			if !emit(cm.ChannelSerial, items[j].Append) {
 				return page, nil
 			}
 		}

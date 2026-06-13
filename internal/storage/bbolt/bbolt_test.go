@@ -38,6 +38,67 @@ func TestBBoltChannelStoreContract(t *testing.T) {
 // Close+Open cycle on the same file: history of pre-restart publishes
 // remains readable, and a post-restart publish succeeds and is itself
 // visible via history.
+//
+// TestBBoltPresenceMembersNotPersisted proves the §12.5 invariant for
+// the disk backend: the membership set is in-memory only, so it is
+// empty after a Close+Open cycle (presence is connection-scoped and no
+// connection survives a restart) — while the presence *history* does
+// persist as an ordinary cm on the channel_messages log.
+func TestBBoltPresenceMembersNotPersisted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ably.db")
+	ctx := context.Background()
+
+	s1, err := bbolt.Open(bbolt.Options{Path: path})
+	if err != nil {
+		t.Fatalf("Open #1: %v", err)
+	}
+	if _, _, err := mustChannel(t, s1, "room").StorePresence(ctx, []*protocol.PresenceMessage{
+		{Action: protocol.PresenceEnter, ConnectionID: "conn-1", ClientID: "alice", Data: "hi"},
+	}); err != nil {
+		t.Fatalf("StorePresence: %v", err)
+	}
+	members, _, err := mustChannel(t, s1, "room").Members(ctx)
+	if err != nil {
+		t.Fatalf("Members #1: %v", err)
+	}
+	if len(members) != 1 {
+		t.Fatalf("pre-restart members = %d, want 1", len(members))
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatalf("Close #1: %v", err)
+	}
+
+	// Second "process": the membership set starts empty...
+	s2, err := bbolt.Open(bbolt.Options{Path: path})
+	if err != nil {
+		t.Fatalf("Open #2: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+
+	members, _, err = mustChannel(t, s2, "room").Members(ctx)
+	if err != nil {
+		t.Fatalf("Members #2: %v", err)
+	}
+	if len(members) != 0 {
+		t.Errorf("post-restart members = %d, want 0 (membership is not persisted)", len(members))
+	}
+
+	// ...but the presence history persists across the restart.
+	page, err := mustChannel(t, s2, "room").History(ctx, storage.HistoryQuery{
+		Kind: storage.KindPresence, Direction: storage.DirectionForwards,
+	})
+	if err != nil {
+		t.Fatalf("presence History: %v", err)
+	}
+	if len(page.ChannelMessages) != 1 || len(page.ChannelMessages[0].Presence) != 1 {
+		t.Fatalf("presence history = %d cms, want 1 with one presence item", len(page.ChannelMessages))
+	}
+	if got := page.ChannelMessages[0].Presence[0].ClientID; got != "alice" {
+		t.Errorf("persisted presence clientId = %q, want alice", got)
+	}
+}
+
 func TestBBoltSurvivesProcessRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ably.db")

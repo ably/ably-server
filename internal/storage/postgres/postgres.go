@@ -247,13 +247,15 @@ func (s *Storage) loadChannelMessage(ctx context.Context, channel, channelSerial
 }
 
 const sqlLoadCM = `
-SELECT idx, payload FROM messages
+SELECT idx, kind, payload FROM channel_messages
 WHERE channel = $1 AND channel_serial = $2
 ORDER BY idx
 `
 
 // decodeChannelMessageRows materialises a ChannelMessage from a rows
-// result of (idx, payload). Closes rows on exit.
+// result of (idx, kind, payload). All rows of a cm share a kind; a
+// presence cm decodes into Presence, a message cm into Messages. Closes
+// rows on exit.
 func decodeChannelMessageRows(rows pgx.Rows, queryErr error, channel, channelSerial string) (*protocol.ChannelMessage, error) {
 	if queryErr != nil {
 		return nil, fmt.Errorf("storage/postgres: load %s:%s: %w", channel, channelSerial, queryErr)
@@ -264,10 +266,19 @@ func decodeChannelMessageRows(rows pgx.Rows, queryErr error, channel, channelSer
 	for rows.Next() {
 		var (
 			idx     int
+			kind    string
 			payload []byte
 		)
-		if err := rows.Scan(&idx, &payload); err != nil {
+		if err := rows.Scan(&idx, &kind, &payload); err != nil {
 			return nil, fmt.Errorf("storage/postgres: scan %s:%s: %w", channel, channelSerial, err)
+		}
+		if kind == string(storage.KindPresence) {
+			var p protocol.PresenceMessage
+			if err := msgpack.Unmarshal(payload, &p); err != nil {
+				return nil, fmt.Errorf("storage/postgres: decode presence payload %s:%s idx=%d: %w", channel, channelSerial, idx, err)
+			}
+			cm.Presence = append(cm.Presence, &p)
+			continue
 		}
 		var m protocol.Message
 		if err := msgpack.Unmarshal(payload, &m); err != nil {
@@ -278,7 +289,7 @@ func decodeChannelMessageRows(rows pgx.Rows, queryErr error, channel, channelSer
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("storage/postgres: rows %s:%s: %w", channel, channelSerial, err)
 	}
-	if len(cm.Messages) == 0 {
+	if len(cm.Messages) == 0 && len(cm.Presence) == 0 {
 		return nil, fmt.Errorf("storage/postgres: ChannelMessage not found: %s:%s", channel, channelSerial)
 	}
 	return cm, nil
@@ -457,7 +468,7 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	if len(ids) > 0 {
 		var existingCS string
 		err := tx.QueryRow(ctx,
-			`SELECT channel_serial FROM messages
+			`SELECT channel_serial FROM channel_messages
 			 WHERE channel = $1 AND id = ANY($2) LIMIT 1`,
 			cs.name, ids).Scan(&existingCS)
 		switch {
@@ -503,8 +514,8 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 			idArg = m.ID
 		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO messages (channel, channel_serial, idx, id, payload)
-			 VALUES ($1, $2, $3, $4, $5)`,
+			`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload)
+			 VALUES ($1, $2, $3, $4, 'message', $5)`,
 			cs.name, channelSerial, i, idArg, payload,
 		); err != nil {
 			return nil, false, fmt.Errorf("storage/postgres: insert message %d: %w", i, err)
@@ -532,7 +543,157 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	return cm, false, nil
 }
 
-// History runs a direction-aware range scan over messages at Message
+// StorePresence persists a presence publish on channel_messages (kind =
+// presence) and folds it into the presence projection table, all in one
+// transaction, then emits a NOTIFY. The cm reaches the channel's
+// appender via the LISTEN round-trip exactly like a message publish
+// (DESIGN.md §12.2, §12.5); the membership table is authoritative across
+// nodes the moment the tx commits.
+func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.PresenceMessage) (*protocol.ChannelMessage, bool, error) {
+	if len(presence) == 0 {
+		return nil, false, errors.New("storage/postgres: StorePresence with no messages")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+
+	tx, err := cs.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Idempotency pre-check — shared id namespace with messages.
+	if ids := nonEmptyPresenceIDs(presence); len(ids) > 0 {
+		var existingCS string
+		err := tx.QueryRow(ctx,
+			`SELECT channel_serial FROM channel_messages
+			 WHERE channel = $1 AND id = ANY($2) LIMIT 1`,
+			cs.name, ids).Scan(&existingCS)
+		switch {
+		case err == nil:
+			original, lerr := loadChannelMessageTx(ctx, tx, cs.name, existingCS)
+			if lerr != nil {
+				return nil, false, lerr
+			}
+			if cerr := tx.Commit(ctx); cerr != nil {
+				return nil, false, fmt.Errorf("storage/postgres: commit: %w", cerr)
+			}
+			return original, true, nil
+		case errors.Is(err, pgx.ErrNoRows):
+			// no prior match — fall through
+		default:
+			return nil, false, fmt.Errorf("storage/postgres: idempotency lookup: %w", err)
+		}
+	}
+
+	var channelSerial string
+	if err := tx.QueryRow(ctx,
+		`SELECT advance_channel_serial($1, $2)`, cs.name, cs.series,
+	).Scan(&channelSerial); err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: advance channel serial: %w", err)
+	}
+	for i, p := range presence {
+		p.Serial = serial.MessageSerial(channelSerial, i)
+	}
+	cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Presence: presence}
+
+	for i, p := range presence {
+		payload, err := msgpack.Marshal(p)
+		if err != nil {
+			return nil, false, fmt.Errorf("storage/postgres: encode presence %d: %w", i, err)
+		}
+		var idArg any
+		if p.ID != "" {
+			idArg = p.ID
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload)
+			 VALUES ($1, $2, $3, $4, 'presence', $5)`,
+			cs.name, channelSerial, i, idArg, payload,
+		); err != nil {
+			return nil, false, fmt.Errorf("storage/postgres: insert presence %d: %w", i, err)
+		}
+
+		// Fold into the membership projection in the same tx.
+		switch p.Action {
+		case protocol.PresenceLeave, protocol.PresenceAbsent:
+			if _, err := tx.Exec(ctx,
+				`DELETE FROM presence WHERE channel = $1 AND connection_id = $2 AND client_id = $3`,
+				cs.name, p.ConnectionID, p.ClientID,
+			); err != nil {
+				return nil, false, fmt.Errorf("storage/postgres: presence leave: %w", err)
+			}
+		default: // Enter, Update, Present
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO presence (channel, connection_id, client_id, channel_serial, payload)
+				 VALUES ($1, $2, $3, $4, $5)
+				 ON CONFLICT (channel, connection_id, client_id)
+				 DO UPDATE SET channel_serial = EXCLUDED.channel_serial, payload = EXCLUDED.payload`,
+				cs.name, p.ConnectionID, p.ClientID, channelSerial, payload,
+			); err != nil {
+				return nil, false, fmt.Errorf("storage/postgres: presence upsert: %w", err)
+			}
+		}
+	}
+
+	body, err := json.Marshal(notifyPayload{Channel: cs.name, Serial: channelSerial})
+	if err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: encode notify: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, notifyChannelName, string(body)); err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: notify: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
+	}
+	return cm, false, nil
+}
+
+// Members returns the channel's presence projection plus the channel's
+// current watermark serial as the as-of point.
+func (cs *channelStore) Members(ctx context.Context) ([]*protocol.PresenceMessage, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+
+	rows, err := cs.pool.Query(ctx,
+		`SELECT payload FROM presence WHERE channel = $1 ORDER BY channel_serial, client_id`, cs.name)
+	if err != nil {
+		return nil, "", fmt.Errorf("storage/postgres: members query: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*protocol.PresenceMessage
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			return nil, "", fmt.Errorf("storage/postgres: scan member: %w", err)
+		}
+		var p protocol.PresenceMessage
+		if err := msgpack.Unmarshal(payload, &p); err != nil {
+			return nil, "", fmt.Errorf("storage/postgres: decode member: %w", err)
+		}
+		out = append(out, &p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("storage/postgres: members rows: %w", err)
+	}
+
+	var asOf string
+	if err := cs.pool.QueryRow(ctx,
+		`SELECT channel_serial FROM channels WHERE name = $1`, cs.name,
+	).Scan(&asOf); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return out, "", nil
+		}
+		return nil, "", fmt.Errorf("storage/postgres: members watermark: %w", err)
+	}
+	return out, asOf, nil
+}
+
+// History runs a direction-aware range scan over channel_messages at item
 // granularity. Time bounds (q.Start / q.End) are applied as predicates
 // on channel_serial — the serial's leading timestamp prefix makes the
 // lex compare correct (DESIGN.md §8 + internal/serial.TimestampBounds),
@@ -578,10 +739,13 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 	// idx) tuple. $4 holds the cursor's channelSerial and $5 its idx;
 	// empty $4 means "no cursor". $7 is the optional inclusive
 	// channelSerial upper bound (EndChannelSerial).
+	wantKind := q.Kind.Normalize()
+
 	query := fmt.Sprintf(`
 		SELECT channel_serial, idx, payload
-		FROM messages
+		FROM channel_messages
 		WHERE channel = $1
+		  AND kind = $8
 		  AND ($2 = '' OR channel_serial >= $2)
 		  AND ($3 = '' OR channel_serial <  $3)
 		  AND ($4 = '' OR (channel_serial, idx) %s ($4, $5))
@@ -595,6 +759,7 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 		cursorChannelSerial, cursorIdx,
 		limit,
 		q.EndChannelSerial,
+		string(wantKind),
 	)
 	if err != nil {
 		return storage.HistoryPage{}, fmt.Errorf("storage/postgres: history query: %w", err)
@@ -611,6 +776,14 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 		if err := rows.Scan(&cs2, &idx, &payload); err != nil {
 			return storage.HistoryPage{}, fmt.Errorf("storage/postgres: scan row: %w", err)
 		}
+		if wantKind == storage.KindPresence {
+			var p protocol.PresenceMessage
+			if err := msgpack.Unmarshal(payload, &p); err != nil {
+				return storage.HistoryPage{}, fmt.Errorf("storage/postgres: decode presence payload %s:%d: %w", cs2, idx, err)
+			}
+			appendPresence(&page, cs2, &p)
+			continue
+		}
 		var m protocol.Message
 		if err := msgpack.Unmarshal(payload, &m); err != nil {
 			return storage.HistoryPage{}, fmt.Errorf("storage/postgres: decode payload %s:%d: %w", cs2, idx, err)
@@ -621,7 +794,7 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 		return storage.HistoryPage{}, fmt.Errorf("storage/postgres: history rows: %w", err)
 	}
 
-	if overLimit && messageCount(page) > limit {
+	if overLimit && itemCount(page) > limit {
 		trimToLimit(&page, limit)
 		page.HasMore = true
 	}
@@ -643,17 +816,39 @@ func appendMessage(page *storage.HistoryPage, channelSerial string, m *protocol.
 	})
 }
 
-// messageCount totals the Messages across all ChannelMessages in page.
-func messageCount(page storage.HistoryPage) int {
+// appendPresence tacks p onto the trailing ChannelMessage when its
+// channelSerial matches; otherwise starts a fresh entry. The presence
+// analogue of appendMessage.
+func appendPresence(page *storage.HistoryPage, channelSerial string, p *protocol.PresenceMessage) {
+	if n := len(page.ChannelMessages); n > 0 && page.ChannelMessages[n-1].ChannelSerial == channelSerial {
+		page.ChannelMessages[n-1].Presence = append(page.ChannelMessages[n-1].Presence, p)
+		return
+	}
+	page.ChannelMessages = append(page.ChannelMessages, &protocol.ChannelMessage{
+		ChannelSerial: channelSerial,
+		Presence:      []*protocol.PresenceMessage{p},
+	})
+}
+
+// cmLen is the item count of a cm — Messages or Presence, whichever the
+// (single-kind) cm carries.
+func cmLen(cm *protocol.ChannelMessage) int {
+	return len(cm.Messages) + len(cm.Presence)
+}
+
+// itemCount totals the items (Messages or Presence) across all
+// ChannelMessages in page.
+func itemCount(page storage.HistoryPage) int {
 	n := 0
 	for _, cm := range page.ChannelMessages {
-		n += len(cm.Messages)
+		n += cmLen(cm)
 	}
 	return n
 }
 
-// trimToLimit drops Messages past limit, in order, possibly leaving
-// the last surviving ChannelMessage partial.
+// trimToLimit drops items past limit, in order, possibly leaving the
+// last surviving ChannelMessage partial. Trims whichever slice the cm
+// carries (a page is single-kind).
 func trimToLimit(page *storage.HistoryPage, limit int) {
 	left := limit
 	for i, cm := range page.ChannelMessages {
@@ -661,11 +856,15 @@ func trimToLimit(page *storage.HistoryPage, limit int) {
 			page.ChannelMessages = page.ChannelMessages[:i]
 			return
 		}
-		if left >= len(cm.Messages) {
-			left -= len(cm.Messages)
+		if left >= cmLen(cm) {
+			left -= cmLen(cm)
 			continue
 		}
-		cm.Messages = cm.Messages[:left]
+		if len(cm.Presence) > 0 {
+			cm.Presence = cm.Presence[:left]
+		} else {
+			cm.Messages = cm.Messages[:left]
+		}
 		page.ChannelMessages = page.ChannelMessages[:i+1]
 		return
 	}
@@ -678,6 +877,17 @@ func nonEmptyIDs(msgs []*protocol.Message) []string {
 	for _, m := range msgs {
 		if m.ID != "" {
 			ids = append(ids, m.ID)
+		}
+	}
+	return ids
+}
+
+// nonEmptyPresenceIDs is the presence analogue of nonEmptyIDs.
+func nonEmptyPresenceIDs(presence []*protocol.PresenceMessage) []string {
+	var ids []string
+	for _, p := range presence {
+		if p.ID != "" {
+			ids = append(ids, p.ID)
 		}
 	}
 	return ids

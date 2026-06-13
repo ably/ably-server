@@ -98,11 +98,90 @@ type ChannelStore interface {
 	// passed in.
 	Store(ctx context.Context, msgs []*protocol.Message) (cm *protocol.ChannelMessage, idempotent bool, err error)
 
+	// StorePresence is the presence analogue of Store (DESIGN.md §12.2,
+	// §12.5). It mints a channelSerial, stamps each PresenceMessage.Serial
+	// to "<channelSerial>:<idx>", persists the presence ChannelMessage on
+	// the same stream (kind = presence), and — atomically with the
+	// persist — folds the operations into the channel's membership set
+	// keyed by "<connectionId>:<clientId>": ENTER/UPDATE/PRESENT upsert a
+	// member, LEAVE/ABSENT remove it. The appender then receives the
+	// presence cm exactly as for a message publish.
+	//
+	// Idempotency works like Store: a contained PresenceMessage.ID already
+	// seen on this channel returns the original cm with idempotent=true
+	// and folds nothing.
+	StorePresence(ctx context.Context, presence []*protocol.PresenceMessage) (cm *protocol.ChannelMessage, idempotent bool, err error)
+
+	// Members returns the channel's current presence set plus the
+	// channelSerial the set is current as-of (DESIGN.md §12.4). The
+	// as-of serial is the channel's current watermark; it is empty only
+	// when the channel has no persisted cms at all. Backs presence sync
+	// and the REST presence endpoint.
+	Members(ctx context.Context) (members []*protocol.PresenceMessage, asOfSerial string, err error)
+
 	// History returns ChannelMessages in publish order. An empty
 	// AfterChannelSerial means "from the oldest retained
 	// ChannelMessage"; otherwise results start strictly after the
-	// given channelSerial.
+	// given channelSerial. q.Kind selects the stream (messages or
+	// presence); the zero value reads messages.
 	History(ctx context.Context, q HistoryQuery) (HistoryPage, error)
+}
+
+// Kind distinguishes the two cm streams that share a channel's ordered
+// log and channelSerial namespace (DESIGN.md §12.1). The zero value is
+// KindMessage so an unset HistoryQuery reads message history.
+type Kind string
+
+const (
+	KindMessage  Kind = "message"
+	KindPresence Kind = "presence"
+)
+
+// Normalize maps the zero value to KindMessage.
+func (k Kind) Normalize() Kind {
+	if k == "" {
+		return KindMessage
+	}
+	return k
+}
+
+// MemberKey returns the presence-set key for a member: the pair
+// (connectionId, clientId) that identifies one member, so the same
+// clientId over two connections is two distinct members (DESIGN.md §12.1).
+func MemberKey(connectionID, clientID string) string {
+	return connectionID + ":" + clientID
+}
+
+// HistItem is one item within a ChannelMessage during a kind-aware
+// history scan: either a Message or a PresenceMessage. Serial is the
+// item's Message.serial (the pagination cursor unit); Append links the
+// item onto a destination ChannelMessage being assembled for the page.
+type HistItem struct {
+	Serial string
+	Append func(dst *protocol.ChannelMessage)
+}
+
+// CMItems returns a ChannelMessage's items for the requested kind, in
+// natural (idx) order. A cm of the other kind yields no items, so a
+// kind-filtered scan transparently skips it. Backends share this so
+// message and presence history walk identical pagination/limit logic.
+func CMItems(cm *protocol.ChannelMessage, kind Kind) []HistItem {
+	if kind.Normalize() == KindPresence {
+		out := make([]HistItem, len(cm.Presence))
+		for i, pm := range cm.Presence {
+			out[i] = HistItem{Serial: pm.Serial, Append: func(dst *protocol.ChannelMessage) {
+				dst.Presence = append(dst.Presence, pm)
+			}}
+		}
+		return out
+	}
+	out := make([]HistItem, len(cm.Messages))
+	for i, m := range cm.Messages {
+		out[i] = HistItem{Serial: m.Serial, Append: func(dst *protocol.ChannelMessage) {
+			dst.Messages = append(dst.Messages, m)
+		}}
+	}
+	return out
 }
 
 // Direction selects the history scan order.
@@ -126,6 +205,10 @@ const (
 
 // HistoryQuery bounds a history read.
 type HistoryQuery struct {
+	// Kind selects which stream to read — messages or presence. The
+	// zero value reads messages (DESIGN.md §12.1).
+	Kind Kind
+
 	// Direction selects scan order. Zero value is DirectionBackwards
 	// (Ably default).
 	Direction Direction
