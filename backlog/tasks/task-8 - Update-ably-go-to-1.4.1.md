@@ -4,7 +4,9 @@ title: Update ably-go to 1.4.1
 status: To Do
 assignee: []
 created_date: '2026-05-31 16:05'
-labels: []
+updated_date: '2026-06-03 13:06'
+labels:
+  - config
 dependencies: []
 ordinal: 8000
 ---

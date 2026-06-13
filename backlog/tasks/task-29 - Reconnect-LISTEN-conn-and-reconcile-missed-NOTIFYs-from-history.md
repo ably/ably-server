@@ -4,7 +4,9 @@ title: Reconnect LISTEN conn and reconcile missed NOTIFYs from history
 status: To Do
 assignee: []
 created_date: '2026-05-31 21:58'
-labels: []
+updated_date: '2026-06-03 13:06'
+labels:
+  - ops
 dependencies:
   - TASK-22
 ordinal: 29000

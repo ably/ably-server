@@ -4,7 +4,9 @@ title: Remove the "At this stage" package comment from cmd/ably-server/main.go
 status: To Do
 assignee: []
 created_date: '2026-05-31 14:16'
-labels: []
+updated_date: '2026-06-03 13:06'
+labels:
+  - cleanup
 dependencies: []
 ordinal: 1000
 ---

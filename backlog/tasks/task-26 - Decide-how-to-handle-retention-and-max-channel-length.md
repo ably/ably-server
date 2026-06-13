@@ -4,7 +4,9 @@ title: Decide how to handle retention and max channel length
 status: To Do
 assignee: []
 created_date: '2026-05-31 16:31'
-labels: []
+updated_date: '2026-06-03 13:06'
+labels:
+  - scoping
 dependencies: []
 priority: low
 ordinal: 26000

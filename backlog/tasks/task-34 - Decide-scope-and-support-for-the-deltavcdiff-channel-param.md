@@ -4,7 +4,9 @@ title: Decide scope and support for the delta=vcdiff channel param
 status: To Do
 assignee: []
 created_date: '2026-06-01 10:04'
-labels: []
+updated_date: '2026-06-03 13:06'
+labels:
+  - scoping
 dependencies: []
 ordinal: 34000
 ---

@@ -4,7 +4,9 @@ title: Add process-wide Prometheus metrics
 status: To Do
 assignee: []
 created_date: '2026-05-31 17:18'
-labels: []
+updated_date: '2026-06-03 13:06'
+labels:
+  - ops
 dependencies: []
 ordinal: 27000
 ---

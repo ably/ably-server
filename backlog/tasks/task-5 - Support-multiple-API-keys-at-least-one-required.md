@@ -4,7 +4,9 @@ title: Support multiple API keys (at least one required)
 status: To Do
 assignee: []
 created_date: '2026-05-31 16:05'
-labels: []
+updated_date: '2026-06-03 13:06'
+labels:
+  - auth
 dependencies: []
 ordinal: 5000
 ---

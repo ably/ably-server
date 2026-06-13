@@ -7,15 +7,13 @@
 >
 > - **§3 auth** — only API-key Basic auth exists. JWT (HS256),
 >   capabilities, and `clientId` resolution are not yet implemented.
-> - **§9 configuration** — `--tls-cert/--tls-key`, `--message-ttl`,
->   `--max-messages-per-channel`, `--log-format` are not wired up; the
->   `ABLY_SERVER_*` env-var coverage is partial.
+> - **§9 configuration** — `--log-format` is not wired up; the
+>   `ABLY_SERVER_*` env-var coverage is partial, and the TOML config
+>   file is not yet implemented.
 > - **§10 observability** — Prometheus `/metrics`, OpenTelemetry, and
 >   pprof are not implemented.
 > - **§11 graceful shutdown** — the server does not currently send
 >   `DISCONNECTED` to existing WebSockets on SIGTERM.
-> - **§4.4 / §5.1 backpressure** — the lag threshold and `ERROR 50000`
->   slow-attachment disconnect are not implemented.
 > - **§6 retention** — TTL / per-channel cap policy is still being
 >   decided.
 >
@@ -294,7 +292,8 @@ queue (with `ChannelSerial = cm.ChannelSerial`, `Messages =
 cm.Messages`, gated by mode flags). The connection's single writer
 goroutine (§5.2) serialises actual frame writes. There is no
 per-attachment buffered fan-out channel: each attachment proceeds at
-its own pace.
+its own pace, lagging the live tail with no upper bound but its own
+memory footprint.
 
 The starting cursor depends on how the attachment was created:
 
@@ -307,11 +306,6 @@ The starting cursor depends on how the attachment was created:
   point.
 - `rewind=N` / `rewind=<duration>` — same pattern: read the historical
   prefix from storage, then attach to the live tail.
-
-Backpressure on a slow attachment is not a buffer overflow event; it
-manifests as the cursor lagging the live tail. If the lag exceeds the
-configured threshold (entries-behind, age-behind, or both) the attachment
-is closed with `ERROR` (`code: 50000`).
 
 ## 5. Internal architecture
 
@@ -411,9 +405,6 @@ cursor and the live tail, so memory grows with its lag. The retention
 policy (§6) bounds the working set: once a message ages past the TTL or
 the per-channel `max_messages` cap, the Channel drops its own
 back-pointer to it, so any unreferenced entries become eligible for GC.
-A persistently slow attachment that holds onto stale entries will be
-disconnected once its lag exceeds a configurable threshold (`ERROR`
-`code: 50000`).
 
 ### 5.2 Connection loop
 
@@ -588,10 +579,10 @@ WHERE channel = $1
 A per-channel cap (counted in ChannelMessages = `DISTINCT
 channel_serial`) is applied in the same sweep.
 
-The default message TTL is **2 minutes**, matching Ably cloud's default;
-both the TTL and the per-channel message cap are configurable (see §9).
-Operators who want full message history for a self-host deployment can
-set the TTL to a large value.
+The default message TTL is **2 minutes**, matching Ably cloud's default.
+Whether — and how — operators can override the TTL and the per-channel
+message cap is still being decided (see the §6 retention note in the
+status callout).
 
 ## 7. Pub/Sub
 
@@ -755,18 +746,17 @@ CLI flags (each with an `ABLY_SERVER_*` env var equivalent):
 ```
 --mode {memory|disk|cluster}      default: memory
 --listen :8080                    HTTP/WS bind
---tls-cert / --tls-key            optional inline TLS
 --api-key                         appId.keyId:keySecret
 --data-dir ./data                 disk mode only
 --db-dsn  postgres://…            cluster mode only
---message-ttl 2m
---max-messages-per-channel 1000
 --shutdown-grace 10s              window to disconnect existing connections on SIGTERM
 --log-level info
 --log-format {text|json}
 ```
 
-Loaded in priority order: flag > env > defaults. No config file.
+Configuration may also be supplied via an optional TOML config file
+(`--config ably-server.toml`) covering the same keys as the flags above.
+Loaded in priority order: flag > env > config file > defaults.
 
 ## 10. Observability
 

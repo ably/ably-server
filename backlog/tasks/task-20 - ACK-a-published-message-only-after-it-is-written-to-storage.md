@@ -4,8 +4,9 @@ title: ACK a published message only after it is written to storage
 status: To Do
 assignee: []
 created_date: '2026-05-31 16:11'
-updated_date: '2026-05-31 16:11'
-labels: []
+updated_date: '2026-06-03 13:06'
+labels:
+  - protocol
 dependencies:
   - TASK-13
 ordinal: 20000
