@@ -20,6 +20,10 @@
 >   implemented yet. The crashed-node membership reaper and lease bump
 >   (§12.5) and `SYNC` paging for very large sets are expected to land
 >   after the core enter/update/leave + sync path.
+> - **§13 mutable messages** — newly in scope as of this revision; not
+>   implemented. Only the `action` field plumbing (TASK-37) is partway
+>   defined. Append aggregation (§13.3) is a later phase after the core
+>   update/delete path.
 >
 > See [`backlog/`](backlog/) for the live task list. The package layout
 > listed in §5 is "proposed" and only loosely matches `internal/`.
@@ -29,7 +33,8 @@
 ### Goals
 
 - A single Go binary, `ably-server`, that speaks Ably's realtime WebSocket
-  protocol and the core REST pub/sub and presence endpoints.
+  protocol and the core REST pub/sub, presence, and mutable-message
+  endpoints.
 - Drop-in for **local development** and **CI** — existing Ably client SDKs
   should connect to it without code changes (only host/port/TLS overrides).
 - **Self-hostable** for single-region deployments where the operator does not
@@ -97,8 +102,11 @@ All REST endpoints live under the root and accept either `application/json` or
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/channels/{channel}/messages` | publish 1..N messages |
-| GET | `/channels/{channel}/messages` | history (paginated) |
+| POST | `/channels/{channel}/messages` | publish (create) 1..N messages |
+| PATCH | `/channels/{channel}/messages/{serial}` | update / delete / append (action in body, see §13) |
+| GET | `/channels/{channel}/messages` | history (paginated; latest version per message, see §13.4) |
+| GET | `/channels/{channel}/messages/{serial}` | one message, latest version (see §13.4) |
+| GET | `/channels/{channel}/messages/{serial}/versions` | all versions of a message (paginated) |
 | GET | `/channels/{channel}/presence` | current presence members (see §12) |
 | GET | `/channels/{channel}/presence/history` | presence history (paginated) |
 | GET | `/time` | server time (ms since epoch) |
@@ -145,11 +153,16 @@ JWT claims:
   channel name. Character classes (`[a-z]`) and `**` are not supported.
   The `[queue]*` / `[meta]*` resource prefixes do not apply since neither
   queues nor metachannels are in scope.
-- `<op>` is one of `publish`, `subscribe`, `presence`, `history`. `*`
-  matches any op. `subscribe` covers both receiving messages and
-  receiving presence (events + sync + the current set); `presence`
-  covers registering presence (enter/update/leave); `history` covers
-  both message and presence history.
+- `<op>` is one of `publish`, `subscribe`, `presence`, `history`,
+  `message-update-own`, `message-update-any`, `message-delete-own`,
+  `message-delete-any`. `*` matches any op. `subscribe` covers both
+  receiving messages and receiving presence (events + sync + the current
+  set); `presence` covers registering presence (enter/update/leave);
+  `history` covers message history, message version history, and
+  presence history. The `message-{update,delete}-{own,any}` ops gate
+  mutable messages (§13.5): `-own` permits the operation only when the
+  caller's resolved `clientId` matches the target message's creator,
+  `-any` waives that check; `append` is gated by `message-update-*`.
 
 Every authenticated request resolves to a **capability set**. For each
 operation the server computes the union of granted ops across all matching
@@ -162,10 +175,13 @@ operation is rejected:
 | WS `ATTACH` flag `PUBLISH` | `publish` |
 | WS `ATTACH` flag `PRESENCE` | `presence` |
 | WS `ATTACH` flag `PRESENCE_SUBSCRIBE` | `subscribe` |
-| WS inbound `MESSAGE` | `publish` (and the attachment must hold the `PUBLISH` mode flag, granted at attach time) |
+| WS inbound `MESSAGE` (`create`) | `publish` (and the attachment must hold the `PUBLISH` mode flag, granted at attach time) |
+| WS inbound `MESSAGE` (`update`/`append`) | `message-update-own`/`-any` (see §13.5) |
+| WS inbound `MESSAGE` (`delete`) | `message-delete-own`/`-any` |
 | WS inbound `PRESENCE` | `presence` (and the attachment must hold the `PRESENCE` mode flag) |
 | REST `POST .../messages` | `publish` |
-| REST `GET .../messages` | `history` |
+| REST `PATCH .../messages/{serial}` | `message-{update,delete}-{own,any}` (see §13.5) |
+| REST `GET .../messages`, `GET .../messages/{serial}[/versions]` | `history` |
 | REST `GET .../presence` | `subscribe` |
 | REST `GET .../presence/history` | `history` |
 
@@ -470,11 +486,13 @@ hands out per-channel `ChannelStore`s and owns any shared resources
 (e.g. a bolt DB handle, a pgxpool), and a per-channel `ChannelStore`
 exposing two operations:
 
-- `Store(ctx, msgs)` — mints a `channelSerial`, stamps each
-  `Message.Serial = "<channelSerial>:<idx>"`, persists the resulting
-  ChannelMessage atomically, and returns it. If any contained
-  `Message.id` was already seen on this channel within the retention
-  window, the call is idempotent: the originally-persisted
+- `Store(ctx, msgs)` — mints a `channelSerial` and persists the resulting
+  ChannelMessage atomically, then returns it. For a `create` it stamps
+  each `Message.serial = "<channelSerial>:<idx>"` (serial == version);
+  for an `update`/`delete`/`append` the `serial` is the caller-supplied
+  target and only `version` takes the new `<channelSerial>:<idx>` (§13.1).
+  If any contained `Message.id` was already seen on this channel within
+  the retention window, the call is idempotent: the originally-persisted
   ChannelMessage is returned with `idempotent=true` and no new row is
   written.
 - `History(ctx, query)` — bounded forward range scan ordered by
@@ -493,6 +511,23 @@ exposing two operations:
   REST `GET .../presence` endpoint. The set is owned by the backend
   (§12.5): a map in memory, in-memory in bbolt, a `presence` table in
   Postgres.
+- `Store` also handles **mutations** (§13): an `update`/`delete`/`append`
+  is a publish whose Message carries an `action` and a target `serial`.
+  The backend validates the target exists within retention, applies the
+  shallow-mixin merge against the message's current latest version,
+  persists the new version as an ordinary cm on the log, and updates two
+  derived structures it owns — a **serial → versions** secondary index
+  (backing version-history reads and target validation) and a
+  **latest-version projection** per message serial (backing the collapsed
+  `GET .../messages` and `GET .../messages/{serial}`). The projection is
+  the message-side analogue of the presence membership set: a map in
+  memory, a `messages` bucket in bbolt, a materialised `messages` table in
+  Postgres; the versions index is a `versions` bucket / partial index over
+  the log (§6.3).
+- `History` therefore has two message modes: the default collapses to the
+  latest version of each message positioned at its create serial; a
+  by-serial version scan returns every version of one message ordered by
+  `version` (§13.4).
 
 Each `ChannelStore` is created with an `Appender` callback —
 `Storage.Channel(name, appender) ChannelStore`. The Appender is the
@@ -521,19 +556,28 @@ Chosen because the disk backend's job is narrow ("survive crashes for
 a single process") and bbolt gives us that without coupling the disk
 layer's schema to the Postgres cluster backend.
 
-Layout — two top-level buckets, channel-scoped via composite keys:
+Layout — channel-scoped buckets via composite keys:
 
-- `messages`: keyed `<channel>\0<channelSerial>` (see §8 — the
-  atomic-publish identifier `<timestamp>-<counter>@<seriesId>`).
-  Values are the msgpack-encoded `protocol.ChannelMessage` blob.
-  bbolt's byte-order iteration over a `<channel>\0` prefix yields a
-  channel's ChannelMessages in publish order, mirroring the Postgres
-  backend's PK range scan.
+- `channel_messages`: the append-only log, keyed `<channel>\0<channelSerial>`
+  (see §8 — the atomic-publish identifier `<timestamp>-<counter>@<seriesId>`).
+  Values are the msgpack-encoded `protocol.ChannelMessage` blob (a
+  message or presence cm). bbolt's byte-order iteration over a
+  `<channel>\0` prefix yields a channel's ChannelMessages in publish
+  order, mirroring the Postgres backend's PK range scan.
 - `ids`: keyed `<channel>\0<Message.id>`, value is the channelSerial
   the id landed in. bbolt has no secondary indexes, so this is the
   manual equivalent of Postgres's partial UNIQUE idempotency index.
-  Entries are dropped by the same sweep that trims `messages` past
-  TTL — idempotency is bounded by message retention.
+  Entries are dropped by the same sweep that trims `channel_messages`
+  past TTL — idempotency is bounded by message retention.
+- `versions` and `messages` (mutable messages, §13): the bbolt analogue
+  of Postgres's `channel_messages_serial_idx` and the materialised
+  `messages` table. `versions` is keyed
+  `<channel>\0<message_serial>\0<version_serial>` so a prefix scan
+  enumerates a message's versions in order; `messages` is keyed
+  `<channel>\0<message_serial>` and holds the merged latest version.
+  Both are written by the same single writer as `channel_messages` and
+  trimmed by the same retention sweep. (Unlike the presence membership
+  set, these are durable — they are message state, not connection-scoped.)
 
 Per-process `seriesId` is regenerated on every `Open` and generator
 monotonic state is not persisted. The §8 serial format makes
@@ -544,7 +588,7 @@ all prior serials. The same-millisecond restart with an unlucky new
 seriesId is the only edge case we don't guarantee, and we don't.
 
 Retention is enforced by a background sweep goroutine that, per
-channel, walks the ordered `messages` keys from oldest forward and
+channel, walks the ordered `channel_messages` keys from oldest forward and
 deletes anything past the message TTL or beyond the per-channel cap
 (the cap counts ChannelMessages, since each is the unit of an atomic
 publish). Because keys are serial-ordered and writes are append-only,
@@ -564,17 +608,21 @@ single Postgres.
 Schema sketch:
 
 ```sql
--- One row per individual Message. The PK groups Messages under their
--- shared channelSerial; the channelSerial prefix encodes the mint
--- timestamp (§8), so a forward range scan over the PK covers ordered
--- history reads AND time-based retention without a separate
--- created_at column.
-CREATE TABLE messages (
+-- The append-only LOG: one row per individual Message or PresenceMessage,
+-- both kinds interleaved in one channelSerial namespace (§12.1). The PK
+-- groups a publish's Messages under their shared channelSerial; the
+-- channelSerial prefix encodes the mint timestamp (§8), so a forward
+-- range scan over the PK covers ordered history reads AND time-based
+-- retention without a separate created_at column. action is NOT a column
+-- — it lives in the payload (nothing scans by it); kind is, because reads
+-- filter by it.
+CREATE TABLE channel_messages (
   channel        TEXT     NOT NULL,
-  channel_serial TEXT     NOT NULL,    -- "<ts>-<ctr>@<series>" (§8)
+  channel_serial TEXT     NOT NULL,    -- "<ts>-<ctr>@<series>" (§8) — this cm's position
   idx            INT      NOT NULL,    -- position within the publish batch
   id             TEXT,                 -- nullable, client-supplied idempotency key
   kind           TEXT     NOT NULL DEFAULT 'message',  -- 'message' | 'presence' (§12.1)
+  message_serial TEXT,                 -- message identity (§8); NULL for presence; = channel_serial:idx for a create
   payload        BYTEA    NOT NULL,    -- msgpack protocol.Message or PresenceMessage, per kind
   PRIMARY KEY (channel, channel_serial, idx)
 );
@@ -582,13 +630,36 @@ CREATE TABLE messages (
 -- Idempotency: a non-NULL client-supplied id is unique per channel
 -- within the retention window. The partial index skips NULL ids so
 -- publishes without an id never collide.
-CREATE UNIQUE INDEX messages_idempotency_idx
-  ON messages (channel, id) WHERE id IS NOT NULL;
+CREATE UNIQUE INDEX channel_messages_idempotency_idx
+  ON channel_messages (channel, id) WHERE id IS NOT NULL;
 
--- Derived presence membership set: one row per live member, keyed by
+-- serial → versions: every version of a message in version order, backing
+-- GET .../messages/{serial}/versions and update/delete target validation
+-- (§13.4). Partial — message rows only; presence rows have no identity.
+CREATE INDEX channel_messages_serial_idx
+  ON channel_messages (channel, message_serial, channel_serial)
+  WHERE message_serial IS NOT NULL;
+
+-- Materialised current MESSAGE state: one row per live message holding its
+-- latest version — the message-side analogue of the presence table below.
+-- UPSERTed in the same transaction as the version's INSERT into
+-- channel_messages; a delete sets deleted = true but the row (and its
+-- versions in the log) stay queryable (soft delete, §13.2). create_serial
+-- keeps the message in its original position for collapsed history.
+CREATE TABLE messages (
+  channel         TEXT    NOT NULL,
+  message_serial  TEXT    NOT NULL,  -- stable identity
+  create_serial   TEXT    NOT NULL,  -- the create's channel_serial:idx (ordering position)
+  version_serial  TEXT    NOT NULL,  -- the latest version's channel_serial:idx
+  deleted         BOOLEAN NOT NULL DEFAULT false,
+  payload         BYTEA   NOT NULL,  -- msgpack of the merged latest Message
+  PRIMARY KEY (channel, message_serial)
+);
+
+-- Materialised current PRESENCE state: one row per live member, keyed by
 -- connectionId:clientId. ENTER/UPDATE upsert, LEAVE deletes — maintained
--- in the same transaction as the presence cm's INSERT above, so the set
--- stays consistent with the stream. node_id + expires_at drive the
+-- in the same transaction as the presence cm's INSERT into channel_messages,
+-- so the set stays consistent with the log. node_id + expires_at drive the
 -- crashed-node reaper (§12.5).
 CREATE TABLE presence (
   channel        TEXT        NOT NULL,
@@ -602,10 +673,13 @@ CREATE TABLE presence (
 );
 ```
 
-History scans add `kind = 'message'` (or `'presence'`) to the predicates
-above; the retention sweep deletes both kinds by channel_serial range.
-The membership-set `presence` table is independent of the message-stream
-retention sweep.
+Reads over the log (`channel_messages`) add `kind = 'message'` (or
+`'presence'`) to the predicates above. Collapsed message history reads the
+materialised `messages` table ordered by `create_serial`; a version scan
+reads `channel_messages` via `channel_messages_serial_idx`. The retention
+sweep deletes log rows by channel_serial range and, when a message's last
+surviving version ages out, drops its `messages` projection row too. The
+`presence` projection is independent of the log's retention sweep (§12.5).
 
 The DDL ships as versioned migrations under
 `internal/storage/postgres/migrations/*.sql` (e.g. `0001_initial.sql`)
@@ -637,13 +711,13 @@ channels. Each node generates its own seriesId at process start; the
 serial format itself (the `@seriesId` suffix) disambiguates concurrent
 mints, so generator state is not shared across nodes.
 
-Retention is a periodic background job that deletes the oldest
-messages on each channel using the channelSerial range — the first 14
-characters are the zero-padded mint timestamp in ms, so lex
-comparison matches numeric comparison:
+Retention is a periodic background job that deletes the oldest log rows
+on each channel using the channelSerial range — the first 14 characters
+are the zero-padded mint timestamp in ms, so lex comparison matches
+numeric comparison:
 
 ```sql
-DELETE FROM messages
+DELETE FROM channel_messages
 WHERE channel = $1
   AND channel_serial < lpad(((now_ms - ttl_ms))::text, 14, '0');
 ```
@@ -799,16 +873,30 @@ should use Ably or fork.
   which lets the disk backend (bbolt) and cluster backend (Postgres)
   use channelSerial directly as the primary key without a separate
   ordering column.
-- **Message.serial**: the server-assigned identifier for an
-  individual message within a ChannelMessage:
+- **Message.serial**: the server-assigned **identity** of an individual
+  message, of the form
 
   ```
   <channelSerial>:<idx>
   ```
 
   where `idx` is a zero-padded 3-digit position within the
-  ChannelMessage (`000` for a single-message publish). All messages
-  in a batch share the channelSerial prefix and differ only by `idx`.
+  ChannelMessage (`000` for a single-message publish). All messages in a
+  batch share the channelSerial prefix and differ only by `idx`. For a
+  plain publish (`action: create`) the serial is the position of that
+  publish. Crucially, it is **stable across versions**: when the message
+  is later updated, deleted, or appended (§13), every version carries the
+  *same* `serial` as the original create — the serial names the message,
+  not the version.
+- **Message.version**: present once mutable messages are in play (§13.1),
+  the server-assigned identity of a *single version* of a message. It
+  has the same `<channelSerial>:<idx>` shape — the position of the
+  publish that produced this version — so a create has `version == serial`
+  and each subsequent update/delete/append gets a fresh, strictly-greater
+  `version`. Lexicographic comparison of versions gives newest-wins
+  ordering. The wire `version` object also carries operation metadata
+  (timestamp, the operating `clientId`, an optional description, and
+  optional metadata).
 - **Message.id**: optional, **client-supplied** identifier used for
   idempotent publishing. If present, the server enforces uniqueness
   per channel within the message retention window: a second publish
@@ -1061,7 +1149,159 @@ This bounds orphan visibility to one lease window.
 There is no REST *write* surface for presence: a member is inherently
 bound to a realtime connection, so entering presence is realtime-only.
 
-## 13. Testing strategy
+## 13. Mutable messages
+
+Messages on a channel can be **updated**, **deleted**, and **appended**
+to after they are published. Like presence (§12), this is modelled as
+operations on the append-only stream rather than mutation of stored
+state: a mutation is a fresh publish — a new ChannelMessage that
+references a prior message's `serial` and carries an `action` — plus a
+derived **latest-version** view the server materialises so reads and
+history can resolve the current state of each message without replaying
+its whole version chain.
+
+### 13.1 Model — identity, version, action
+
+Every Message carries an `action` and a stable `serial` (§8):
+
+| `action` | meaning |
+|---|---|
+| `create` | an original publish (the default; what §2.1 / §7 already describe) |
+| `update` | replace fields of an existing message with a new version |
+| `delete` | soft-delete an existing message (a tombstone version) |
+| `append` | concatenate onto an existing message's data (§13.3) |
+
+`serial` names the **message**; `version` names a **single version** of
+it (§8). A create mints both equal to its own `<channelSerial>:<idx>`.
+An update/delete/append is an ordinary publish that lands at a *new*
+channelSerial: its Message repeats the target's `serial`, sets the
+`action`, and gets a fresh `version` (its own position). Versions sort
+lexicographically, so newest-wins is a string comparison.
+
+The action enum mirrors Ably's `MessageAction`, pinned to ably-go's
+constants at implementation (`create = 0`, `update = 1`, `delete = 2`,
+`append = 5`; `summary` / `meta` occupy other values). The wire shape
+matches Ably: `serial`, `action`, and a `version` object
+(`{serial, timestamp, clientId, description, metadata}`).
+
+Mutations ride the **same stream and Append/NOTIFY path** as any publish
+(§7): they are `kind = message` cms distinguished only by `action`
+(presence stays `kind = presence`, §12.1). Nothing on the live linked
+list or in storage is rewritten in place — a mutation is purely
+additive, and the `serial`-vs-`version` split is what lets readers
+collapse the chain.
+
+### 13.2 Update & delete
+
+An update or delete is published — REST `PATCH .../messages/{serial}`
+(target serial in the path, `action` in the body), or a WS `MESSAGE`
+frame carrying the `action` and the target `serial`. The server:
+
+1. Authorises against `message-{update,delete}-{own,any}` (§3.1): `-own`
+   requires the caller's resolved `clientId` to equal the target
+   message's creator; `-any` waives it. The WS surface also still
+   requires the `PUBLISH` attachment mode.
+2. Resolves the target's current latest version from the latest-version
+   fold (§13.4). A target that does not exist (never published, or aged
+   out of retention) is rejected (`ERROR` / `NACK` on WS, `4xx` on REST).
+3. Applies **shallow-mixin** semantics: only the fields supplied among
+   `data`, `name`, `extras` replace the corresponding fields of the
+   current version; unspecified fields are carried forward. The server
+   persists the resulting **merged** Message as the new version, so
+   subscribers and history always carry a complete message, never a diff.
+4. Stamps operation metadata into `version` (timestamp, operating
+   `clientId`, optional description/metadata), mints the new `version`,
+   persists the cm on the stream, and updates the `serial → versions`
+   index and the latest-version fold (§13.4).
+5. ACKs / NACKs (WS) or responds (REST) as for any publish.
+
+A `delete` is **soft**: it writes a tombstone version (the latest fold
+marks the message deleted) but the message and all its versions remain
+queryable via version history (§13.4). Subscribers receive the new
+version as an ordinary outbound `MESSAGE` frame carrying `action: update`
+/ `delete` and the unchanged `serial` — delivered by the same attachment
+cursor as any message (§4.4), so a live subscriber sees the edit or
+removal in stream order.
+
+### 13.3 Append
+
+`append` concatenates `data` onto the message's current latest version
+(name / extras follow the same shallow-mixin replace as update). It
+targets the high-frequency single-publisher case (e.g. streaming an LLM
+token sequence onto one message), so its delivery is looser than update /
+delete:
+
+- The server maintains the **rolled-up** latest data for the message. A
+  subscriber that is caught up receives each append **incrementally**
+  (just the delta `data`); the first delivery for a message a subscriber
+  has not yet seen — e.g. immediately after attach — is a full
+  `action: update` carrying the aggregated payload, after which it
+  receives subsequent appends incrementally.
+- The server may **conflate**: coalesce multiple appends, drop superseded
+  intermediate versions, or deliver an append as a full rolled-up
+  `update`. The only guarantee is that the last version a subscriber
+  receives is the most recent — there is no promise that every
+  intermediate append is delivered.
+- Appends are **not** retained as individual entries in version history;
+  only the aggregated latest version is durable. A channel param lets a
+  subscriber opt into receiving full versions instead of incremental
+  appends.
+
+Because append aggregation is stateful and conflation-sensitive, it is a
+**later phase** (see the Status callout): the core update / delete path
+ships first.
+
+### 13.4 Reads & history
+
+Two derived structures, both owned by the storage backend (§6) and
+maintained transactionally with each version's persist into the
+`channel_messages` log — the message analogues of the presence membership
+set:
+
+- **the materialised `messages` projection** (`serial → latest merged
+  Message`, with a deleted tombstone). Backs `GET .../messages/{serial}`
+  (one message, latest version) and the default `GET .../messages`
+  history, which returns the **latest version of each message positioned
+  at its create serial** — an edited message keeps its place in the
+  timeline but shows current content, and a deleted message shows as a
+  tombstone.
+- **the `serial → versions` index** over the log. Backs
+  `GET .../messages/{serial}/versions`, which returns *every* version of a
+  message (create + each update / delete) ordered by `version`, paginated
+  with the same `Link` convention as message history (§2.2). It is also
+  what an update / delete consults to validate and merge against its
+  target.
+
+Live and resume delivery are **not** collapsed: a fresh subscriber, and a
+resuming one replaying the gap (§4.3), receive the raw version cms in
+stream order (create, then each edit) and converge by newest-`version`
+exactly as they would have live. Only history *reads* collapse to the
+latest version. `rewind` (§4.3) counts stream cms, so a window may span
+several versions of the same message.
+
+### 13.5 Capabilities
+
+Mutations add four capability ops to §3.1, matching Ably:
+`message-update-own`, `message-update-any`, `message-delete-own`,
+`message-delete-any` (append is gated by `message-update-*`). The `-own`
+/ `-any` distinction is the first **ownership-scoped** op in the model:
+`-own` resolves only if the caller's `clientId` (§3.2) equals the target
+message's creator `clientId`; `-any` skips the check. Creating a message
+is still plain `publish`; all version reads (latest, by-serial, versions)
+use `history`.
+
+### 13.6 Surface
+
+- **WS** — inbound `MESSAGE` carries `action` + (for mutations) the
+  target `serial`; outbound `MESSAGE` carries `action` + `version`. No
+  new `ProtocolMessage` action is introduced — mutations reuse `MESSAGE`
+  (15), distinguished by the Message-level `action` field.
+- **REST** — `POST .../messages` creates; `PATCH .../messages/{serial}`
+  carries a mutation (target serial in the path, `action` in the body);
+  `GET .../messages/{serial}` and `GET .../messages/{serial}/versions`
+  read the latest version and the full version chain (§2.2).
+
+## 14. Testing strategy
 
 - **Unit**: per-package; mock-free where practical (the storage interface
   has an in-memory implementation, exercised by the same test suite as the
@@ -1076,7 +1316,7 @@ There is no existing Ably protocol conformance suite to target; the
 ably-go integration tests are the de-facto external check on SDK
 compatibility.
 
-## 14. Project layout & licensing
+## 15. Project layout & licensing
 
 - License: **Apache 2.0** (matches ably-go).
 - Module: `github.com/ably/ably-server`.

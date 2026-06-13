@@ -45,6 +45,7 @@ the full spec):
   `GET /channels/{name}/presence[/history]`, `GET /time`,
   `GET /healthz`, `GET /readyz`.
 - **Presence** — enter/update/leave, sync on attach, presence history.
+- **Mutable messages** — message update/delete/append with version history.
 - **Auth** — API key (Basic) or JWT (HS256) with Ably-style capabilities.
 
 Out of scope: push, integrations, multi-region, Spaces, Chat,
