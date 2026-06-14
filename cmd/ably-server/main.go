@@ -118,6 +118,9 @@ func run(ctx context.Context, opts runOpts) int {
 	mux.HandleFunc("GET /", rt.HandleWebSocket)
 	mux.HandleFunc("POST /channels/{name}/messages", rs.HandlePublish)
 	mux.HandleFunc("GET /channels/{name}/messages", rs.HandleHistory)
+	// ably-go's REST History() requests /history (TASK-57); serve it as
+	// an alias so the SDK's history reads work.
+	mux.HandleFunc("GET /channels/{name}/history", rs.HandleHistory)
 	mux.HandleFunc("PATCH /channels/{name}/messages/{serial}", rs.HandleMutate)
 	mux.HandleFunc("GET /channels/{name}/messages/{serial}", rs.HandleMessage)
 	mux.HandleFunc("GET /channels/{name}/messages/{serial}/versions", rs.HandleMessageVersions)
