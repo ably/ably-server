@@ -14,7 +14,6 @@ import (
 // ProtocolMessage action), distinguished by the Message-level action and
 // a target serial. The handler:
 //
-//   - requires an attachment holding the PUBLISH mode (§13.5);
 //   - validates a single message carrying a mutation action and a target;
 //   - stamps the operating clientId onto the version;
 //   - calls Channel.Mutate (which validates the target, merges, mints the
@@ -25,10 +24,12 @@ import (
 // frame via the normal attachment cursor (forward()), carrying the action,
 // the new version, and the unchanged serial in stream order.
 //
-// Capability/ownership gating is intentionally absent: the capability
-// framework (TASK-12) is unbuilt, so the only gate is the PUBLISH mode,
-// matching the rest of the realtime surface. TASK-51 adds ownership once
-// TASK-12 lands.
+// No attachment or capability gate is applied — a mutation is a write to
+// the channel stream, handled exactly like a create publish, which needs
+// no attachment either. DESIGN §13.5's PUBLISH-mode + message-* capability
+// gating lands uniformly (for publish and mutate) with the capability
+// framework (TASK-12); applying it to mutations alone would diverge from
+// the create path.
 func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolMessage) {
 	if len(msg.Messages) != 1 {
 		c.logger.Warn("mutation must carry exactly one message; rejecting",
@@ -52,17 +53,10 @@ func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolM
 		return
 	}
 
-	// A mutation requires an attachment holding the PUBLISH mode
-	// (DESIGN.md §13.5).
-	a, ok := c.attachments[msg.Channel]
-	if !ok || !a.hasMode(protocol.FlagPublish) {
-		c.logger.Warn("mutation without an attached PUBLISH-mode channel; rejecting",
-			"channel", msg.Channel, "msgSerial", msg.MsgSerial)
-		c.nack(ctx, msg.MsgSerial, &protocol.ErrorInfo{
-			Message:    "a mutation requires an attachment with the publish mode",
-			Code:       40160,
-			StatusCode: 401,
-		})
+	ch, err := c.manager.GetChannel(ctx, msg.Channel)
+	if err != nil {
+		c.logger.Warn("mutation failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerial, "err", err)
+		c.nack(ctx, msg.MsgSerial, nil)
 		return
 	}
 
@@ -73,7 +67,7 @@ func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolM
 		m.ClientID = c.clientID
 	}
 
-	cm, _, err := a.channel.Mutate(ctx, m)
+	cm, _, err := ch.Mutate(ctx, m)
 	if err != nil {
 		if errors.Is(err, storage.ErrTargetNotFound) {
 			c.logger.Warn("mutation target not found; NACKing",
@@ -97,6 +91,6 @@ func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolM
 		Action:    protocol.ActionAck,
 		MsgSerial: msg.MsgSerial,
 		Count:     1,
-		Serials:   []string{storage.VersionSerial(cm.Messages[0])},
+		Res:       []*protocol.PublishResult{{Serials: []string{storage.VersionSerial(cm.Messages[0])}}},
 	})
 }

@@ -4,7 +4,7 @@ title: 'Realtime mutations: inbound MESSAGE update/delete/append and outbound de
 status: Done
 assignee: []
 created_date: '2026-06-13 14:46'
-updated_date: '2026-06-14 21:11'
+updated_date: '2026-06-14 22:10'
 labels:
   - mutable-messages
 dependencies:
@@ -35,5 +35,5 @@ Per DESIGN.md sections 13.2 and 13.6. On an inbound MESSAGE frame with action up
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-AC#2: the PUBLISH attachment-mode gate is implemented and tested; the message-* capability gate is deferred — the capability framework (TASK-12) is unbuilt, so no capability/ownership check is wired (per project direction). It slots into handleMutation once TASK-12 lands.
+Correction: an earlier version required a PUBLISH-mode attachment for mutations (mirroring presence). That was removed — it was inconsistent with the create/publish path, which requires no attachment. A mutation is a write to the channel stream, handled like a create. DESIGN §13.5's PUBLISH-mode + message-* capability gating is deferred uniformly (publish and mutate) to the capability framework (TASK-12), the same way §3.1 capabilities are deferred.
 <!-- SECTION:NOTES:END -->

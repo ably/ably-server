@@ -193,23 +193,39 @@ func TestMutationTargetNotFound(t *testing.T) {
 	}
 }
 
-// TestMutationRequiresPublishMode: a mutation from an attachment without
-// the PUBLISH mode is NACKed before any storage work (DESIGN.md §13.5).
-func TestMutationRequiresPublishMode(t *testing.T) {
+// TestMutationWithoutAttachmentSucceeds: a mutation needs no attachment —
+// like a create publish, it is a write to the channel stream. The
+// publisher here never attaches; the mutation is still ACKed.
+func TestMutationWithoutAttachmentSucceeds(t *testing.T) {
 	srv, _ := newTestServer(t, time.Hour)
-	ws := dialClient(t, srv, "alice")
-	drainConnected(t, ws)
-	attach(t, ws, "room", protocol.FlagSubscribe) // subscribe-only, no PUBLISH
 
-	sendMutation(t, ws, "room", 9, &protocol.Message{
-		Action: protocol.MessageUpdate, Serial: "00000000000001-000@deadbeef00:000", Data: "x",
+	// A subscriber (separate connection) so we can learn the create serial
+	// and confirm delivery.
+	sub := dialClient(t, srv, "")
+	drainConnected(t, sub)
+	attach(t, sub, "room", protocol.FlagSubscribe)
+
+	// Publisher: never attaches, just publishes a create then mutates it.
+	pub := dialClient(t, srv, "alice")
+	drainConnected(t, pub)
+	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "room",
+		MsgSerial: 1,
+		Messages:  []*protocol.Message{{Data: "v1"}},
 	})
-
-	f := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
-	if f.Action != protocol.ActionNack {
-		t.Fatalf("action = %v, want NACK", f.Action)
+	if ack := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {
+		t.Fatalf("create frame = %v, want ACK", ack.Action)
 	}
-	if f.Error == nil || f.Error.Code != 40160 {
-		t.Errorf("error = %+v, want code 40160 (mode required)", f.Error)
+	create := readMessage(t, sub)
+	target := create.Messages[0].Serial
+
+	sendMutation(t, pub, "room", 2, &protocol.Message{Action: protocol.MessageUpdate, Serial: target, Data: "v2"})
+	if ack := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {
+		t.Fatalf("mutation frame = %v, want ACK (no attachment required)", ack.Action)
+	}
+	upd := readMessage(t, sub)
+	if upd.Messages[0].Action != protocol.MessageUpdate || upd.Messages[0].Data != "v2" {
+		t.Errorf("delivered mutation = %+v, want update/v2", upd.Messages[0])
 	}
 }
