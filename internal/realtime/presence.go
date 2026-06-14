@@ -69,10 +69,12 @@ func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolM
 		c.recordPresence(msg.Channel, p.ClientID, p.Action)
 	}
 
+	// Count is 1: an ACK acknowledges one protocol message (this PRESENCE
+	// frame), not the members it carries.
 	c.queue(ctx, &protocol.ProtocolMessage{
 		Action:    protocol.ActionAck,
 		MsgSerial: msg.MsgSerial,
-		Count:     len(msg.Presence),
+		Count:     1,
 	})
 }
 

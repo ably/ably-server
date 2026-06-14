@@ -467,7 +467,11 @@ func TestPublishAcksAndForwardsToAttachedConnection(t *testing.T) {
 	}
 }
 
-func TestPublishAckCountReflectsBatchSize(t *testing.T) {
+// TestPublishAckIsPerProtocolMessage: an ACK acknowledges one protocol
+// message (Count=1) regardless of how many messages the frame carries —
+// msgSerial is per frame, not per message. The per-message serials ride
+// the ACK's Res entry instead.
+func TestPublishAckIsPerProtocolMessage(t *testing.T) {
 	srv, _ := newTestServer(t, time.Hour)
 	ws := dial(t, srv, "")
 	drainConnected(t, ws)
@@ -487,8 +491,15 @@ func TestPublishAckCountReflectsBatchSize(t *testing.T) {
 	if ack.MsgSerial != 3 {
 		t.Errorf("MsgSerial = %d, want 3", ack.MsgSerial)
 	}
-	if ack.Count != 3 {
-		t.Errorf("Count = %d, want 3", ack.Count)
+	if ack.Count != 1 {
+		t.Errorf("Count = %d, want 1 (one protocol message acked, not the batch size)", ack.Count)
+	}
+	// The three assigned serials ride a single Res entry for the frame.
+	if len(ack.Res) != 1 {
+		t.Fatalf("Res length = %d, want 1 (one entry per acked frame)", len(ack.Res))
+	}
+	if len(ack.Res[0].Serials) != 3 {
+		t.Errorf("Res[0].Serials = %v, want 3 serials for the 3-message batch", ack.Res[0].Serials)
 	}
 }
 

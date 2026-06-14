@@ -365,3 +365,46 @@ func TestIntegrationClusterRESTPublishObservedAcrossNodes(t *testing.T) {
 
 func nameFor(i int) string { return "from-" + strconv.Itoa(i) }
 func dataFor(i int) string { return "payload-" + strconv.Itoa(i) }
+
+// TestIntegrationBatchPublishSDK publishes a multi-message batch via the
+// SDK's PublishMultiple. A single frame is acked with count=1; reporting
+// the inner-message count would over-ack and panic ably-go's pending
+// emitter (TASK-59). All messages must round-trip to a subscriber.
+func TestIntegrationBatchPublishSDK(t *testing.T) {
+	addr := startServer(t)
+	client := newClient(t, addr)
+	connect(t, client)
+
+	ctx, cancel := testCtx(t)
+	defer cancel()
+
+	ch := client.Channels.Get("batch")
+	received := make(chan *ably.Message, 8)
+	unsub, err := ch.SubscribeAll(ctx, func(m *ably.Message) { received <- m })
+	if err != nil {
+		t.Fatalf("SubscribeAll: %v", err)
+	}
+	defer unsub()
+
+	// Must not error or panic the SDK connection goroutine.
+	if err := ch.PublishMultiple(ctx, []*ably.Message{
+		{Name: "a", Data: "1"}, {Name: "b", Data: "2"}, {Name: "c", Data: "3"},
+	}); err != nil {
+		t.Fatalf("PublishMultiple: %v", err)
+	}
+
+	got := map[string]bool{}
+	for range 3 {
+		select {
+		case m := <-received:
+			got[m.Name] = true
+		case <-ctx.Done():
+			t.Fatalf("only received %d/3 batch messages: %v", len(got), got)
+		}
+	}
+	for _, n := range []string{"a", "b", "c"} {
+		if !got[n] {
+			t.Errorf("missing batch message %q (got %v)", n, got)
+		}
+	}
+}

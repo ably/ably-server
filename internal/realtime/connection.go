@@ -208,21 +208,25 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 		c.nack(ctx, msg.MsgSerial, nil)
 		return
 	}
+	// Count is 1: an ACK acknowledges protocol messages (one msgSerial per
+	// frame), not the inner messages. We emit one ACK per inbound frame
+	// and never batch-ack, so it is always 1. The per-message serials ride
+	// the single Res entry (Ably's TR4s) so the publisher still learns
+	// every serial it was assigned (DESIGN.md §8).
 	c.queue(ctx, &protocol.ProtocolMessage{
 		Action:    protocol.ActionAck,
 		MsgSerial: msg.MsgSerial,
-		Count:     len(cm.Messages),
-		Res:       publishResults(cm.Messages),
+		Count:     1,
+		Res:       []*protocol.PublishResult{{Serials: messageSerials(cm.Messages)}},
 	})
 }
 
-// publishResults builds the per-message ACK results (Ably's TR4s Res
-// array): one entry per message carrying its server-assigned serial, so
-// the publisher can learn the serials it was assigned (DESIGN.md §8).
-func publishResults(msgs []*protocol.Message) []*protocol.PublishResult {
-	out := make([]*protocol.PublishResult, len(msgs))
+// messageSerials returns the server-assigned Serial of each message in
+// idx order — the serials carried in the frame's ACK Res entry.
+func messageSerials(msgs []*protocol.Message) []string {
+	out := make([]string, len(msgs))
 	for i, m := range msgs {
-		out[i] = &protocol.PublishResult{Serials: []string{m.Serial}}
+		out[i] = m.Serial
 	}
 	return out
 }
