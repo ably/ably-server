@@ -128,6 +128,11 @@ func (s *Server) HandleHistory(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// The default message history collapses to the latest version of each
+	// message positioned at its create serial (DESIGN.md §13.4): an edited
+	// message keeps its place but shows current content, a deleted one
+	// shows as a tombstone. (Raw stream order is only for live/resume.)
+	q.Collapse = true
 
 	format, err := acceptFormat(r.Header.Get("Accept"))
 	if err != nil {
@@ -159,6 +164,191 @@ func (s *Server) HandleHistory(w http.ResponseWriter, r *http.Request) {
 	writeHistoryLinks(w, r, page)
 	w.Header().Set("Content-Type", contentTypeFor(format))
 	_, _ = w.Write(body)
+}
+
+// HandleMutate applies a mutation (update/delete/append) to an existing
+// message: PATCH /channels/{name}/messages/{serial} (DESIGN.md §13.2,
+// §13.6). The target serial is in the path; the body is a single Message
+// carrying the action and the fields to mix in (JSON or msgpack via
+// Content-Type). On success it returns the resulting merged version in
+// the Accept format. A missing/aged-out target is a 404.
+//
+// No capability/ownership gating is applied: the capability framework
+// (TASK-12) is unbuilt, so the endpoint requires only the API key, like
+// publish. TASK-51 adds the message-* ownership check once TASK-12 lands.
+func (s *Server) HandleMutate(w http.ResponseWriter, r *http.Request) {
+	if !s.authenticate(w, r) {
+		return
+	}
+	name := r.PathValue("name")
+	target := r.PathValue("serial")
+	if name == "" || target == "" {
+		http.Error(w, "channel name and message serial required", http.StatusBadRequest)
+		return
+	}
+
+	format, err := contentTypeFormat(r.Header.Get("Content-Type"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnsupportedMediaType)
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body) == 0 {
+		http.Error(w, "empty body", http.StatusBadRequest)
+		return
+	}
+	var mut protocol.Message
+	if err := unmarshal(body, format, &mut); err != nil {
+		http.Error(w, fmt.Sprintf("decode mutation: %v", err), http.StatusBadRequest)
+		return
+	}
+	if !mut.Action.IsMutation() {
+		http.Error(w, fmt.Sprintf("action %s is not a mutation; PATCH requires update/delete/append", mut.Action), http.StatusBadRequest)
+		return
+	}
+	// The target serial comes from the path — it is authoritative.
+	mut.Serial = target
+
+	respFormat, err := acceptFormat(r.Header.Get("Accept"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotAcceptable)
+		return
+	}
+
+	ch, err := s.manager.GetChannel(r.Context(), name)
+	if err != nil {
+		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
+		http.Error(w, "channel unavailable", http.StatusInternalServerError)
+		return
+	}
+	cm, _, err := ch.Mutate(r.Context(), &mut)
+	if errors.Is(err, storage.ErrTargetNotFound) {
+		http.Error(w, "target message not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		s.logger.Warn("mutate failed", "channel", name, "target", target, "err", err)
+		http.Error(w, "mutate failed", http.StatusInternalServerError)
+		return
+	}
+
+	out, err := marshalMessage(cm.Messages[0], respFormat)
+	if err != nil {
+		s.logger.Warn("mutate encode failed", "channel", name, "err", err)
+		http.Error(w, "encode failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeFor(respFormat))
+	_, _ = w.Write(out)
+}
+
+// HandleMessage returns the latest version of a single message —
+// GET /channels/{name}/messages/{serial} (DESIGN.md §13.4) — or its
+// tombstone if deleted. A message that never existed (or aged out) is a
+// 404. Gated by history (API key only today; capability is TASK-12).
+func (s *Server) HandleMessage(w http.ResponseWriter, r *http.Request) {
+	if !s.authenticate(w, r) {
+		return
+	}
+	name := r.PathValue("name")
+	serial := r.PathValue("serial")
+	if name == "" || serial == "" {
+		http.Error(w, "channel name and message serial required", http.StatusBadRequest)
+		return
+	}
+
+	format, err := acceptFormat(r.Header.Get("Accept"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotAcceptable)
+		return
+	}
+
+	ch, err := s.manager.GetChannel(r.Context(), name)
+	if err != nil {
+		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
+		http.Error(w, "channel unavailable", http.StatusInternalServerError)
+		return
+	}
+	m, err := ch.LatestVersion(r.Context(), serial)
+	if errors.Is(err, storage.ErrTargetNotFound) {
+		http.Error(w, "message not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		s.logger.Warn("message read failed", "channel", name, "serial", serial, "err", err)
+		http.Error(w, "read failed", http.StatusInternalServerError)
+		return
+	}
+
+	out, err := marshalMessage(m, format)
+	if err != nil {
+		s.logger.Warn("message encode failed", "channel", name, "err", err)
+		http.Error(w, "encode failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeFor(format))
+	_, _ = w.Write(out)
+}
+
+// HandleMessageVersions returns every version of a message ordered by
+// version — GET /channels/{name}/messages/{serial}/versions (DESIGN.md
+// §13.4) — paginated with the same Link convention as message history,
+// except the cursor is a version serial. A message with no versions is a
+// 404. Gated by history (API key only today; capability is TASK-12).
+func (s *Server) HandleMessageVersions(w http.ResponseWriter, r *http.Request) {
+	if !s.authenticate(w, r) {
+		return
+	}
+	name := r.PathValue("name")
+	serial := r.PathValue("serial")
+	if name == "" || serial == "" {
+		http.Error(w, "channel name and message serial required", http.StatusBadRequest)
+		return
+	}
+
+	q, err := parseHistoryQuery(r.URL.Query())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	format, err := acceptFormat(r.Header.Get("Accept"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotAcceptable)
+		return
+	}
+
+	ch, err := s.manager.GetChannel(r.Context(), name)
+	if err != nil {
+		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
+		http.Error(w, "channel unavailable", http.StatusInternalServerError)
+		return
+	}
+	page, err := ch.Versions(r.Context(), serial, q)
+	if errors.Is(err, storage.ErrTargetNotFound) {
+		http.Error(w, "message not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		s.logger.Warn("versions failed", "channel", name, "serial", serial, "err", err)
+		http.Error(w, "versions failed", http.StatusInternalServerError)
+		return
+	}
+
+	out := flattenHistory(page.ChannelMessages)
+	resp, err := marshalBody(out, format)
+	if err != nil {
+		s.logger.Warn("versions encode failed", "channel", name, "err", err)
+		http.Error(w, "encode failed", http.StatusInternalServerError)
+		return
+	}
+
+	writeLinkHeaders(w, r, lastVersionSerial(page), page.HasMore)
+	w.Header().Set("Content-Type", contentTypeFor(format))
+	_, _ = w.Write(resp)
 }
 
 // HandlePresence returns the channel's current presence set as a flat
@@ -556,14 +746,20 @@ func marshalBody(v []*protocol.Message, format protocol.Format) ([]byte, error) 
 	return nil, fmt.Errorf("unsupported format")
 }
 
-// writeHistoryLinks emits RFC 5988 Link headers: rel="current"
-// (request URL verbatim), rel="first" (request URL minus the opaque
-// cursor), and — when more results exist past the page — rel="next"
-// carrying the cursor that should bound the next request.
-//
-// Clients are required to treat the link URLs opaquely; the cursor's
-// parameter name and value are internal-only.
+// writeHistoryLinks emits the pagination Link headers for a message or
+// presence history page; the next-cursor boundary is the page's last
+// item serial.
 func writeHistoryLinks(w http.ResponseWriter, r *http.Request, page storage.HistoryPage) {
+	writeLinkHeaders(w, r, lastMessageSerial(page), page.HasMore)
+}
+
+// writeLinkHeaders emits RFC 5988 Link headers: rel="current" (request
+// URL verbatim), rel="first" (request URL minus the opaque cursor), and
+// — when hasMore and boundary is non-empty — rel="next" carrying the
+// cursor that should bound the next request. Clients are required to
+// treat the link URLs opaquely; the cursor's parameter name and value
+// are internal-only.
+func writeLinkHeaders(w http.ResponseWriter, r *http.Request, boundary string, hasMore bool) {
 	current := *r.URL
 	current.Host, current.Scheme = "", ""
 
@@ -577,16 +773,41 @@ func writeHistoryLinks(w http.ResponseWriter, r *http.Request, page storage.Hist
 		fmt.Sprintf(`<%s>; rel="first"`, first.RequestURI()),
 	}
 
-	if boundary := lastMessageSerial(page); boundary != "" && page.HasMore {
+	if boundary != "" && hasMore {
 		next := current
 		nextQ := next.Query()
-		// The cursor is a Message.Serial (`<channelSerial>:<idx>`),
-		// matching Ably's REST: pagination strictly excludes the
-		// cursor in the requested direction.
+		// Pagination strictly excludes the cursor in the requested
+		// direction (matching Ably's REST).
 		nextQ.Set(internalCursorParam, boundary)
 		next.RawQuery = nextQ.Encode()
 		links = append(links, fmt.Sprintf(`<%s>; rel="next"`, next.RequestURI()))
 	}
 
 	w.Header().Set("Link", strings.Join(links, ", "))
+}
+
+// lastVersionSerial returns the version serial of the trailing message in
+// a versions page — the cursor boundary for version-history pagination
+// (each version's own serial, not the shared message identity).
+func lastVersionSerial(page storage.HistoryPage) string {
+	if len(page.ChannelMessages) == 0 {
+		return ""
+	}
+	cm := page.ChannelMessages[len(page.ChannelMessages)-1]
+	if n := len(cm.Messages); n > 0 {
+		return storage.VersionSerial(cm.Messages[n-1])
+	}
+	return ""
+}
+
+// marshalMessage encodes a single Message using the requested format —
+// used by the single-message read and the mutation result.
+func marshalMessage(m *protocol.Message, format protocol.Format) ([]byte, error) {
+	switch format {
+	case protocol.FormatJSON:
+		return json.Marshal(m)
+	case protocol.FormatMsgpack:
+		return msgpack.Marshal(m)
+	}
+	return nil, fmt.Errorf("unsupported format")
 }
