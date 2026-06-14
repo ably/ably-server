@@ -211,7 +211,8 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 		})
 		return
 	}
-	if _, _, err := ch.Publish(ctx, msg.Messages); err != nil {
+	cm, _, err := ch.Publish(ctx, msg.Messages)
+	if err != nil {
 		c.logger.Warn("publish failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerial, "err", err)
 		c.queue(ctx, &protocol.ProtocolMessage{
 			Action:    protocol.ActionNack,
@@ -222,8 +223,20 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 	c.queue(ctx, &protocol.ProtocolMessage{
 		Action:    protocol.ActionAck,
 		MsgSerial: msg.MsgSerial,
-		Count:     len(msg.Messages),
+		Count:     len(cm.Messages),
+		Serials:   messageSerials(cm.Messages),
 	})
+}
+
+// messageSerials returns the server-assigned Serial of each message in
+// idx order — the ACK payload that lets a publisher learn the serials it
+// was assigned (DESIGN.md §8).
+func messageSerials(msgs []*protocol.Message) []string {
+	out := make([]string, len(msgs))
+	for i, m := range msgs {
+		out[i] = m.Serial
+	}
+	return out
 }
 
 // queue pushes a frame onto the outbound channel, blocking under

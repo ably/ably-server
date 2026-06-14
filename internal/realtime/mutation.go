@@ -73,7 +73,7 @@ func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolM
 		m.ClientID = c.clientID
 	}
 
-	_, _, err := a.channel.Mutate(ctx, m)
+	cm, _, err := a.channel.Mutate(ctx, m)
 	if err != nil {
 		if errors.Is(err, storage.ErrTargetNotFound) {
 			c.logger.Warn("mutation target not found; NACKing",
@@ -91,9 +91,12 @@ func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolM
 		return
 	}
 
+	// The ACK carries the new version serial so the SDK can return it as
+	// the operation's VersionSerial (DESIGN.md §13.1).
 	c.queue(ctx, &protocol.ProtocolMessage{
 		Action:    protocol.ActionAck,
 		MsgSerial: msg.MsgSerial,
 		Count:     1,
+		Serials:   []string{storage.VersionSerial(cm.Messages[0])},
 	})
 }

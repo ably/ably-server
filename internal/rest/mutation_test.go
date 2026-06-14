@@ -77,7 +77,12 @@ func patch(t *testing.T, srv *httptest.Server, channel, serial string, m *protoc
 	return request(t, srv, http.MethodPatch, "/channels/"+channel+"/messages/"+serial, "application/json", body, true)
 }
 
-func TestPatchUpdateReturnsVersion(t *testing.T) {
+// versionSerialResponse is the PATCH response shape (RSL15e).
+type versionSerialResponse struct {
+	VersionSerial string `json:"versionSerial"`
+}
+
+func TestPatchUpdateReturnsVersionSerial(t *testing.T) {
 	srv, _ := newTestServer(t)
 	serial := publishOne(t, srv, "room", &protocol.Message{Name: "n", Data: "v1", ClientID: "alice"})
 
@@ -85,19 +90,27 @@ func TestPatchUpdateReturnsVersion(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("PATCH status = %d, want 200", resp.StatusCode)
 	}
-	var got protocol.Message
+	var got versionSerialResponse
 	decodeJSON(t, resp, &got)
-	if got.Serial != serial {
-		t.Errorf("serial = %q, want stable identity %q", got.Serial, serial)
+	if got.VersionSerial == "" || got.VersionSerial == serial {
+		t.Errorf("versionSerial = %q, want a fresh version serial != identity %q", got.VersionSerial, serial)
 	}
-	if got.Action != protocol.MessageUpdate || got.Data != "v2" {
-		t.Errorf("got action=%v data=%v, want update/v2", got.Action, got.Data)
+
+	// The merged content is observable via the single-message read.
+	mr := request(t, srv, http.MethodGet, "/channels/room/messages/"+serial, "", nil, true)
+	var m protocol.Message
+	decodeJSON(t, mr, &m)
+	if m.Serial != serial {
+		t.Errorf("serial = %q, want stable identity %q", m.Serial, serial)
 	}
-	if got.Name != "n" {
-		t.Errorf("name = %q, want carried-forward 'n'", got.Name)
+	if m.Action != protocol.MessageUpdate || m.Data != "v2" {
+		t.Errorf("got action=%v data=%v, want update/v2", m.Action, m.Data)
 	}
-	if got.Version == nil || got.Version.Serial == serial {
-		t.Errorf("version = %+v, want a fresh version serial", got.Version)
+	if m.Name != "n" {
+		t.Errorf("name = %q, want carried-forward 'n'", m.Name)
+	}
+	if m.Version == nil || m.Version.Serial != got.VersionSerial {
+		t.Errorf("version = %+v, want serial %q", m.Version, got.VersionSerial)
 	}
 }
 
@@ -245,11 +258,31 @@ func TestPatchAndReadMsgpack(t *testing.T) {
 		t.Errorf("Content-Type = %q, want application/x-msgpack", ct)
 	}
 	raw, _ := io.ReadAll(resp.Body)
-	var got protocol.Message
+	var got struct {
+		VersionSerial string `msgpack:"versionSerial"`
+	}
 	if err := msgpack.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("decode msgpack: %v", err)
 	}
-	if got.Data != "v2" || got.Action != protocol.MessageUpdate {
-		t.Errorf("msgpack mutation result = %+v, want update/v2", got)
+	if got.VersionSerial == "" {
+		t.Fatalf("msgpack mutation result has empty versionSerial")
+	}
+
+	// Read back the merged version via msgpack single-message read.
+	mreq, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/channels/room/messages/"+serial, nil)
+	mreq.SetBasicAuth("app.key", "secret")
+	mreq.Header.Set("Accept", "application/x-msgpack")
+	mresp, err := srv.Client().Do(mreq)
+	if err != nil {
+		t.Fatalf("GET msgpack: %v", err)
+	}
+	t.Cleanup(func() { mresp.Body.Close() })
+	mraw, _ := io.ReadAll(mresp.Body)
+	var m protocol.Message
+	if err := msgpack.Unmarshal(mraw, &m); err != nil {
+		t.Fatalf("decode msgpack message: %v", err)
+	}
+	if m.Data != "v2" || m.Action != protocol.MessageUpdate {
+		t.Errorf("msgpack merged version = %+v, want update/v2", m)
 	}
 }

@@ -87,18 +87,68 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	respFormat, err := acceptFormat(r.Header.Get("Accept"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotAcceptable)
+		return
+	}
+
 	ch, err := s.manager.GetChannel(r.Context(), name)
 	if err != nil {
 		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
 		http.Error(w, "channel unavailable", http.StatusInternalServerError)
 		return
 	}
-	if _, _, err := ch.Publish(r.Context(), msgs); err != nil {
+	cm, _, err := ch.Publish(r.Context(), msgs)
+	if err != nil {
 		s.logger.Warn("publish failed", "channel", name, "err", err)
 		http.Error(w, "publish failed", http.StatusInternalServerError)
 		return
 	}
+
+	// Return the server-assigned serials so the SDK can populate its
+	// publish result (DESIGN.md §8).
+	respBody, err := marshalValue(publishResponse{Serials: messageSerials(cm.Messages)}, respFormat)
+	if err != nil {
+		s.logger.Warn("publish encode failed", "channel", name, "err", err)
+		http.Error(w, "encode failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeFor(respFormat))
 	w.WriteHeader(http.StatusCreated)
+	_, _ = w.Write(respBody)
+}
+
+// publishResponse is the REST POST /messages response body: the serials
+// the server assigned, one per published message in order.
+type publishResponse struct {
+	Serials []string `json:"serials,omitempty" msgpack:"serials,omitempty"`
+}
+
+// updateDeleteResponse is the REST PATCH /messages/{serial} response
+// body: the new version's serial.
+type updateDeleteResponse struct {
+	VersionSerial string `json:"versionSerial,omitempty" msgpack:"versionSerial,omitempty"`
+}
+
+// messageSerials returns each message's server-assigned Serial in order.
+func messageSerials(msgs []*protocol.Message) []string {
+	out := make([]string, len(msgs))
+	for i, m := range msgs {
+		out[i] = m.Serial
+	}
+	return out
+}
+
+// marshalValue encodes an arbitrary value in the requested wire format.
+func marshalValue(v any, format protocol.Format) ([]byte, error) {
+	switch format {
+	case protocol.FormatJSON:
+		return json.Marshal(v)
+	case protocol.FormatMsgpack:
+		return msgpack.Marshal(v)
+	}
+	return nil, fmt.Errorf("unsupported format")
 }
 
 // HandleHistory authenticates the request, parses the Ably-SDK query
@@ -236,7 +286,10 @@ func (s *Server) HandleMutate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	out, err := marshalMessage(cm.Messages[0], respFormat)
+	// Respond with the new version serial (the SDK's UpdateDeleteResult
+	// wire shape, RSL15e); the full merged version is available via
+	// GET .../messages/{serial} and .../versions.
+	out, err := marshalValue(updateDeleteResponse{VersionSerial: storage.VersionSerial(cm.Messages[0])}, respFormat)
 	if err != nil {
 		s.logger.Warn("mutate encode failed", "channel", name, "err", err)
 		http.Error(w, "encode failed", http.StatusInternalServerError)

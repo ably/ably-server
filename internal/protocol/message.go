@@ -76,6 +76,11 @@ type ProtocolMessage struct {
 	MsgSerial     int64              `json:"msgSerial,omitempty"     msgpack:"msgSerial,omitempty"`
 	Timestamp     int64              `json:"timestamp,omitempty"     msgpack:"timestamp,omitempty"`
 	Count         int                `json:"count,omitempty"         msgpack:"count,omitempty"`
+	// Serials carries the server-assigned serials back to the publisher
+	// on an ACK: the persisted Message.Serial of each message in a
+	// publish (idx order), or the new version serial of a mutation. SDKs
+	// read it to populate publish/update results (DESIGN.md §8, §13.1).
+	Serials       []string           `json:"serials,omitempty"       msgpack:"serials,omitempty"`
 	Flags         int64              `json:"flags,omitempty"         msgpack:"flags,omitempty"`
 	Messages      []*Message         `json:"messages,omitempty"      msgpack:"messages,omitempty"`
 	Presence      []*PresenceMessage `json:"presence,omitempty"      msgpack:"presence,omitempty"`
