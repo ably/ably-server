@@ -178,18 +178,12 @@ func (c *connection) handleDetach(ctx context.Context, name string) {
 func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMessage) {
 	if msg.Channel == "" {
 		c.logger.Warn("MESSAGE with empty channel name; rejecting", "msgSerial", msg.MsgSerial)
-		c.queue(ctx, &protocol.ProtocolMessage{
-			Action:    protocol.ActionNack,
-			MsgSerial: msg.MsgSerial,
-		})
+		c.nack(ctx, msg.MsgSerial, nil)
 		return
 	}
 	if len(msg.Messages) == 0 {
 		c.logger.Warn("MESSAGE with no payload; rejecting", "msgSerial", msg.MsgSerial)
-		c.queue(ctx, &protocol.ProtocolMessage{
-			Action:    protocol.ActionNack,
-			MsgSerial: msg.MsgSerial,
-		})
+		c.nack(ctx, msg.MsgSerial, nil)
 		return
 	}
 	// Mutations (update/delete/append) reuse the MESSAGE frame,
@@ -205,36 +199,30 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 	ch, err := c.manager.GetChannel(ctx, msg.Channel)
 	if err != nil {
 		c.logger.Warn("publish failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerial, "err", err)
-		c.queue(ctx, &protocol.ProtocolMessage{
-			Action:    protocol.ActionNack,
-			MsgSerial: msg.MsgSerial,
-		})
+		c.nack(ctx, msg.MsgSerial, nil)
 		return
 	}
 	cm, _, err := ch.Publish(ctx, msg.Messages)
 	if err != nil {
 		c.logger.Warn("publish failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerial, "err", err)
-		c.queue(ctx, &protocol.ProtocolMessage{
-			Action:    protocol.ActionNack,
-			MsgSerial: msg.MsgSerial,
-		})
+		c.nack(ctx, msg.MsgSerial, nil)
 		return
 	}
 	c.queue(ctx, &protocol.ProtocolMessage{
 		Action:    protocol.ActionAck,
 		MsgSerial: msg.MsgSerial,
 		Count:     len(cm.Messages),
-		Serials:   messageSerials(cm.Messages),
+		Res:       publishResults(cm.Messages),
 	})
 }
 
-// messageSerials returns the server-assigned Serial of each message in
-// idx order — the ACK payload that lets a publisher learn the serials it
-// was assigned (DESIGN.md §8).
-func messageSerials(msgs []*protocol.Message) []string {
-	out := make([]string, len(msgs))
+// publishResults builds the per-message ACK results (Ably's TR4s Res
+// array): one entry per message carrying its server-assigned serial, so
+// the publisher can learn the serials it was assigned (DESIGN.md §8).
+func publishResults(msgs []*protocol.Message) []*protocol.PublishResult {
+	out := make([]*protocol.PublishResult, len(msgs))
 	for i, m := range msgs {
-		out[i] = m.Serial
+		out[i] = &protocol.PublishResult{Serials: []string{m.Serial}}
 	}
 	return out
 }

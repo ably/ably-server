@@ -189,10 +189,14 @@ func (c *connection) publishLeaves(ctx context.Context, channel string, set map[
 }
 
 // nack queues a NACK for msgSerial, optionally carrying an ErrorInfo.
+// Count is 1: a NACK rejects exactly one inbound frame. SDKs correlate
+// an ACK/NACK by counting Count messages from MsgSerial, so a missing
+// Count (0) leaves the operation uncorrelated and the client hanging.
 func (c *connection) nack(ctx context.Context, msgSerial int64, errInfo *protocol.ErrorInfo) {
 	c.queue(ctx, &protocol.ProtocolMessage{
 		Action:    protocol.ActionNack,
 		MsgSerial: msgSerial,
+		Count:     1,
 		Error:     errInfo,
 	})
 }
