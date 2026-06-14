@@ -499,6 +499,8 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	}
 	for i, m := range msgs {
 		m.Serial = serial.MessageSerial(channelSerial, i)
+		m.Action = protocol.MessageCreate
+		storage.StampCreateVersion(m)
 	}
 	cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Messages: msgs}
 
@@ -508,17 +510,26 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 			return nil, false, fmt.Errorf("storage/postgres: encode message %d: %w", i, err)
 		}
 		// id is stored as NULL when empty so the partial UNIQUE
-		// idempotency index never matches a no-id publish.
+		// idempotency index never matches a no-id publish. message_serial
+		// is the message identity (its own serial for a create) — the
+		// versions index and the projection key off it (DESIGN.md §13.4).
 		var idArg any
 		if m.ID != "" {
 			idArg = m.ID
 		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload)
-			 VALUES ($1, $2, $3, $4, 'message', $5)`,
-			cs.name, channelSerial, i, idArg, payload,
+			`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload, message_serial)
+			 VALUES ($1, $2, $3, $4, 'message', $5, $6)`,
+			cs.name, channelSerial, i, idArg, payload, m.Serial,
 		); err != nil {
 			return nil, false, fmt.Errorf("storage/postgres: insert message %d: %w", i, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO messages (channel, message_serial, payload, deleted)
+			 VALUES ($1, $2, $3, FALSE)`,
+			cs.name, m.Serial, payload,
+		); err != nil {
+			return nil, false, fmt.Errorf("storage/postgres: insert projection %d: %w", i, err)
 		}
 	}
 
@@ -541,6 +552,204 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
 	}
 	return cm, false, nil
+}
+
+// Mutate applies an update/delete/append to an existing message
+// (DESIGN.md §13.2) in one transaction: resolve the target's current
+// latest version from the projection (ErrTargetNotFound if absent),
+// apply the shallow-mixin merge, mint a fresh version serial, insert the
+// merged version row on channel_messages (message_serial = identity),
+// upsert the projection (deleted = TRUE for a delete), and NOTIFY. The
+// cm reaches every node's appender via the LISTEN round-trip, like Store.
+func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*protocol.ChannelMessage, bool, error) {
+	if mut == nil || !mut.Action.IsMutation() {
+		return nil, false, errors.New("storage/postgres: Mutate requires a mutation action")
+	}
+	if mut.Serial == "" {
+		return nil, false, errors.New("storage/postgres: Mutate requires a target serial")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+
+	tx, err := cs.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Idempotency pre-check — shared id namespace with creates.
+	if mut.ID != "" {
+		var existingCS string
+		switch err := tx.QueryRow(ctx,
+			`SELECT channel_serial FROM channel_messages WHERE channel = $1 AND id = $2 LIMIT 1`,
+			cs.name, mut.ID).Scan(&existingCS); {
+		case err == nil:
+			original, lerr := loadChannelMessageTx(ctx, tx, cs.name, existingCS)
+			if lerr != nil {
+				return nil, false, lerr
+			}
+			if cerr := tx.Commit(ctx); cerr != nil {
+				return nil, false, fmt.Errorf("storage/postgres: commit: %w", cerr)
+			}
+			return original, true, nil
+		case errors.Is(err, pgx.ErrNoRows):
+			// fall through
+		default:
+			return nil, false, fmt.Errorf("storage/postgres: idempotency lookup: %w", err)
+		}
+	}
+
+	// Resolve the target's current latest version from the projection.
+	var curPayload []byte
+	switch err := tx.QueryRow(ctx,
+		`SELECT payload FROM messages WHERE channel = $1 AND message_serial = $2`,
+		cs.name, mut.Serial).Scan(&curPayload); {
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil, false, storage.ErrTargetNotFound
+	case err != nil:
+		return nil, false, fmt.Errorf("storage/postgres: load target version: %w", err)
+	}
+	var current protocol.Message
+	if err := msgpack.Unmarshal(curPayload, &current); err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: decode target version: %w", err)
+	}
+
+	var channelSerial string
+	if err := tx.QueryRow(ctx,
+		`SELECT advance_channel_serial($1, $2)`, cs.name, cs.series,
+	).Scan(&channelSerial); err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: advance channel serial: %w", err)
+	}
+	version := storage.MergeVersion(&current, mut, serial.MessageSerial(channelSerial, 0))
+	cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Messages: []*protocol.Message{version}}
+
+	payload, err := msgpack.Marshal(version)
+	if err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: encode version: %w", err)
+	}
+	var idArg any
+	if mut.ID != "" {
+		idArg = mut.ID
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload, message_serial)
+		 VALUES ($1, $2, 0, $3, 'message', $4, $5)`,
+		cs.name, channelSerial, idArg, payload, mut.Serial,
+	); err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: insert version: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE messages SET payload = $3, deleted = $4 WHERE channel = $1 AND message_serial = $2`,
+		cs.name, mut.Serial, payload, version.Action == protocol.MessageDelete,
+	); err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: update projection: %w", err)
+	}
+
+	body, err := json.Marshal(notifyPayload{Channel: cs.name, Serial: channelSerial})
+	if err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: encode notify: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, notifyChannelName, string(body)); err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: notify: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
+	}
+	return cm, false, nil
+}
+
+// LatestVersion returns the projection entry for serial, or
+// ErrTargetNotFound (DESIGN.md §13.4).
+func (cs *channelStore) LatestVersion(ctx context.Context, serial string) (*protocol.Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var payload []byte
+	switch err := cs.pool.QueryRow(ctx,
+		`SELECT payload FROM messages WHERE channel = $1 AND message_serial = $2`,
+		cs.name, serial).Scan(&payload); {
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil, storage.ErrTargetNotFound
+	case err != nil:
+		return nil, fmt.Errorf("storage/postgres: latest version: %w", err)
+	}
+	var m protocol.Message
+	if err := msgpack.Unmarshal(payload, &m); err != nil {
+		return nil, fmt.Errorf("storage/postgres: decode latest version: %w", err)
+	}
+	return &m, nil
+}
+
+// Versions returns every version of serial ordered by version (the
+// versions index), paginated at version granularity (DESIGN.md §13.4).
+// The cursor is a version serial decomposed to (channel_serial, idx);
+// Limit+1 detects HasMore. ErrTargetNotFound if the message has no rows.
+func (cs *channelStore) Versions(ctx context.Context, serial2 string, q storage.HistoryQuery) (storage.HistoryPage, error) {
+	if err := ctx.Err(); err != nil {
+		return storage.HistoryPage{}, err
+	}
+
+	forwards := q.Direction == storage.DirectionForwards
+	order, cursorOp := "ASC", ">"
+	if !forwards {
+		order, cursorOp = "DESC", "<"
+	}
+	var (
+		cursorCS  string
+		cursorIdx int
+	)
+	if q.Cursor != "" {
+		var err error
+		cursorCS, cursorIdx, err = serial.ParseMessageSerial(q.Cursor)
+		if err != nil {
+			return storage.HistoryPage{}, fmt.Errorf("storage/postgres: parse versions cursor: %w", err)
+		}
+	}
+
+	query := fmt.Sprintf(`
+		SELECT channel_serial, payload FROM channel_messages
+		WHERE channel = $1 AND message_serial = $2
+		  AND ($3 = '' OR (channel_serial, idx) %s ($3, $4))
+		ORDER BY channel_serial %s, idx %s
+		LIMIT CASE WHEN $5 > 0 THEN $5 + 1 ELSE NULL END
+	`, cursorOp, order, order)
+
+	rows, err := cs.pool.Query(ctx, query, cs.name, serial2, cursorCS, cursorIdx, q.Limit)
+	if err != nil {
+		return storage.HistoryPage{}, fmt.Errorf("storage/postgres: versions query: %w", err)
+	}
+	defer rows.Close()
+
+	var page storage.HistoryPage
+	for rows.Next() {
+		var (
+			cs2     string
+			payload []byte
+		)
+		if err := rows.Scan(&cs2, &payload); err != nil {
+			return storage.HistoryPage{}, fmt.Errorf("storage/postgres: scan version: %w", err)
+		}
+		var m protocol.Message
+		if err := msgpack.Unmarshal(payload, &m); err != nil {
+			return storage.HistoryPage{}, fmt.Errorf("storage/postgres: decode version %s: %w", cs2, err)
+		}
+		page.ChannelMessages = append(page.ChannelMessages, &protocol.ChannelMessage{
+			ChannelSerial: cs2,
+			Messages:      []*protocol.Message{&m},
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return storage.HistoryPage{}, fmt.Errorf("storage/postgres: versions rows: %w", err)
+	}
+	if len(page.ChannelMessages) == 0 {
+		return storage.HistoryPage{}, storage.ErrTargetNotFound
+	}
+	if q.Limit > 0 && len(page.ChannelMessages) > q.Limit {
+		page.ChannelMessages = page.ChannelMessages[:q.Limit]
+		page.HasMore = true
+	}
+	return page, nil
 }
 
 // StorePresence persists a presence publish on channel_messages (kind =
@@ -711,6 +920,10 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 		return storage.HistoryPage{}, err
 	}
 
+	if q.Collapse && q.Kind.Normalize() == storage.KindMessage {
+		return cs.collapsedHistory(ctx, q)
+	}
+
 	timeLower, timeUpper := serial.TimestampBounds(q.Start, q.End)
 	forwards := q.Direction == storage.DirectionForwards
 
@@ -796,6 +1009,63 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 
 	if overLimit && itemCount(page) > limit {
 		trimToLimit(&page, limit)
+		page.HasMore = true
+	}
+	return page, nil
+}
+
+// collapsedHistory returns the latest version of each message positioned
+// at its create serial (DESIGN.md §13.4), backing the default REST
+// message history. It scans the latest-version projection ordered by
+// message_serial (== create serial, so create-timeline order), applies
+// the time bounds / cursor / limit against that identity, and regroups
+// rows under their create channelSerial (DESC within a batch for
+// backwards, matching the raw scan).
+func (cs *channelStore) collapsedHistory(ctx context.Context, q storage.HistoryQuery) (storage.HistoryPage, error) {
+	timeLower, timeUpper := serial.TimestampBounds(q.Start, q.End)
+	forwards := q.Direction == storage.DirectionForwards
+	order, cursorOp := "ASC", ">"
+	if !forwards {
+		order, cursorOp = "DESC", "<"
+	}
+
+	query := fmt.Sprintf(`
+		SELECT message_serial, payload FROM messages
+		WHERE channel = $1
+		  AND ($2 = '' OR message_serial >= $2)
+		  AND ($3 = '' OR message_serial <  $3)
+		  AND ($4 = '' OR message_serial %s $4)
+		ORDER BY message_serial %s
+		LIMIT CASE WHEN $5 > 0 THEN $5 + 1 ELSE NULL END
+	`, cursorOp, order)
+
+	rows, err := cs.pool.Query(ctx, query, cs.name, timeLower, timeUpper, q.Cursor, q.Limit)
+	if err != nil {
+		return storage.HistoryPage{}, fmt.Errorf("storage/postgres: collapsed history query: %w", err)
+	}
+	defer rows.Close()
+
+	var page storage.HistoryPage
+	for rows.Next() {
+		var (
+			identity string
+			payload  []byte
+		)
+		if err := rows.Scan(&identity, &payload); err != nil {
+			return storage.HistoryPage{}, fmt.Errorf("storage/postgres: scan collapsed row: %w", err)
+		}
+		var m protocol.Message
+		if err := msgpack.Unmarshal(payload, &m); err != nil {
+			return storage.HistoryPage{}, fmt.Errorf("storage/postgres: decode projection %s: %w", identity, err)
+		}
+		appendMessage(&page, storage.CreateChannelSerial(identity), &m)
+	}
+	if err := rows.Err(); err != nil {
+		return storage.HistoryPage{}, fmt.Errorf("storage/postgres: collapsed history rows: %w", err)
+	}
+
+	if q.Limit > 0 && itemCount(page) > q.Limit {
+		trimToLimit(&page, q.Limit)
 		page.HasMore = true
 	}
 	return page, nil

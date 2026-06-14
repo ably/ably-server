@@ -6,6 +6,7 @@ package storagetest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -961,6 +962,327 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 			t.Errorf("presence history clientId = %q, want alice", got)
 		}
 	})
+
+	// ---- Mutable messages (DESIGN.md §13) ------------------------------
+
+	t.Run("CreateStampsActionAndVersion", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		m := mustCreate(t, ch, &protocol.Message{Name: "x", Data: "v1", ClientID: "alice"})
+		if m.Action != protocol.MessageCreate {
+			t.Errorf("create action = %v, want create", m.Action)
+		}
+		if m.Version == nil || m.Version.Serial != m.Serial {
+			t.Errorf("create version = %+v, want version.serial == serial %q", m.Version, m.Serial)
+		}
+		if m.Version != nil && m.Version.ClientID != "alice" {
+			t.Errorf("create version.clientId = %q, want alice", m.Version.ClientID)
+		}
+	})
+
+	t.Run("MutateUpdateProducesNewVersionStableIdentity", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		created := mustCreate(t, ch, &protocol.Message{Name: "greeting", Data: "v1", ClientID: "alice"})
+
+		updated := mustMutate(t, ch, &protocol.Message{
+			Action: protocol.MessageUpdate, Serial: created.Serial, Data: "v2", ClientID: "bob",
+			Version: &protocol.MessageVersion{Description: "edit"},
+		})
+		if updated.Serial != created.Serial {
+			t.Errorf("updated serial = %q, want stable identity %q", updated.Serial, created.Serial)
+		}
+		if updated.Action != protocol.MessageUpdate {
+			t.Errorf("updated action = %v, want update", updated.Action)
+		}
+		if updated.Data != "v2" {
+			t.Errorf("updated data = %v, want v2", updated.Data)
+		}
+		if updated.Version == nil || updated.Version.Serial == created.Serial || updated.Version.Serial <= created.Version.Serial {
+			t.Errorf("updated version.serial = %v, want fresh and > create's %q", updated.Version, created.Version.Serial)
+		}
+		if updated.Version != nil && (updated.Version.ClientID != "bob" || updated.Version.Description != "edit") {
+			t.Errorf("updated version metadata = %+v, want operator bob / 'edit'", updated.Version)
+		}
+
+		latest, err := ch.LatestVersion(context.Background(), created.Serial)
+		if err != nil {
+			t.Fatalf("LatestVersion: %v", err)
+		}
+		if latest.Data != "v2" || latest.ClientID != "alice" {
+			t.Errorf("latest = data %v / creator %q, want v2 / alice (creator carried forward)", latest.Data, latest.ClientID)
+		}
+	})
+
+	t.Run("MutateShallowMixinCarriesForwardUnsuppliedFields", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		created := mustCreate(t, ch, &protocol.Message{Name: "title", Data: "body", ClientID: "alice"})
+
+		// Update only data — name must carry forward.
+		mustMutate(t, ch, &protocol.Message{Action: protocol.MessageUpdate, Serial: created.Serial, Data: "body2", ClientID: "alice"})
+		latest, _ := ch.LatestVersion(context.Background(), created.Serial)
+		if latest.Name != "title" || latest.Data != "body2" {
+			t.Errorf("after data-only update: name=%q data=%v, want title/body2", latest.Name, latest.Data)
+		}
+
+		// Update only name — data must carry forward.
+		mustMutate(t, ch, &protocol.Message{Action: protocol.MessageUpdate, Serial: created.Serial, Name: "title2", ClientID: "alice"})
+		latest, _ = ch.LatestVersion(context.Background(), created.Serial)
+		if latest.Name != "title2" || latest.Data != "body2" {
+			t.Errorf("after name-only update: name=%q data=%v, want title2/body2", latest.Name, latest.Data)
+		}
+	})
+
+	t.Run("MutateAppendConcatenatesData", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		created := mustCreate(t, ch, &protocol.Message{Data: "Hello", ClientID: "alice"})
+		appended := mustMutate(t, ch, &protocol.Message{Action: protocol.MessageAppend, Serial: created.Serial, Data: ", world", ClientID: "alice"})
+		if appended.Data != "Hello, world" {
+			t.Errorf("appended data = %v, want %q", appended.Data, "Hello, world")
+		}
+		// Delivered/stored as a full update in this phase (DESIGN.md §13.3).
+		if appended.Action != protocol.MessageUpdate {
+			t.Errorf("append action = %v, want update (full delivery)", appended.Action)
+		}
+	})
+
+	t.Run("MutateDeleteIsSoftTombstone", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		created := mustCreate(t, ch, &protocol.Message{Name: "n", Data: "secret", ClientID: "alice"})
+		deleted := mustMutate(t, ch, &protocol.Message{Action: protocol.MessageDelete, Serial: created.Serial, ClientID: "mod"})
+		if deleted.Action != protocol.MessageDelete {
+			t.Errorf("delete action = %v, want delete", deleted.Action)
+		}
+		if deleted.Data != nil || deleted.Name != "" {
+			t.Errorf("tombstone carries data=%v name=%q, want both cleared", deleted.Data, deleted.Name)
+		}
+
+		// Soft: the message and all versions remain queryable.
+		latest, err := ch.LatestVersion(context.Background(), created.Serial)
+		if err != nil {
+			t.Fatalf("LatestVersion after delete: %v (must stay queryable)", err)
+		}
+		if latest.Action != protocol.MessageDelete {
+			t.Errorf("latest action after delete = %v, want delete", latest.Action)
+		}
+		vers, err := ch.Versions(context.Background(), created.Serial, storage.HistoryQuery{Direction: storage.DirectionForwards})
+		if err != nil {
+			t.Fatalf("Versions after delete: %v", err)
+		}
+		if n := itemCountVersions(vers); n != 2 {
+			t.Errorf("versions after delete = %d, want 2 (create + delete)", n)
+		}
+	})
+
+	t.Run("MutateTargetNotFound", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		_, _, err := ch.Mutate(context.Background(), &protocol.Message{
+			Action: protocol.MessageUpdate, Serial: "00000000000001-000@nonexistent:000", Data: "x", ClientID: "alice",
+		})
+		if !errors.Is(err, storage.ErrTargetNotFound) {
+			t.Errorf("Mutate on unknown target err = %v, want ErrTargetNotFound", err)
+		}
+		if _, err := ch.LatestVersion(context.Background(), "00000000000001-000@nonexistent:000"); !errors.Is(err, storage.ErrTargetNotFound) {
+			t.Errorf("LatestVersion unknown err = %v, want ErrTargetNotFound", err)
+		}
+	})
+
+	t.Run("MutateIdempotentByID", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		created := mustCreate(t, ch, &protocol.Message{Data: "v1", ClientID: "alice"})
+
+		first, idemp, err := ch.Mutate(context.Background(), &protocol.Message{
+			ID: "edit-1", Action: protocol.MessageUpdate, Serial: created.Serial, Data: "v2", ClientID: "alice",
+		})
+		if err != nil || idemp {
+			t.Fatalf("first mutate: err=%v idempotent=%v", err, idemp)
+		}
+		second, idemp, err := ch.Mutate(context.Background(), &protocol.Message{
+			ID: "edit-1", Action: protocol.MessageUpdate, Serial: created.Serial, Data: "v3", ClientID: "alice",
+		})
+		if err != nil {
+			t.Fatalf("second mutate: %v", err)
+		}
+		if !idemp {
+			t.Error("idempotent=false on duplicate mutation id")
+		}
+		if second.ChannelSerial != first.ChannelSerial {
+			t.Errorf("returned serial = %q, want original %q", second.ChannelSerial, first.ChannelSerial)
+		}
+		latest, _ := ch.LatestVersion(context.Background(), created.Serial)
+		if latest.Data != "v2" {
+			t.Errorf("latest data = %v, want v2 (duplicate mutation must not apply)", latest.Data)
+		}
+		vers, _ := ch.Versions(context.Background(), created.Serial, storage.HistoryQuery{Direction: storage.DirectionForwards})
+		if n := itemCountVersions(vers); n != 2 {
+			t.Errorf("versions = %d, want 2 (create + one applied edit)", n)
+		}
+	})
+
+	t.Run("VersionsOrderedByVersion", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		created := mustCreate(t, ch, &protocol.Message{Data: "v1", ClientID: "alice"})
+		u1 := mustMutate(t, ch, &protocol.Message{Action: protocol.MessageUpdate, Serial: created.Serial, Data: "v2", ClientID: "alice"})
+		u2 := mustMutate(t, ch, &protocol.Message{Action: protocol.MessageUpdate, Serial: created.Serial, Data: "v3", ClientID: "alice"})
+
+		fwd, err := ch.Versions(context.Background(), created.Serial, storage.HistoryQuery{Direction: storage.DirectionForwards})
+		if err != nil {
+			t.Fatalf("Versions forwards: %v", err)
+		}
+		gotFwd := versionSerials(fwd)
+		wantFwd := []string{created.Version.Serial, u1.Version.Serial, u2.Version.Serial}
+		if !equalStrings(gotFwd, wantFwd) {
+			t.Errorf("versions forwards = %v, want %v", gotFwd, wantFwd)
+		}
+
+		bwd, _ := ch.Versions(context.Background(), created.Serial, storage.HistoryQuery{Direction: storage.DirectionBackwards})
+		gotBwd := versionSerials(bwd)
+		wantBwd := []string{u2.Version.Serial, u1.Version.Serial, created.Version.Serial}
+		if !equalStrings(gotBwd, wantBwd) {
+			t.Errorf("versions backwards = %v, want %v", gotBwd, wantBwd)
+		}
+
+		// Limit + HasMore at version granularity.
+		lim, _ := ch.Versions(context.Background(), created.Serial, storage.HistoryQuery{Direction: storage.DirectionForwards, Limit: 2})
+		if got := versionSerials(lim); !equalStrings(got, wantFwd[:2]) || !lim.HasMore {
+			t.Errorf("versions limit=2 = %v hasMore=%v, want %v hasMore=true", got, lim.HasMore, wantFwd[:2])
+		}
+	})
+
+	t.Run("CollapsedHistoryShowsLatestAtCreatePosition", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		m1 := mustCreate(t, ch, &protocol.Message{Name: "m1", Data: "1", ClientID: "alice"})
+		m2 := mustCreate(t, ch, &protocol.Message{Name: "m2", Data: "2", ClientID: "alice"})
+		m3 := mustCreate(t, ch, &protocol.Message{Name: "m3", Data: "3", ClientID: "alice"})
+		mustMutate(t, ch, &protocol.Message{Action: protocol.MessageUpdate, Serial: m2.Serial, Data: "2-edited", ClientID: "alice"})
+
+		// Collapsed forwards: latest of each, positioned at create order.
+		page, err := ch.History(context.Background(), storage.HistoryQuery{Direction: storage.DirectionForwards, Collapse: true})
+		if err != nil {
+			t.Fatalf("collapsed History: %v", err)
+		}
+		var gotData []any
+		var gotSerials, gotChannelSerials []string
+		for _, cm := range page.ChannelMessages {
+			for _, m := range cm.Messages {
+				gotData = append(gotData, m.Data)
+				gotSerials = append(gotSerials, m.Serial)
+				gotChannelSerials = append(gotChannelSerials, cm.ChannelSerial)
+			}
+		}
+		if len(gotData) != 3 {
+			t.Fatalf("collapsed messages = %d, want 3 (one per message)", len(gotData))
+		}
+		if gotData[0] != "1" || gotData[1] != "2-edited" || gotData[2] != "3" {
+			t.Errorf("collapsed data = %v, want [1 2-edited 3]", gotData)
+		}
+		// Stable identities, positioned at create serials.
+		wantSerials := []string{m1.Serial, m2.Serial, m3.Serial}
+		if !equalStrings(gotSerials, wantSerials) {
+			t.Errorf("collapsed serials = %v, want %v (stable identities)", gotSerials, wantSerials)
+		}
+		wantCS := []string{
+			storage.CreateChannelSerial(m1.Serial),
+			storage.CreateChannelSerial(m2.Serial),
+			storage.CreateChannelSerial(m3.Serial),
+		}
+		if !equalStrings(gotChannelSerials, wantCS) {
+			t.Errorf("collapsed channelSerials = %v, want create positions %v", gotChannelSerials, wantCS)
+		}
+	})
+
+	t.Run("CollapsedVsRawMessageHistory", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		created := mustCreate(t, ch, &protocol.Message{Data: "v1", ClientID: "alice"})
+		mustMutate(t, ch, &protocol.Message{Action: protocol.MessageUpdate, Serial: created.Serial, Data: "v2", ClientID: "alice"})
+
+		// Raw stream (Collapse=false): both the create and the update cm
+		// appear in stream order — live/resume must see every version.
+		raw, err := ch.History(context.Background(), storage.HistoryQuery{Direction: storage.DirectionForwards})
+		if err != nil {
+			t.Fatalf("raw History: %v", err)
+		}
+		if len(raw.ChannelMessages) != 2 {
+			t.Errorf("raw history cms = %d, want 2 (create + update version)", len(raw.ChannelMessages))
+		}
+
+		// Collapsed: one entry, latest content.
+		col, _ := ch.History(context.Background(), storage.HistoryQuery{Direction: storage.DirectionForwards, Collapse: true})
+		if len(col.ChannelMessages) != 1 || len(col.ChannelMessages[0].Messages) != 1 {
+			t.Fatalf("collapsed cms = %d, want 1", len(col.ChannelMessages))
+		}
+		if col.ChannelMessages[0].Messages[0].Data != "v2" {
+			t.Errorf("collapsed data = %v, want v2", col.ChannelMessages[0].Messages[0].Data)
+		}
+	})
+
+	t.Run("CollapsedDeletedShowsAsTombstone", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		created := mustCreate(t, ch, &protocol.Message{Data: "v1", ClientID: "alice"})
+		mustMutate(t, ch, &protocol.Message{Action: protocol.MessageDelete, Serial: created.Serial, ClientID: "mod"})
+
+		col, err := ch.History(context.Background(), storage.HistoryQuery{Direction: storage.DirectionForwards, Collapse: true})
+		if err != nil {
+			t.Fatalf("collapsed History: %v", err)
+		}
+		if len(col.ChannelMessages) != 1 || len(col.ChannelMessages[0].Messages) != 1 {
+			t.Fatalf("collapsed cms = %d, want 1 (deleted message still positioned)", len(col.ChannelMessages))
+		}
+		if got := col.ChannelMessages[0].Messages[0]; got.Action != protocol.MessageDelete {
+			t.Errorf("collapsed deleted action = %v, want delete (tombstone)", got.Action)
+		}
+	})
+}
+
+// mustCreate publishes a single create message and returns the stamped
+// Message (with its serial + version) from the persisted cm.
+func mustCreate(t *testing.T, ch storage.ChannelStore, m *protocol.Message) *protocol.Message {
+	t.Helper()
+	cm, _, err := ch.Store(context.Background(), []*protocol.Message{m})
+	if err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	return cm.Messages[0]
+}
+
+// mustMutate applies a mutation and returns the persisted merged version.
+func mustMutate(t *testing.T, ch storage.ChannelStore, mut *protocol.Message) *protocol.Message {
+	t.Helper()
+	cm, _, err := ch.Mutate(context.Background(), mut)
+	if err != nil {
+		t.Fatalf("Mutate: %v", err)
+	}
+	return cm.Messages[0]
+}
+
+// itemCountVersions totals the Messages across a versions page.
+func itemCountVersions(page storage.HistoryPage) int {
+	n := 0
+	for _, cm := range page.ChannelMessages {
+		n += len(cm.Messages)
+	}
+	return n
+}
+
+// versionSerials flattens a versions page to the per-version serials
+// (Version.Serial), in page order.
+func versionSerials(page storage.HistoryPage) []string {
+	var out []string
+	for _, cm := range page.ChannelMessages {
+		for _, m := range cm.Messages {
+			out = append(out, storage.VersionSerial(m))
+		}
+	}
+	return out
 }
 
 // mustEnter publishes a single ENTER for (connID, clientID) with data.

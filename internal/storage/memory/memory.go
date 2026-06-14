@@ -96,6 +96,14 @@ type channelStore struct {
 	byCS    map[string]*protocol.ChannelMessage
 	byID    map[string]string                    // Message.id / PresenceMessage.id -> channelSerial
 	members map[string]*protocol.PresenceMessage // "<connId>:<clientId>" -> latest member (DESIGN.md §12.5)
+
+	// Mutable-message derived structures (DESIGN.md §13.4), maintained
+	// under mu alongside the log. latest is the materialised projection:
+	// message identity serial -> latest merged version. versions is the
+	// serial→versions index: identity serial -> every version in version
+	// (publish) order.
+	latest   map[string]*protocol.Message
+	versions map[string][]*protocol.Message
 }
 
 func newChannelStore(gen *serial.Generator, appender storage.Appender) *channelStore {
@@ -105,6 +113,8 @@ func newChannelStore(gen *serial.Generator, appender storage.Appender) *channelS
 		byCS:     make(map[string]*protocol.ChannelMessage),
 		byID:     make(map[string]string),
 		members:  make(map[string]*protocol.PresenceMessage),
+		latest:   make(map[string]*protocol.Message),
+		versions: make(map[string][]*protocol.Message),
 	}
 }
 
@@ -140,6 +150,8 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	channelSerial := cs.gen.Mint()
 	for i, m := range msgs {
 		m.Serial = serial.MessageSerial(channelSerial, i)
+		m.Action = protocol.MessageCreate
+		storage.StampCreateVersion(m)
 	}
 	cm := &protocol.ChannelMessage{
 		ChannelSerial: channelSerial,
@@ -152,12 +164,100 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 		if m.ID != "" {
 			cs.byID[m.ID] = channelSerial
 		}
+		// Register the create as the first version + projection entry,
+		// so mutations can resolve their target and collapsed history /
+		// single-message reads find it (DESIGN.md §13.4).
+		cs.latest[m.Serial] = m
+		cs.versions[m.Serial] = []*protocol.Message{m}
 	}
 
 	if cs.appender != nil {
 		cs.appender.Append(cm)
 	}
 	return cm, false, nil
+}
+
+// Mutate applies an update/delete/append to an existing message under the
+// single channel mutex, mirroring Store's idempotency + appender
+// discipline (DESIGN.md §13.2). It validates the target exists, merges,
+// mints a fresh version cm carrying the complete merged Message, and
+// updates the latest projection + versions index atomically.
+func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*protocol.ChannelMessage, bool, error) {
+	if mut == nil || !mut.Action.IsMutation() {
+		return nil, false, errors.New("storage/memory: Mutate requires a mutation action")
+	}
+	if mut.Serial == "" {
+		return nil, false, errors.New("storage/memory: Mutate requires a target serial")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	if mut.ID != "" {
+		if existingCS, ok := cs.byID[mut.ID]; ok {
+			return cs.byCS[existingCS], true, nil
+		}
+	}
+
+	current, ok := cs.latest[mut.Serial]
+	if !ok {
+		return nil, false, storage.ErrTargetNotFound
+	}
+
+	channelSerial := cs.gen.Mint()
+	version := storage.MergeVersion(current, mut, serial.MessageSerial(channelSerial, 0))
+	cm := &protocol.ChannelMessage{
+		ChannelSerial: channelSerial,
+		Messages:      []*protocol.Message{version},
+	}
+
+	cs.byCS[channelSerial] = cm
+	cs.order = append(cs.order, channelSerial)
+	if mut.ID != "" {
+		cs.byID[mut.ID] = channelSerial
+	}
+	cs.latest[mut.Serial] = version
+	cs.versions[mut.Serial] = append(cs.versions[mut.Serial], version)
+
+	if cs.appender != nil {
+		cs.appender.Append(cm)
+	}
+	return cm, false, nil
+}
+
+// LatestVersion returns the projection entry for serial, or
+// ErrTargetNotFound (DESIGN.md §13.4).
+func (cs *channelStore) LatestVersion(ctx context.Context, serial string) (*protocol.Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	m, ok := cs.latest[serial]
+	if !ok {
+		return nil, storage.ErrTargetNotFound
+	}
+	return m, nil
+}
+
+// Versions returns every version of serial ordered by version, paginated
+// at version granularity via q.Cursor (a version serial) / q.Limit /
+// q.Direction (DESIGN.md §13.4).
+func (cs *channelStore) Versions(ctx context.Context, serial string, q storage.HistoryQuery) (storage.HistoryPage, error) {
+	if err := ctx.Err(); err != nil {
+		return storage.HistoryPage{}, err
+	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	all, ok := cs.versions[serial]
+	if !ok {
+		return storage.HistoryPage{}, storage.ErrTargetNotFound
+	}
+	return storage.PaginateVersions(all, q), nil
 }
 
 // StorePresence persists a presence publish on the same stream as
@@ -236,6 +336,77 @@ func (cs *channelStore) Members(ctx context.Context) ([]*protocol.PresenceMessag
 	return out, asOf, nil
 }
 
+// collapsedHistory returns the latest version of each message positioned
+// at its create serial (DESIGN.md §13.4), driving the default REST
+// message history. Called with cs.mu held. Identities sort by create
+// position (identity == createSerial:idx); time bounds and the cursor
+// compare against the identity, and a multi-message create batch is
+// regrouped under its shared create channelSerial (reversed within the
+// batch for backwards, matching the raw scan).
+func (cs *channelStore) collapsedHistory(q storage.HistoryQuery) storage.HistoryPage {
+	lower, upper := serial.TimestampBounds(q.Start, q.End)
+	ids := make([]string, 0, len(cs.latest))
+	for id := range cs.latest {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	forwards := q.Direction == storage.DirectionForwards
+	cursor := q.Cursor
+	limit := q.Limit
+
+	var page storage.HistoryPage
+	count := 0
+	emit := func(m *protocol.Message) bool {
+		if limit > 0 && count >= limit {
+			page.HasMore = true
+			return false
+		}
+		ccs := storage.CreateChannelSerial(m.Serial)
+		var current *protocol.ChannelMessage
+		if n := len(page.ChannelMessages); n > 0 && page.ChannelMessages[n-1].ChannelSerial == ccs {
+			current = page.ChannelMessages[n-1]
+		} else {
+			current = &protocol.ChannelMessage{ChannelSerial: ccs}
+			page.ChannelMessages = append(page.ChannelMessages, current)
+		}
+		current.Messages = append(current.Messages, m)
+		count++
+		return true
+	}
+	inBounds := func(id string) bool {
+		if lower != "" && id < lower {
+			return false
+		}
+		if upper != "" && id >= upper {
+			return false
+		}
+		return true
+	}
+
+	if forwards {
+		for _, id := range ids {
+			if !inBounds(id) || (cursor != "" && id <= cursor) {
+				continue
+			}
+			if !emit(cs.latest[id]) {
+				break
+			}
+		}
+		return page
+	}
+	for i := len(ids) - 1; i >= 0; i-- {
+		id := ids[i]
+		if !inBounds(id) || (cursor != "" && id >= cursor) {
+			continue
+		}
+		if !emit(cs.latest[id]) {
+			break
+		}
+	}
+	return page
+}
+
 // History implements storage.ChannelStore. The walk over cs.order is
 // direction-aware: forwards starts at the lower-bound index and walks
 // up; backwards starts at the upper-bound index and walks down. Within
@@ -257,6 +428,9 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 	defer cs.mu.Unlock()
 
 	wantKind := q.Kind.Normalize()
+	if q.Collapse && wantKind == storage.KindMessage {
+		return cs.collapsedHistory(q), nil
+	}
 	lower, upper := serial.TimestampBounds(q.Start, q.End)
 
 	lo := 0

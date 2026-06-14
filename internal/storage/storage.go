@@ -18,9 +18,17 @@ package storage
 
 import (
 	"context"
+	"errors"
 
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/serial"
 )
+
+// ErrTargetNotFound is returned by Mutate, LatestVersion and Versions
+// when the target message identity has never been published on the
+// channel, or has aged out of retention (DESIGN.md §13.2). Callers map
+// it to a 4xx (REST) or a NACK/ERROR (WS).
+var ErrTargetNotFound = errors.New("storage: target message not found")
 
 // Appender is the bridge between the storage backend and the in-process
 // channel state. The backend calls Initialize exactly once, before any
@@ -98,6 +106,48 @@ type ChannelStore interface {
 	// passed in.
 	Store(ctx context.Context, msgs []*protocol.Message) (cm *protocol.ChannelMessage, idempotent bool, err error)
 
+	// Mutate persists an update/delete/append to an existing message
+	// (DESIGN.md §13.2). mut carries the mutation: mut.Action is the
+	// operation (update/delete/append), mut.Serial is the target message
+	// identity, mut.ClientID is the operating client (resolved by the
+	// caller), the supplied Data/Name/Encoding are the fields to mix in,
+	// and mut.Version (if set) carries an optional operator description /
+	// metadata.
+	//
+	// The backend:
+	//   - returns ErrTargetNotFound if the target's identity has no
+	//     current version (never published, or aged out);
+	//   - applies shallow-mixin merge against the target's current latest
+	//     version (only supplied fields replace; append concatenates data)
+	//     and mints a fresh version;
+	//   - persists the resulting MERGED Message as a new cm on the same
+	//     stream (kind = message, message identity recorded), so live and
+	//     resume subscribers always carry a complete message, never a diff;
+	//   - upserts the latest-version projection (a delete marks the row
+	//     deleted) and the serial→versions index in the same transaction
+	//     as the log insert;
+	//   - delivers the cm to the appender exactly as Store does.
+	//
+	// Idempotency works like Store: a mut.ID already seen on the channel
+	// returns the original cm with idempotent=true and mutates nothing.
+	Mutate(ctx context.Context, mut *protocol.Message) (cm *protocol.ChannelMessage, idempotent bool, err error)
+
+	// LatestVersion returns the current latest version of the message
+	// identified by serial — the materialised projection entry, a fully
+	// merged Message (DESIGN.md §13.4). A soft-deleted message is
+	// returned as its tombstone version (Action = delete). Returns
+	// ErrTargetNotFound if no such message exists. Backs
+	// GET .../messages/{serial}.
+	LatestVersion(ctx context.Context, serial string) (*protocol.Message, error)
+
+	// Versions returns every version of the message identified by serial
+	// (create + each update/delete) ordered by version, paginated via the
+	// shared HistoryQuery shape (DESIGN.md §13.4). q.Cursor, when set, is
+	// a version's Message.Serial-style cursor compared at version
+	// granularity; q.Limit caps versions. Returns ErrTargetNotFound if
+	// the message has no versions. Backs GET .../messages/{serial}/versions.
+	Versions(ctx context.Context, serial string, q HistoryQuery) (HistoryPage, error)
+
 	// StorePresence is the presence analogue of Store (DESIGN.md §12.2,
 	// §12.5). It mints a channelSerial, stamps each PresenceMessage.Serial
 	// to "<channelSerial>:<idx>", persists the presence ChannelMessage on
@@ -150,6 +200,174 @@ func (k Kind) Normalize() Kind {
 // clientId over two connections is two distinct members (DESIGN.md §12.1).
 func MemberKey(connectionID, clientID string) string {
 	return connectionID + ":" + clientID
+}
+
+// StampCreateVersion stamps a freshly-published create message's Version
+// (DESIGN.md §13.1): version.serial == the message's own serial, with a
+// server-authoritative timestamp derived from that serial and the
+// creator clientId. Called by every backend's Store after the serial is
+// assigned, so creates carry the same version shape as mutations. The
+// message's own Action stays MessageCreate (the zero value).
+func StampCreateVersion(m *protocol.Message) {
+	ts, _ := serial.Timestamp(m.Serial)
+	m.Version = &protocol.MessageVersion{
+		Serial:    m.Serial,
+		Timestamp: ts,
+		ClientID:  m.ClientID,
+	}
+}
+
+// MergeVersion produces the new merged version of a message for a
+// mutation (DESIGN.md §13.2). current is the target's current latest
+// version (a complete Message); mut is the inbound mutation carrying the
+// action, the operating clientId and the supplied fields;
+// versionSerial is the `<channelSerial>:<idx>` minted for this mutation
+// publish. The result is a complete Message that repeats current's
+// stable identity (Serial) and creator (ClientID), applies shallow-mixin
+// for update/append (only supplied fields replace; append concatenates
+// data), tombstones for delete, and carries a fresh Version stamped with
+// the operator and serial. An append is delivered and stored as a full
+// update in this phase (incremental delivery is TASK-54).
+func MergeVersion(current, mut *protocol.Message, versionSerial string) *protocol.Message {
+	v := *current // carry every field forward, then mix in the supplied ones
+	v.Serial = current.Serial
+	v.ConnectionID = current.ConnectionID
+
+	switch mut.Action {
+	case protocol.MessageDelete:
+		// Tombstone: drop the payload but keep identity + creator.
+		v.Action = protocol.MessageDelete
+		v.Data = nil
+		v.Name = ""
+		v.Encoding = ""
+	case protocol.MessageAppend:
+		v.Action = protocol.MessageUpdate // delivered/stored as a full update
+		v.Data = concatData(current.Data, mut.Data)
+		if mut.Encoding != "" {
+			v.Encoding = mut.Encoding
+		}
+		if mut.Name != "" {
+			v.Name = mut.Name
+		}
+	default: // update
+		v.Action = protocol.MessageUpdate
+		if mut.Data != nil {
+			v.Data = mut.Data
+			v.Encoding = mut.Encoding
+		}
+		if mut.Name != "" {
+			v.Name = mut.Name
+		}
+	}
+
+	ts, _ := serial.Timestamp(versionSerial)
+	ver := &protocol.MessageVersion{
+		Serial:    versionSerial,
+		Timestamp: ts,
+		ClientID:  mut.ClientID,
+	}
+	if mut.Version != nil {
+		ver.Description = mut.Version.Description
+		ver.Metadata = mut.Version.Metadata
+	}
+	v.Version = ver
+	return &v
+}
+
+// concatData concatenates an append's data onto the current value. It
+// handles the string and []byte cases (the only ones for which
+// concatenation is well-defined); for any other / mismatched types it
+// falls back to replacement, and a nil current is replaced outright.
+func concatData(current, add any) any {
+	if current == nil {
+		return add
+	}
+	switch c := current.(type) {
+	case string:
+		if a, ok := add.(string); ok {
+			return c + a
+		}
+	case []byte:
+		if a, ok := add.([]byte); ok {
+			return append(append([]byte{}, c...), a...)
+		}
+	}
+	return add
+}
+
+// VersionSerial returns the serial that identifies a single version of a
+// message — Version.Serial when present (every server-stamped message),
+// falling back to the stable identity Serial. It is the pagination unit
+// for a version-history scan (DESIGN.md §13.4).
+func VersionSerial(m *protocol.Message) string {
+	if m.Version != nil && m.Version.Serial != "" {
+		return m.Version.Serial
+	}
+	return m.Serial
+}
+
+// PaginateVersions slices an ascending-by-version list of a single
+// message's versions into a HistoryPage per the query's Direction /
+// Cursor / Limit (DESIGN.md §13.4). The cursor is a version serial,
+// excluded strictly in the scan direction; each version becomes its own
+// single-message ChannelMessage positioned at the version's own
+// channelSerial. Shared by the in-memory and bbolt backends, which hold
+// the versions list directly; Postgres paginates in SQL.
+func PaginateVersions(all []*protocol.Message, q HistoryQuery) HistoryPage {
+	forwards := q.Direction == DirectionForwards
+	cursor := q.Cursor
+	limit := q.Limit
+
+	var page HistoryPage
+	count := 0
+	emit := func(m *protocol.Message) bool {
+		vs := VersionSerial(m)
+		if cursor != "" {
+			if forwards && vs <= cursor {
+				return true
+			}
+			if !forwards && vs >= cursor {
+				return true
+			}
+		}
+		if limit > 0 && count >= limit {
+			page.HasMore = true
+			return false
+		}
+		page.ChannelMessages = append(page.ChannelMessages, &protocol.ChannelMessage{
+			ChannelSerial: CreateChannelSerial(vs),
+			Messages:      []*protocol.Message{m},
+		})
+		count++
+		return true
+	}
+
+	if forwards {
+		for _, m := range all {
+			if !emit(m) {
+				break
+			}
+		}
+	} else {
+		for i := len(all) - 1; i >= 0; i-- {
+			if !emit(all[i]) {
+				break
+			}
+		}
+	}
+	return page
+}
+
+// CreateChannelSerial returns the channelSerial of the publish that
+// created the message with the given identity serial — the position a
+// collapsed history entry occupies (DESIGN.md §13.4). The identity is
+// `<channelSerial>:<idx>`, so this strips the trailing idx.
+func CreateChannelSerial(identity string) string {
+	cs, _, err := serial.ParseMessageSerial(identity)
+	if err != nil {
+		return identity
+	}
+	return cs
 }
 
 // HistItem is one item within a ChannelMessage during a kind-aware
@@ -247,6 +465,16 @@ type HistoryQuery struct {
 	// limit. When the limit cuts a multi-message batch, the trailing
 	// ChannelMessage in the page is partial; HasMore is true.
 	Limit int
+
+	// Collapse selects the message-history view (DESIGN.md §13.4),
+	// ignored for KindPresence. The zero value (false) returns the raw
+	// version cms in stream order — every create and every edit — as
+	// live and resume delivery require. When true, history collapses to
+	// the latest version of each message positioned at its create serial:
+	// an edited message keeps its place in the timeline but shows current
+	// content, and a deleted message shows as a tombstone. The default
+	// REST GET .../messages sets this; resume/rewind replay never does.
+	Collapse bool
 }
 
 // HistoryPage is one page of history results, ordered per the query's
