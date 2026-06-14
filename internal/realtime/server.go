@@ -75,11 +75,13 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		ws:                ws,
 		format:            format,
 		id:                connID,
+		clientID:          r.URL.Query().Get("clientId"),
 		heartbeatInterval: s.heartbeatInterval,
 		logger:            s.logger.With("connId", connID),
 		manager:           s.manager,
 		outbound:          make(chan *protocol.ProtocolMessage, 16),
 		attachments:       make(map[string]*attachment),
+		entered:           make(map[string]map[string]struct{}),
 	}
 	conn.run(r.Context())
 }

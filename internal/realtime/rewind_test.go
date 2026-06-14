@@ -90,16 +90,16 @@ func TestParseRewindEmpty(t *testing.T) {
 
 func TestParseRewindRejectsInvalid(t *testing.T) {
 	bad := []string{
-		"0",        // count must be > 0
-		"-1",       // negative count
-		"abc",      // not a number
-		"0s",       // zero seconds
-		"-1s",      // negative seconds
-		"abcs",     // unparseable seconds
-		"0m",       // zero minutes
-		"1.2.3s",   // malformed float
-		"5h",       // unsupported unit
-		"1ms",      // ms not in spec
+		"0",      // count must be > 0
+		"-1",     // negative count
+		"abc",    // not a number
+		"0s",     // zero seconds
+		"-1s",    // negative seconds
+		"abcs",   // unparseable seconds
+		"0m",     // zero minutes
+		"1.2.3s", // malformed float
+		"5h",     // unsupported unit
+		"1ms",    // ms not in spec
 	}
 	for _, in := range bad {
 		if _, _, _, err := ParseRewind(in); err == nil {

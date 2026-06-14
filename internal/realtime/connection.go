@@ -21,12 +21,19 @@ type connection struct {
 	ws                *websocket.Conn
 	format            protocol.Format
 	id                string
+	clientID          string // resolved clientId for this connection ("" = anonymous, "*" = wildcard); see DESIGN.md §3.2
 	heartbeatInterval time.Duration
 	logger            *slog.Logger
 	manager           *core.Manager
 
 	outbound    chan *protocol.ProtocolMessage
 	attachments map[string]*attachment
+
+	// entered tracks the presence members this connection has entered,
+	// per channel: channel -> set of clientIds. Used to synthesise LEAVE
+	// on DETACH and on connection teardown (DESIGN.md §12.5). Only
+	// touched from the single read-loop goroutine (dispatch + teardown).
+	entered map[string]map[string]struct{}
 }
 
 // run drives the connection until either side terminates. It returns
@@ -49,6 +56,15 @@ func (c *connection) run(ctx context.Context) {
 	}()
 
 	c.readLoop(ctx)
+
+	// The read loop has exited — the connection is terminating (client
+	// disconnect, network error, or the socket being closed under us on
+	// shutdown). Synthesise LEAVE for every presence member this
+	// connection still holds, so other subscribers see the departures
+	// (DESIGN.md §12.5). Uses a fresh context since ctx is about to be
+	// cancelled.
+	c.emitTeardownLeaves()
+
 	cancel()
 	<-writeDone
 }
@@ -90,6 +106,8 @@ func (c *connection) dispatch(ctx context.Context, msg *protocol.ProtocolMessage
 		c.handleDetach(ctx, msg.Channel)
 	case protocol.ActionMessage:
 		c.handleMessage(ctx, msg)
+	case protocol.ActionPresence:
+		c.handlePresence(ctx, msg)
 	case protocol.ActionClose:
 		c.handleClose(ctx)
 	default:
@@ -128,7 +146,7 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 		c.logger.Warn("Attach failed", "channel", name, "err", err)
 		return
 	}
-	a := newAttachment(ctx, name, ch, stream, msg.ChannelSerial, msg.Params, c.outbound, c.logger.With("channel", name))
+	a := newAttachment(ctx, name, ch, stream, msg.ChannelSerial, msg.Flags, msg.Params, c.outbound, c.logger.With("channel", name))
 	c.attachments[name] = a
 	go a.run()
 }
@@ -142,6 +160,9 @@ func (c *connection) handleDetach(ctx context.Context, name string) {
 		c.logger.Warn("DETACH with empty channel name; ignoring")
 		return
 	}
+	// Detaching from a channel leaves any presence members this
+	// connection entered on it (DESIGN.md §12.5).
+	c.leaveChannel(ctx, name)
 	if a, ok := c.attachments[name]; ok {
 		a.stop()
 		delete(c.attachments, name)

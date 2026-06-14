@@ -80,6 +80,16 @@ func (c *Channel) Publish(ctx context.Context, msgs []*protocol.Message) (*proto
 	return c.store.Store(ctx, msgs)
 }
 
+// PublishPresence runs the presence-publish sequence: hand the presence
+// messages to the storage backend (which mints the channelSerial, stamps
+// each Serial, folds the membership set, and persists), then the link
+// onto the live list arrives via the Appender callback exactly as for a
+// message publish (DESIGN.md §12.2). The (cm, idempotent, err) tuple is
+// forwarded verbatim from storage.
+func (c *Channel) PublishPresence(ctx context.Context, presence []*protocol.PresenceMessage) (*protocol.ChannelMessage, bool, error) {
+	return c.store.StorePresence(ctx, presence)
+}
+
 // History delegates to the underlying ChannelStore. Backends return
 // ChannelMessages in the order requested by q.Direction (see
 // storage.HistoryQuery); the REST and resume paths flatten the page

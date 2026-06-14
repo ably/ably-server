@@ -35,7 +35,13 @@ type attachment struct {
 	// Ignored when resumeFrom is non-empty.
 	rewindParam string
 	// params: full ATTACH params, echoed in ATTACHED.params.
-	params    map[string]string
+	params map[string]string
+	// modes is the effective channel-mode set for this attachment,
+	// resolved from ATTACH.flags (DESIGN.md §4.2): an empty request is
+	// treated as the full set. Gates frame flow — SUBSCRIBE for MESSAGE,
+	// PRESENCE_SUBSCRIBE for PRESENCE/SYNC. Capability intersection
+	// (effective = requested ∩ permitted) is a later task (TASK-12).
+	modes     int64
 	replayCap int
 	out       chan<- *protocol.ProtocolMessage
 	logger    *slog.Logger
@@ -50,7 +56,7 @@ type attachment struct {
 // attach; if non-empty, run() will replay the gap before entering the
 // live Stream loop. rewindParam takes effect only when resumeFrom is
 // empty — channelSerial wins (DESIGN §4.3).
-func newAttachment(parent context.Context, name string, channel *core.Channel, stream *core.Stream, resumeFrom string, params map[string]string, out chan<- *protocol.ProtocolMessage, logger *slog.Logger) *attachment {
+func newAttachment(parent context.Context, name string, channel *core.Channel, stream *core.Stream, resumeFrom string, flags int64, params map[string]string, out chan<- *protocol.ProtocolMessage, logger *slog.Logger) *attachment {
 	ctx, cancel := context.WithCancel(parent)
 	rewind := ""
 	if resumeFrom == "" {
@@ -63,6 +69,7 @@ func newAttachment(parent context.Context, name string, channel *core.Channel, s
 		resumeFrom:  resumeFrom,
 		rewindParam: rewind,
 		params:      params,
+		modes:       resolveModes(flags),
 		replayCap:   defaultReplayCap,
 		out:         out,
 		logger:      logger,
@@ -70,6 +77,24 @@ func newAttachment(parent context.Context, name string, channel *core.Channel, s
 		cancel:      cancel,
 		done:        make(chan struct{}),
 	}
+}
+
+// allModes is the full channel-mode set — the default when an ATTACH
+// requests no specific modes (DESIGN.md §4.2).
+const allModes = protocol.FlagPresence | protocol.FlagPublish | protocol.FlagSubscribe | protocol.FlagPresenceSubscribe
+
+// resolveModes extracts the channel-mode bits from an ATTACH flags word.
+// A request with no mode bits is treated as the full set (SDK default).
+func resolveModes(flags int64) int64 {
+	if m := flags & allModes; m != 0 {
+		return m
+	}
+	return allModes
+}
+
+// hasMode reports whether this attachment holds the given channel mode.
+func (a *attachment) hasMode(mode int64) bool {
+	return a.modes&mode != 0
 }
 
 // run sends ATTACHED, optionally replays history (resume or rewind),
@@ -99,12 +124,7 @@ func (a *attachment) run() {
 	}
 
 	for _, cm := range replay {
-		if !a.send(&protocol.ProtocolMessage{
-			Action:        protocol.ActionMessage,
-			Channel:       a.channelName,
-			ChannelSerial: cm.ChannelSerial,
-			Messages:      cm.Messages,
-		}) {
+		if !a.forward(cm) {
 			return
 		}
 	}
@@ -114,15 +134,41 @@ func (a *attachment) run() {
 		if err != nil {
 			return
 		}
-		if !a.send(&protocol.ProtocolMessage{
+		if !a.forward(cm) {
+			return
+		}
+	}
+}
+
+// forward delivers one ChannelMessage to the connection as the wire
+// frame appropriate to its kind, gated by the attachment's modes: a
+// message cm becomes a MESSAGE frame (SUBSCRIBE), a presence cm becomes
+// a PRESENCE frame (PRESENCE_SUBSCRIBE). A cm the attachment is not
+// subscribed to is skipped. Returns false if the send is cancelled.
+func (a *attachment) forward(cm *protocol.ChannelMessage) bool {
+	if len(cm.Messages) > 0 {
+		if !a.hasMode(protocol.FlagSubscribe) {
+			return true
+		}
+		return a.send(&protocol.ProtocolMessage{
 			Action:        protocol.ActionMessage,
 			Channel:       a.channelName,
 			ChannelSerial: cm.ChannelSerial,
 			Messages:      cm.Messages,
-		}) {
-			return
-		}
+		})
 	}
+	if len(cm.Presence) > 0 {
+		if !a.hasMode(protocol.FlagPresenceSubscribe) {
+			return true
+		}
+		return a.send(&protocol.ProtocolMessage{
+			Action:        protocol.ActionPresence,
+			Channel:       a.channelName,
+			ChannelSerial: cm.ChannelSerial,
+			Presence:      cm.Presence,
+		})
+	}
+	return true
 }
 
 // computeReplay decides what to replay, what attach point to advertise
