@@ -118,6 +118,8 @@ func run(ctx context.Context, opts runOpts) int {
 	mux.HandleFunc("GET /", rt.HandleWebSocket)
 	mux.HandleFunc("POST /channels/{name}/messages", rs.HandlePublish)
 	mux.HandleFunc("GET /channels/{name}/messages", rs.HandleHistory)
+	mux.HandleFunc("GET /channels/{name}/presence", rs.HandlePresence)
+	mux.HandleFunc("GET /channels/{name}/presence/history", rs.HandlePresenceHistory)
 	mux.HandleFunc("GET /time", rs.HandleTime)
 	mux.HandleFunc("GET /healthz", rs.HandleHealthz)
 	mux.HandleFunc("GET /readyz", rs.HandleReadyz)

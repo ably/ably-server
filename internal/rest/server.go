@@ -152,6 +152,104 @@ func (s *Server) HandleHistory(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
+// HandlePresence returns the channel's current presence set as a flat
+// array of PresenceMessages, each stamped action=PRESENT (DESIGN.md
+// §12.6). Format follows the Accept header.
+//
+// Capability enforcement (the `subscribe` op) is deferred to TASK-12;
+// today the endpoint requires only the API key, like message history.
+func (s *Server) HandlePresence(w http.ResponseWriter, r *http.Request) {
+	if !s.authenticate(w, r) {
+		return
+	}
+	name := r.PathValue("name")
+	if name == "" {
+		http.Error(w, "channel name required", http.StatusBadRequest)
+		return
+	}
+
+	format, err := acceptFormat(r.Header.Get("Accept"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotAcceptable)
+		return
+	}
+
+	ch, err := s.manager.GetChannel(r.Context(), name)
+	if err != nil {
+		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
+		http.Error(w, "channel unavailable", http.StatusInternalServerError)
+		return
+	}
+	members, _, err := ch.Members(r.Context())
+	if err != nil {
+		s.logger.Warn("members failed", "channel", name, "err", err)
+		http.Error(w, "presence failed", http.StatusInternalServerError)
+		return
+	}
+
+	body, err := marshalPresence(presentMembers(members), format)
+	if err != nil {
+		s.logger.Warn("presence encode failed", "channel", name, "err", err)
+		http.Error(w, "encode failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeFor(format))
+	_, _ = w.Write(body)
+}
+
+// HandlePresenceHistory returns the channel's presence history — a flat
+// array of PresenceMessages from the presence stream (DESIGN.md §12.6).
+// It reuses the message-history query shape and Link-header pagination,
+// scanning the presence kind. Capability enforcement (the `history` op)
+// is deferred to TASK-12.
+func (s *Server) HandlePresenceHistory(w http.ResponseWriter, r *http.Request) {
+	if !s.authenticate(w, r) {
+		return
+	}
+	name := r.PathValue("name")
+	if name == "" {
+		http.Error(w, "channel name required", http.StatusBadRequest)
+		return
+	}
+
+	q, err := parseHistoryQuery(r.URL.Query())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	q.Kind = storage.KindPresence
+
+	format, err := acceptFormat(r.Header.Get("Accept"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotAcceptable)
+		return
+	}
+
+	ch, err := s.manager.GetChannel(r.Context(), name)
+	if err != nil {
+		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
+		http.Error(w, "channel unavailable", http.StatusInternalServerError)
+		return
+	}
+	page, err := ch.History(r.Context(), q)
+	if err != nil {
+		s.logger.Warn("presence history failed", "channel", name, "err", err)
+		http.Error(w, "history failed", http.StatusInternalServerError)
+		return
+	}
+
+	body, err := marshalPresence(flattenPresence(page.ChannelMessages), format)
+	if err != nil {
+		s.logger.Warn("presence history encode failed", "channel", name, "err", err)
+		http.Error(w, "encode failed", http.StatusInternalServerError)
+		return
+	}
+
+	writeHistoryLinks(w, r, page)
+	w.Header().Set("Content-Type", contentTypeFor(format))
+	_, _ = w.Write(body)
+}
+
 // HandleTime returns the server's current time in Ably's wire form: a
 // JSON array containing one element, milliseconds since the Unix epoch.
 func (s *Server) HandleTime(w http.ResponseWriter, r *http.Request) {
@@ -371,18 +469,65 @@ func flattenHistory(cms []*protocol.ChannelMessage) []*protocol.Message {
 	return out
 }
 
-// lastMessageSerial returns the Serial of the trailing Message in the
-// page (the boundary against which a `next` cursor is built), or "" if
-// the page is empty.
+// lastMessageSerial returns the Serial of the trailing item in the page
+// (the boundary against which a `next` cursor is built), or "" if the
+// page is empty. Handles both kinds: a message page's last Message, or a
+// presence page's last PresenceMessage.
 func lastMessageSerial(page storage.HistoryPage) string {
 	if len(page.ChannelMessages) == 0 {
 		return ""
 	}
 	cm := page.ChannelMessages[len(page.ChannelMessages)-1]
-	if len(cm.Messages) == 0 {
-		return ""
+	if n := len(cm.Messages); n > 0 {
+		return cm.Messages[n-1].Serial
 	}
-	return cm.Messages[len(cm.Messages)-1].Serial
+	if n := len(cm.Presence); n > 0 {
+		return cm.Presence[n-1].Serial
+	}
+	return ""
+}
+
+// flattenPresence turns a page of presence ChannelMessages into the flat
+// []PresenceMessage wire shape, concatenating in storage order (the
+// backend has already applied direction-aware reordering).
+func flattenPresence(cms []*protocol.ChannelMessage) []*protocol.PresenceMessage {
+	total := 0
+	for _, cm := range cms {
+		total += len(cm.Presence)
+	}
+	out := make([]*protocol.PresenceMessage, 0, total)
+	for _, cm := range cms {
+		out = append(out, cm.Presence...)
+	}
+	return out
+}
+
+// presentMembers copies members for a presence-set response, stamping
+// each with action PRESENT (DESIGN.md §12.6). Members may return
+// pointers into live backend state, so we copy rather than mutate.
+func presentMembers(members []*protocol.PresenceMessage) []*protocol.PresenceMessage {
+	out := make([]*protocol.PresenceMessage, len(members))
+	for i, m := range members {
+		cp := *m
+		cp.Action = protocol.PresencePresent
+		out[i] = &cp
+	}
+	return out
+}
+
+// marshalPresence encodes a presence slice using the requested format,
+// normalising nil to an empty array (matching marshalBody for messages).
+func marshalPresence(v []*protocol.PresenceMessage, format protocol.Format) ([]byte, error) {
+	if v == nil {
+		v = []*protocol.PresenceMessage{}
+	}
+	switch format {
+	case protocol.FormatJSON:
+		return json.Marshal(v)
+	case protocol.FormatMsgpack:
+		return msgpack.Marshal(v)
+	}
+	return nil, fmt.Errorf("unsupported format")
 }
 
 // marshalBody encodes v using the requested format. JSON encodes nil
