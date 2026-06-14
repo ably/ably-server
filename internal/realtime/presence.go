@@ -76,6 +76,20 @@ func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolM
 	})
 }
 
+// presentSnapshot copies members for a SYNC frame, stamping each with
+// action PRESENT (DESIGN.md §12.4). The stored members keep their
+// enter/update action — Members may return pointers into live backend
+// state, so we must copy rather than mutate.
+func presentSnapshot(members []*protocol.PresenceMessage) []*protocol.PresenceMessage {
+	out := make([]*protocol.PresenceMessage, len(members))
+	for i, m := range members {
+		cp := *m
+		cp.Action = protocol.PresencePresent
+		out[i] = &cp
+	}
+	return out
+}
+
 // resolvePresenceClientID applies the §12.3 rules and returns the
 // clientId to stamp on the member, or ok=false if the operation is not
 // permitted. connClientID is the connection's resolved clientId:

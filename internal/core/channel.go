@@ -98,6 +98,13 @@ func (c *Channel) History(ctx context.Context, q storage.HistoryQuery) (storage.
 	return c.store.History(ctx, q)
 }
 
+// Members returns the channel's current presence set plus the
+// channelSerial the set is current as-of, delegating to the storage
+// backend. Backs presence sync on attach (DESIGN.md §12.4).
+func (c *Channel) Members(ctx context.Context) ([]*protocol.PresenceMessage, string, error) {
+	return c.store.Members(ctx)
+}
+
 // Initialize seeds the sentinel with the channel's current watermark
 // serial, records the channel's immutable initial serial, and marks
 // the channel ready. The storage backend calls this exactly once

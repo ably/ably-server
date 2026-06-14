@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -71,6 +72,155 @@ func attach(t *testing.T, ws *websocket.Conn, channel string, flags int64) {
 	})
 	if msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); msg.Action != protocol.ActionAttached {
 		t.Fatalf("expected ATTACHED on %q, got %v", channel, msg.Action)
+	}
+}
+
+// enter sends a single ENTER on channel and reads the ACK. The caller's
+// connection must be attached with the PRESENCE mode (and, to avoid a
+// self-echo confusing the ACK read, without PRESENCE_SUBSCRIBE).
+func enter(t *testing.T, ws *websocket.Conn, channel string, msgSerial int64) {
+	t.Helper()
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:    protocol.ActionPresence,
+		Channel:   channel,
+		MsgSerial: msgSerial,
+		Presence:  []*protocol.PresenceMessage{{Action: protocol.PresenceEnter}},
+	})
+	if ack := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {
+		t.Fatalf("enter: frame = %v, want ACK", ack.Action)
+	}
+}
+
+// sendAttach sends ATTACH with flags and returns the ATTACHED frame so
+// the caller can inspect its flags (unlike attach, which discards it).
+func sendAttach(t *testing.T, ws *websocket.Conn, channel string, flags int64) *protocol.ProtocolMessage {
+	t.Helper()
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:  protocol.ActionAttach,
+		Channel: channel,
+		Flags:   flags,
+	})
+	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if msg.Action != protocol.ActionAttached {
+		t.Fatalf("expected ATTACHED on %q, got %v", channel, msg.Action)
+	}
+	return msg
+}
+
+// TestPresenceSyncOnAttach: attaching to a channel with members sets
+// HAS_PRESENCE on ATTACHED and delivers the set as a SYNC frame (action
+// PRESENT), with the cursor marking the set complete.
+func TestPresenceSyncOnAttach(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+
+	pub := dialClient(t, srv, "alice")
+	drainConnected(t, pub)
+	attach(t, pub, "room", protocol.FlagPresence)
+	enter(t, pub, "room", 1)
+
+	sub := dial(t, srv, "")
+	drainConnected(t, sub)
+	attached := sendAttach(t, sub, "room", 0) // full modes incl. PRESENCE_SUBSCRIBE
+	if attached.Flags&protocol.FlagHasPresence == 0 {
+		t.Errorf("ATTACHED flags = %d, want HAS_PRESENCE set", attached.Flags)
+	}
+
+	sync := readFrame(t, sub, protocol.FormatJSON, 2*time.Second)
+	if sync.Action != protocol.ActionSync {
+		t.Fatalf("Action = %v, want SYNC", sync.Action)
+	}
+	if len(sync.Presence) != 1 {
+		t.Fatalf("SYNC Presence length = %d, want 1", len(sync.Presence))
+	}
+	p := sync.Presence[0]
+	if p.ClientID != "alice" {
+		t.Errorf("member clientId = %q, want alice", p.ClientID)
+	}
+	if p.Action != protocol.PresencePresent {
+		t.Errorf("member action = %v, want present", p.Action)
+	}
+	if !strings.HasSuffix(sync.ChannelSerial, ":") {
+		t.Errorf("SYNC channelSerial = %q, want a trailing ':' marking the set complete", sync.ChannelSerial)
+	}
+}
+
+// TestPresenceNoSyncWhenEmpty: an empty channel yields no HAS_PRESENCE
+// and no SYNC frame.
+func TestPresenceNoSyncWhenEmpty(t *testing.T) {
+	srv, h := newTestServer(t, time.Hour)
+	sub := dial(t, srv, "")
+	drainConnected(t, sub)
+	attached := sendAttach(t, sub, "room", 0)
+	if attached.Flags&protocol.FlagHasPresence != 0 {
+		t.Errorf("ATTACHED flags = %d, want HAS_PRESENCE clear for empty channel", attached.Flags)
+	}
+	// A subsequent message is the next frame — proving no SYNC was sent.
+	h.publish(t, "room", &protocol.Message{Name: "m"})
+	next := readFrame(t, sub, protocol.FormatJSON, 2*time.Second)
+	if next.Action != protocol.ActionMessage {
+		t.Fatalf("next frame = %v, want MESSAGE (a stray SYNC would arrive first)", next.Action)
+	}
+}
+
+// TestPresenceNoSyncWithoutSubscribeMode: an attachment lacking
+// PRESENCE_SUBSCRIBE gets neither HAS_PRESENCE nor a SYNC even when the
+// channel has members.
+func TestPresenceNoSyncWithoutSubscribeMode(t *testing.T) {
+	srv, h := newTestServer(t, time.Hour)
+
+	pub := dialClient(t, srv, "alice")
+	drainConnected(t, pub)
+	attach(t, pub, "room", protocol.FlagPresence)
+	enter(t, pub, "room", 1)
+
+	sub := dial(t, srv, "")
+	drainConnected(t, sub)
+	attached := sendAttach(t, sub, "room", protocol.FlagSubscribe) // no PRESENCE_SUBSCRIBE
+	if attached.Flags&protocol.FlagHasPresence != 0 {
+		t.Errorf("ATTACHED flags = %d, want HAS_PRESENCE clear (no PRESENCE_SUBSCRIBE)", attached.Flags)
+	}
+	h.publish(t, "room", &protocol.Message{Name: "m"})
+	next := readFrame(t, sub, protocol.FormatJSON, 2*time.Second)
+	if next.Action != protocol.ActionMessage {
+		t.Fatalf("next frame = %v, want MESSAGE (no SYNC expected)", next.Action)
+	}
+}
+
+// TestPresenceSyncThenLiveConverges: the pre-existing member arrives via
+// SYNC, a member that joins afterwards arrives live — the subscriber sees
+// both, with no duplicate of the synced member.
+func TestPresenceSyncThenLiveConverges(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+
+	a := dialClient(t, srv, "alice")
+	drainConnected(t, a)
+	attach(t, a, "room", protocol.FlagPresence)
+	enter(t, a, "room", 1)
+
+	sub := dial(t, srv, "")
+	drainConnected(t, sub)
+	attached := sendAttach(t, sub, "room", 0)
+	if attached.Flags&protocol.FlagHasPresence == 0 {
+		t.Fatalf("want HAS_PRESENCE set")
+	}
+	sync := readFrame(t, sub, protocol.FormatJSON, 2*time.Second)
+	if sync.Action != protocol.ActionSync || len(sync.Presence) != 1 || sync.Presence[0].ClientID != "alice" {
+		t.Fatalf("SYNC = %v with %d members, want alice", sync.Action, len(sync.Presence))
+	}
+
+	// bob joins after the sync → delivered live (and alice is NOT
+	// re-delivered live, since her enter precedes the subscriber's anchor).
+	b := dialClient(t, srv, "bob")
+	drainConnected(t, b)
+	attach(t, b, "room", protocol.FlagPresence)
+	enter(t, b, "room", 1)
+
+	live := readFrame(t, sub, protocol.FormatJSON, 2*time.Second)
+	if live.Action != protocol.ActionPresence || len(live.Presence) != 1 {
+		t.Fatalf("live frame = %v (presence len %d), want one PRESENCE", live.Action, len(live.Presence))
+	}
+	if live.Presence[0].ClientID != "bob" || live.Presence[0].Action != protocol.PresenceEnter {
+		t.Errorf("live member = (%q, %v), want (bob, enter)", live.Presence[0].ClientID, live.Presence[0].Action)
 	}
 }
 

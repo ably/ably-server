@@ -106,9 +106,31 @@ func (a *attachment) run() {
 	anchor := a.stream.ChannelSerial()
 	replay, attachPoint, resumed, errInfo := a.computeReplay(anchor)
 
+	// Presence sync snapshot (DESIGN.md §12.4): only PRESENCE_SUBSCRIBE
+	// attachments get the current set. Captured before ATTACHED so the
+	// HAS_PRESENCE flag can be set. The snapshot is taken at-or-after the
+	// live anchor; any member that enters or leaves past the anchor also
+	// arrives on the live cursor, and the client converges by serial.
+	var (
+		syncMembers []*protocol.PresenceMessage
+		syncAsOf    string
+	)
+	if a.hasMode(protocol.FlagPresenceSubscribe) {
+		members, asOf, err := a.channel.Members(a.ctx)
+		if err != nil {
+			a.logger.Warn("presence sync: Members failed; skipping sync", "err", err)
+		} else if len(members) > 0 {
+			syncMembers = presentSnapshot(members)
+			syncAsOf = asOf
+		}
+	}
+
 	flags := int64(0)
 	if resumed {
 		flags = protocol.FlagResumed
+	}
+	if len(syncMembers) > 0 {
+		flags |= protocol.FlagHasPresence
 	}
 
 	attached := &protocol.ProtocolMessage{
@@ -121,6 +143,21 @@ func (a *attachment) run() {
 	}
 	if !a.send(attached) {
 		return
+	}
+
+	// Deliver the presence set as a SYNC frame before live delivery. A
+	// single frame suffices at our scale; the channelSerial carries the
+	// sync cursor — "<serial>:" with an empty cursor part marks the set
+	// complete (paging is a later phase, DESIGN.md §12.4).
+	if len(syncMembers) > 0 {
+		if !a.send(&protocol.ProtocolMessage{
+			Action:        protocol.ActionSync,
+			Channel:       a.channelName,
+			ChannelSerial: syncAsOf + ":",
+			Presence:      syncMembers,
+		}) {
+			return
+		}
 	}
 
 	for _, cm := range replay {
