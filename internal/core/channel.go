@@ -90,6 +90,29 @@ func (c *Channel) PublishPresence(ctx context.Context, presence []*protocol.Pres
 	return c.store.StorePresence(ctx, presence)
 }
 
+// Mutate applies an update/delete/append to an existing message,
+// delegating to the storage backend (which validates the target, merges,
+// mints the new version, persists, and updates the projection/versions
+// index). The link onto the live list arrives via the Appender callback
+// exactly as for a publish, so subscribers see the new version in stream
+// order (DESIGN.md §13.2). The (cm, idempotent, err) tuple is forwarded
+// verbatim — notably storage.ErrTargetNotFound for an unknown target.
+func (c *Channel) Mutate(ctx context.Context, mut *protocol.Message) (*protocol.ChannelMessage, bool, error) {
+	return c.store.Mutate(ctx, mut)
+}
+
+// LatestVersion returns the current latest version of the message
+// identified by serial, or storage.ErrTargetNotFound (DESIGN.md §13.4).
+func (c *Channel) LatestVersion(ctx context.Context, serial string) (*protocol.Message, error) {
+	return c.store.LatestVersion(ctx, serial)
+}
+
+// Versions returns every version of the message identified by serial,
+// paginated per q (DESIGN.md §13.4).
+func (c *Channel) Versions(ctx context.Context, serial string, q storage.HistoryQuery) (storage.HistoryPage, error) {
+	return c.store.Versions(ctx, serial, q)
+}
+
 // History delegates to the underlying ChannelStore. Backends return
 // ChannelMessages in the order requested by q.Direction (see
 // storage.HistoryQuery); the REST and resume paths flatten the page

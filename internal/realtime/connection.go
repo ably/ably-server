@@ -3,7 +3,6 @@ package realtime
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"time"
 
@@ -193,23 +192,12 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 		})
 		return
 	}
-	// Inbound mutations (update/delete/append) reuse the MESSAGE frame,
+	// Mutations (update/delete/append) reuse the MESSAGE frame,
 	// distinguished by a non-create Message-level action (DESIGN.md
-	// §13.6). The mutation path lands in TASK-52; until then a non-create
-	// action is rejected so we never silently drop the semantics.
+	// §13.6); they take the mutation path rather than a fresh publish.
 	for _, m := range msg.Messages {
-		if m.Action != protocol.MessageCreate {
-			c.logger.Warn("MESSAGE with non-create action not yet supported; rejecting",
-				"action", m.Action.String(), "msgSerial", msg.MsgSerial)
-			c.queue(ctx, &protocol.ProtocolMessage{
-				Action:    protocol.ActionNack,
-				MsgSerial: msg.MsgSerial,
-				Error: &protocol.ErrorInfo{
-					Message:    fmt.Sprintf("message action %s not supported", m.Action),
-					Code:       40000,
-					StatusCode: 400,
-				},
-			})
+		if m.Action.IsMutation() {
+			c.handleMutation(ctx, msg)
 			return
 		}
 	}
