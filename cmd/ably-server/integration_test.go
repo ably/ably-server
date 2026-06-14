@@ -82,34 +82,12 @@ func startServerOnDSN(t *testing.T, dsn string) string {
 	return addr.String()
 }
 
-// newClient builds an ably-go realtime client pointed at the running
-// server. The client is closed on t.Cleanup.
+// newClient builds an anonymous ably-go realtime client pointed at the
+// running server. The client is closed on t.Cleanup. For presence tests
+// that need a clientId, use newClientWithID.
 func newClient(t *testing.T, addr string) *ably.Realtime {
 	t.Helper()
-	host, portStr, err := net.SplitHostPort(addr)
-	if err != nil {
-		t.Fatalf("split host:port %q: %v", addr, err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		t.Fatalf("port %q: %v", portStr, err)
-	}
-	client, err := ably.NewRealtime(
-		ably.WithKey(integrationAPIKey),
-		ably.WithEndpoint(host),
-		ably.WithPort(port),
-		ably.WithTLS(false),
-		ably.WithInsecureAllowBasicAuthWithoutTLS(),
-		ably.WithUseTokenAuth(false),
-		ably.WithAutoConnect(false),
-		ably.WithRealtimeRequestTimeout(5*time.Second),
-		ably.WithLogLevel(ably.LogNone),
-	)
-	if err != nil {
-		t.Fatalf("NewRealtime: %v", err)
-	}
-	t.Cleanup(func() { client.Close() })
-	return client
+	return newClientWithID(t, addr, "")
 }
 
 // connect drives the client to CONNECTED.

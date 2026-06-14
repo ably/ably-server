@@ -4,6 +4,7 @@ title: Cluster presence liveness lease and crashed-node reaper (Postgres)
 status: To Do
 assignee: []
 created_date: '2026-06-13 09:38'
+updated_date: '2026-06-14 19:40'
 labels:
   - cluster
 dependencies:
@@ -30,4 +31,5 @@ Handle presence orphans left by a crashed cluster node per DESIGN.md section 12.
 - [ ] #5 After a node is killed without teardown, its members disappear from Members and a LEAVE reaches other nodes within one lease window
 - [ ] #6 The lease window and reaper cadence are defined as constants; making them configurable is a follow-up
 - [ ] #7 A multi-node testcontainer test verifies orphan reaping after a simulated node death
+- [ ] #8 Multi-node integration test: a member whose owning node is killed is reaped — removed from Members and a synthetic LEAVE propagates to other nodes within a lease window (the crashed-node case deferred from TASK-48)
 <!-- AC:END -->
