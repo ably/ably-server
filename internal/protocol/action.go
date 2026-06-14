@@ -50,3 +50,53 @@ func (a Action) String() string {
 	}
 	return "unknown"
 }
+
+// MessageAction is the action carried by a Message — the data-stream
+// analogue of PresenceAction. Values are pinned to Ably's MessageAction
+// wire enum (ably-go's constants): a create is the default original
+// publish; update/delete/append are mutations of an existing message
+// (DESIGN.md §13.1). The values summary (3), meta (4) and others Ably
+// defines for object messages / annotations are intentionally omitted —
+// this server only models the mutable-message subset.
+type MessageAction int8
+
+const (
+	// MessageCreate is an original publish (the default). Every message
+	// the publish path produces carries this; it must be emitted on the
+	// wire even at its zero value, so Message.Action has no omitempty.
+	MessageCreate MessageAction = 0
+	// MessageUpdate replaces fields of an existing message with a new
+	// version (DESIGN.md §13.2).
+	MessageUpdate MessageAction = 1
+	// MessageDelete soft-deletes an existing message — a tombstone
+	// version (DESIGN.md §13.2).
+	MessageDelete MessageAction = 2
+	// MessageAppend concatenates onto an existing message's data
+	// (DESIGN.md §13.3). Pinned to Ably's value 5.
+	MessageAppend MessageAction = 5
+)
+
+var messageActionNames = map[MessageAction]string{
+	MessageCreate: "create",
+	MessageUpdate: "update",
+	MessageDelete: "delete",
+	MessageAppend: "append",
+}
+
+func (a MessageAction) String() string {
+	if name, ok := messageActionNames[a]; ok {
+		return name
+	}
+	return "unknown"
+}
+
+// IsMutation reports whether a is an update, delete or append — i.e. a
+// mutation of an existing message rather than an original create.
+func (a MessageAction) IsMutation() bool {
+	switch a {
+	case MessageUpdate, MessageDelete, MessageAppend:
+		return true
+	default:
+		return false
+	}
+}

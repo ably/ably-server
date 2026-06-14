@@ -77,6 +77,15 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no messages", http.StatusBadRequest)
 		return
 	}
+	// POST creates messages only. A mutation (update/delete/append)
+	// carries a non-create action and a target serial; it is published
+	// via PATCH .../messages/{serial} (DESIGN.md §13.6), never here.
+	for _, m := range msgs {
+		if m.Action != protocol.MessageCreate {
+			http.Error(w, fmt.Sprintf("action %s not permitted on POST; use PATCH for mutations", m.Action), http.StatusBadRequest)
+			return
+		}
+	}
 
 	ch, err := s.manager.GetChannel(r.Context(), name)
 	if err != nil {

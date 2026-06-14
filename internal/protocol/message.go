@@ -7,19 +7,46 @@ package protocol
 //   - ID is client-supplied and optional; it carries idempotency intent
 //     so the server can reject duplicate publishes within the retention
 //     window.
-//   - Serial is server-assigned on publish in the form
-//     `<channelSerial>:<idx>`, where channelSerial is the containing
-//     ChannelMessage's serial and idx is this Message's position
-//     within that batch.
+//   - Serial is the stable message IDENTITY (DESIGN.md §8, §13.1): it
+//     names the message, unchanged across every version. For a create
+//     it is server-assigned in the form `<channelSerial>:<idx>` (the
+//     containing ChannelMessage's serial plus this Message's position
+//     in the batch); an update/delete/append repeats the target's
+//     Serial and carries a fresh Version.
+//
+// Action and Version split message-vs-version identity (DESIGN.md §13.1).
+// Action distinguishes a create from a mutation; Version names a single
+// version of the message. For a create, Version.Serial == Serial; each
+// subsequent mutation lands at a new channelSerial and gets a fresh,
+// strictly-greater Version.Serial. Action carries no omitempty: a create
+// must emit action=0 on the wire to match Ably's SDKs.
 type Message struct {
-	ID           string `json:"id,omitempty"           msgpack:"id,omitempty"`
-	Serial       string `json:"serial,omitempty"       msgpack:"serial,omitempty"`
-	ClientID     string `json:"clientId,omitempty"     msgpack:"clientId,omitempty"`
-	ConnectionID string `json:"connectionId,omitempty" msgpack:"connectionId,omitempty"`
-	Name         string `json:"name,omitempty"         msgpack:"name,omitempty"`
-	Data         any    `json:"data,omitempty"         msgpack:"data,omitempty"`
-	Encoding     string `json:"encoding,omitempty"     msgpack:"encoding,omitempty"`
-	Timestamp    int64  `json:"timestamp,omitempty"    msgpack:"timestamp,omitempty"`
+	ID           string          `json:"id,omitempty"           msgpack:"id,omitempty"`
+	Serial       string          `json:"serial,omitempty"       msgpack:"serial,omitempty"`
+	Action       MessageAction   `json:"action"                 msgpack:"action"`
+	ClientID     string          `json:"clientId,omitempty"     msgpack:"clientId,omitempty"`
+	ConnectionID string          `json:"connectionId,omitempty" msgpack:"connectionId,omitempty"`
+	Name         string          `json:"name,omitempty"         msgpack:"name,omitempty"`
+	Data         any             `json:"data,omitempty"         msgpack:"data,omitempty"`
+	Encoding     string          `json:"encoding,omitempty"     msgpack:"encoding,omitempty"`
+	Timestamp    int64           `json:"timestamp,omitempty"    msgpack:"timestamp,omitempty"`
+	Version      *MessageVersion `json:"version,omitempty"      msgpack:"version,omitempty"`
+}
+
+// MessageVersion names a single version of a message (DESIGN.md §13.1).
+// Its wire shape matches Ably's version object. Serial is the
+// `<channelSerial>:<idx>` of the publish that produced this version (for
+// a create it equals the message's own Serial; for a mutation it is the
+// mutation publish's position). Timestamp, ClientID, Description and
+// Metadata stamp the operation: ClientID is the operating client (which
+// may differ from the message's creator), and Description/Metadata are
+// optional operator-supplied annotations.
+type MessageVersion struct {
+	Serial      string         `json:"serial,omitempty"      msgpack:"serial,omitempty"`
+	Timestamp   int64          `json:"timestamp,omitempty"   msgpack:"timestamp,omitempty"`
+	ClientID    string         `json:"clientId,omitempty"    msgpack:"clientId,omitempty"`
+	Description string         `json:"description,omitempty" msgpack:"description,omitempty"`
+	Metadata    map[string]any `json:"metadata,omitempty"    msgpack:"metadata,omitempty"`
 }
 
 // ChannelMessage is one atomic publish on a channel: a server-assigned

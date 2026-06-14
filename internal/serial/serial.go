@@ -144,6 +144,22 @@ func ParseMessageSerial(s string) (channelSerial string, idx int, err error) {
 	return channelSerial, idx, nil
 }
 
+// Timestamp extracts the wall-clock millisecond prefix encoded in a
+// channelSerial or Message.serial (the leading 14 digits; see the
+// format above). Returns an error if s is too short or the prefix is
+// not numeric. Used to stamp a server-authoritative timestamp onto a
+// message version from the serial the publish minted (DESIGN.md §13.1).
+func Timestamp(s string) (int64, error) {
+	if len(s) < timestampWidth {
+		return 0, fmt.Errorf("serial: %q too short to contain a timestamp", s)
+	}
+	v, err := strconv.ParseInt(s[:timestampWidth], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("serial: %q has non-numeric timestamp prefix: %w", s, err)
+	}
+	return v, nil
+}
+
 // TimestampBounds maps an inclusive ms-since-epoch range to a
 // half-open lex range over channelSerials. Useful for backends that
 // implement timestamp-bounded history reads via prefix/range scans on
