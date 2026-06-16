@@ -99,6 +99,37 @@ ably-server --mode cluster
 
 Run `ably-server --help` for the full flag list.
 
+### Local cluster (Docker Compose)
+
+To run the full `cluster` topology locally — one PostgreSQL instance and
+three stateless ably-server nodes sharing it for both state and pub/sub:
+
+```sh
+docker compose up --build
+```
+
+The nodes auto-migrate the empty database on boot (under a Postgres
+advisory lock), so there's no manual setup. Each node is reachable on its
+own host port and all three share the api-key `app.key:secret`, so a
+client can attach to any of them:
+
+| Node  | Endpoint              |
+|-------|-----------------------|
+| node1 | `http://localhost:8081` |
+| node2 | `http://localhost:8082` |
+| node3 | `http://localhost:8083` |
+
+Publish to one node and read it back from another (the shared DB carries
+the message across):
+
+```sh
+curl -u app.key:secret -H 'Content-Type: application/json' \
+  -d '{"name":"greeting","data":"hello"}' \
+  http://localhost:8081/channels/test/messages
+
+curl -u app.key:secret http://localhost:8082/channels/test/history
+```
+
 ## Status
 
 Some of [DESIGN.md](DESIGN.md) is implemented; some is still on the

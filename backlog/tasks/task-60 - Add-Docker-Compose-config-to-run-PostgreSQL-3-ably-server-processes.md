@@ -1,9 +1,11 @@
 ---
 id: TASK-60
 title: Add Docker Compose config to run PostgreSQL + 3 ably-server processes
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@claude'
 created_date: '2026-06-16 18:14'
+updated_date: '2026-06-16 18:22'
 labels:
   - performance
 dependencies: []
@@ -27,7 +29,15 @@ Notes / pointers:
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 docker compose up brings up Postgres + 3 ably-server nodes in cluster mode against the shared DB
-- [ ] #2 Each node is reachable on its own host port and shares one api-key
-- [ ] #3 Stack comes up cleanly from empty DB (concurrent auto-migrate) with no manual setup steps
+- [x] #1 docker compose up brings up Postgres + 3 ably-server nodes in cluster mode against the shared DB
+- [x] #2 Each node is reachable on its own host port and shares one api-key
+- [x] #3 Stack comes up cleanly from empty DB (concurrent auto-migrate) with no manual setup steps
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Added Dockerfile (multi-stage, static CGO_ENABLED=0 binary on alpine), .dockerignore, and docker-compose.yml defining one postgres:16-alpine + three ably-server nodes (node1/2/3 on host ports 8081/8082/8083). Nodes share api-key app.key:secret and DSN postgres://ably:ably@postgres:5432/ably via ABLY_SERVER_API_KEY / ABLY_SERVER_DB_DSN; a YAML anchor keeps the three node defs DRY and the image builds once. Nodes depend_on postgres service_healthy (pg_isready) and have a /healthz busybox-wget healthcheck.
+
+Verified end to end: docker compose up --build brings all three nodes to healthy against the shared DB from an empty schema (concurrent advisory-lock auto-migrate), and a message published to node1 is readable via /history from node2 and node3. README gained a "Local cluster (Docker Compose)" section.
+<!-- SECTION:NOTES:END -->
