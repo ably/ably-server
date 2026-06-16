@@ -130,6 +130,32 @@ curl -u app.key:secret -H 'Content-Type: application/json' \
 curl -u app.key:secret http://localhost:8082/channels/test/history
 ```
 
+## Benchmarking
+
+`cmd/ably-bench` drives pub/sub load against a running server (a single
+node or the Compose cluster above), checks delivery correctness, measures
+end-to-end latency, and can search for the highest throughput that stays
+within a latency budget.
+
+```sh
+# Fixed-rate run against the local cluster (default endpoints):
+go run ./cmd/ably-bench --rate 5000 --duration 10s
+
+# Find the max throughput within p50<=20ms, p99<=100ms:
+go run ./cmd/ably-bench --search --p50 20ms --p99 100ms --max-rate 100000
+
+# Target a single in-memory node instead:
+go run ./cmd/ably-bench --endpoints localhost:8090 --rate 20000
+```
+
+Each message carries its publisher id, a per-publisher sequence number,
+and a publish timestamp; the same process publishes and subscribes, so
+latency is measured against one clock with no skew. Correctness is a hard
+check — any loss, duplication, or per-channel reordering fails the run.
+`--search` ramps the offered load until the budget breaks, then binary-
+searches for the highest sustained rate that still meets it. Run
+`go run ./cmd/ably-bench --help` for the full flag list.
+
 ## Status
 
 Some of [DESIGN.md](DESIGN.md) is implemented; some is still on the

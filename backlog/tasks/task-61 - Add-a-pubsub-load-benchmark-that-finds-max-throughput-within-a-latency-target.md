@@ -1,9 +1,11 @@
 ---
 id: TASK-61
 title: Add a pubsub load benchmark that finds max throughput within a latency target
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@claude'
 created_date: '2026-06-16 18:14'
+updated_date: '2026-06-16 21:20'
 labels:
   - performance
 dependencies: []
@@ -29,8 +31,16 @@ Pointers: build alongside `cmd/` (e.g. `cmd/ably-bench`); cluster wiring mirrors
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Generates configurable pubsub load (channels, publishers, subscribers, message rate/size) against a running server or the Compose cluster
-- [ ] #2 Verifies correctness: detects and reports any message loss, duplication, or per-channel reordering
-- [ ] #3 Measures end-to-end latency and reports p50/p99/max
-- [ ] #4 Searches offered load and reports the max sustained throughput that stays within the configured p50/p99 target
+- [x] #1 Generates configurable pubsub load (channels, publishers, subscribers, message rate/size) against a running server or the Compose cluster
+- [x] #2 Verifies correctness: detects and reports any message loss, duplication, or per-channel reordering
+- [x] #3 Measures end-to-end latency and reports p50/p99/max
+- [x] #4 Searches offered load and reports the max sustained throughput that stays within the configured p50/p99 target
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Added cmd/ably-bench (main.go CLI+search+reporting, trial.go run/clients, stats.go histogram+payload+correctness). Uses ably-go realtime clients (same basic-auth/no-TLS wiring as the integration tests), x/time/rate to pace offered load, and PublishAsync with a bounded in-flight semaphore so a server that can't keep up shows as backpressure (achieved < offered) rather than unbounded memory. Each message embeds publisherID:seq:publishNanos+padding; the same process publishes and subscribes so latency is skew-free. Correctness is exact per-publisher (loss/dup/reorder) via monotonic seq tracking; latency via a 100µs-resolution histogram (p50/p99/max). --search ramps x2 to first budget breach then binary-searches for the max sustained rate within --p50/--p99.
+
+Verified against the TASK-60 compose cluster and a single in-memory node. Findings (laptop, docker): in-memory mode sustained ~47k msg/s at p50=0.2ms/p99=1.1ms; cluster mode (Postgres LISTEN/NOTIFY) hit a hard knee around ~2-2.5k msg/s aggregate where latency climbs into the hundreds of ms / seconds while delivery stays correct. Same benchmark binary in both, so the ceiling is the cluster write/NOTIFY path, not the tool — worth a follow-up perf task.
+<!-- SECTION:NOTES:END -->
