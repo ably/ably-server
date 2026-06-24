@@ -1,52 +1,16 @@
 # ably-server — Design
 
-> **Status.** This document describes the target design, not the current
-> state of the code. Substantial parts are aspirational and read in
-> present tense as if implemented — they aren't yet. Notable gaps at the
-> time of writing:
->
-> - **§3 auth** — only API-key Basic auth exists. JWT (HS256),
->   capabilities, and `clientId` resolution are not yet implemented.
-> - **§9 configuration** — `--log-format` is not wired up; the
->   `ABLY_SERVER_*` env-var coverage is partial, and the TOML config
->   file is not yet implemented.
-> - **§10 observability** — Prometheus `/metrics`, OpenTelemetry, and
->   pprof are not implemented.
-> - **§11 graceful shutdown** — the server does not currently send
->   `DISCONNECTED` to existing WebSockets on SIGTERM.
-> - **§6 retention** — TTL / per-channel cap policy is still being
->   decided.
-> - **§12 presence** — newly in scope as of this revision; none of it is
->   implemented yet. The crashed-node membership reaper and lease bump
->   (§12.5) and `SYNC` paging for very large sets are expected to land
->   after the core enter/update/leave + sync path.
-> - **§13 mutable messages** — newly in scope as of this revision; not
->   implemented. Only the `action` field plumbing (TASK-37) is partway
->   defined. Append aggregation (§13.3) is a later phase after the core
->   update/delete path.
->
-> See [`backlog/`](backlog/) for the live task list. The package layout
-> listed in §5 is "proposed" and only loosely matches `internal/`.
+`ably-server` is a single Go binary that speaks Ably's realtime WebSocket
+protocol and the core REST API, so existing Ably SDKs connect to it
+unchanged. It covers pub/sub messaging — including presence and mutable
+messages — and runs as one in-memory or on-disk process for local
+development and CI, or as a cluster of stateless nodes over a shared
+Postgres for self-hosted single-region deployments.
 
-## 1. Goals & non-goals
+This document describes how it works, section by section. The task list in
+[`backlog/`](backlog/) tracks implementation progress.
 
-### Goals
-
-- A single Go binary, `ably-server`, that speaks Ably's realtime WebSocket
-  protocol and the core REST pub/sub, presence, and mutable-message
-  endpoints.
-- Drop-in for **local development** and **CI** — existing Ably client SDKs
-  should connect to it without code changes (only host/port/TLS overrides).
-- **Self-hostable** for single-region deployments where the operator does not
-  need (or want) Ably's cloud.
-- Three deployment modes selected by configuration:
-  1. `memory` — single process, in-memory state, in-memory pub/sub.
-  2. `disk` — single process, on-disk persistence, in-memory pub/sub.
-  3. `cluster` — N processes, shared database for both state and pub/sub.
-- Stateless server processes: any node can serve any connection; no peer-to-peer
-  membership or gossip.
-
-### Non-goals
+## 1. Non-goals
 
 - Multi-region / global distribution.
 - Ably-cloud-only product surface: integrations / rules, push notifications,
@@ -315,8 +279,8 @@ Continuity instead lives at the attachment level, driven by the client:
   onwards (the gap between the client's cursor and the live head, followed
   by live traffic).
 - If the supplied serial is older than retained history (the relevant
-  messages have aged out — message TTL defaults to 2 minutes, see §6) the
-  server still attaches: it picks the channel's current head as the attach
+  messages are no longer held in storage — see the retention note in §6)
+  the server still attaches: it picks the channel's current head as the attach
   point, clears `ATTACHED.flags.RESUMED`, and populates `ATTACHED.error`
   with an `ErrorInfo` explaining that the requested resume could not be
   satisfied so the SDK can surface a discontinuity to the application. No
@@ -385,27 +349,39 @@ The starting cursor depends on how the attachment was created:
                        memory / disk / database
 ```
 
-Protocol types (`ProtocolMessage`, `Action`, `Message`) default to
-importing `github.com/ably/ably-go/ably/proto` where the exported types
-have the fields we need. If we hit friction — missing fields, awkward
-serialisation, types not exported — the package falls back to internal
-definitions in `internal/protocol/`. The fallback is mechanical:
-redefine the affected struct, keep field tags, leave the rest of the
-package on the upstream types.
+Three deployment modes are selected by configuration, differing only in
+where state and pub/sub live:
 
-Major packages (proposed):
+1. `memory` — single process, in-memory state, in-memory pub/sub.
+2. `disk` — single process, on-disk persistence, in-memory pub/sub.
+3. `cluster` — N processes, shared database for both state and pub/sub.
+
+Server processes are stateless: any node can serve any connection, with no
+peer-to-peer membership or gossip. The mechanics of each mode are detailed
+in §6 (storage) and §7 (pub/sub).
+
+Protocol types (`ProtocolMessage`, `Action`, `Message`, `PresenceMessage`)
+are defined in `internal/protocol/`, with their field tags and
+action/flag constants pinned to ably-go's wire constants so SDKs
+interoperate unchanged. (The original plan was to import
+`github.com/ably/ably-go/ably/proto` directly and fall back to local
+definitions only on friction; in practice the local definitions carry the
+whole surface, so the package owns them outright.)
+
+Major packages:
 
 ```
 cmd/ably-server/        # main, flag/env wiring
-internal/config/        # mode + DSN resolution
-internal/protocol/      # codec wrappers (json/msgpack); fallback type defs if needed
-internal/auth/          # key parsing, basic-auth, JWT verify, capability + clientId resolution
-internal/realtime/      # WebSocket upgrade, ConnectionLoop, attachment cursor loop
+cmd/ably-bench/         # pub/sub load benchmark
+internal/protocol/      # wire types + json/msgpack codec; presence and mutable-message types
+internal/auth/          # API-key parsing + Basic auth
+internal/realtime/      # WebSocket upgrade, connection loop, attachment cursor, presence, mutation, rewind
 internal/rest/          # HTTP handlers + router
-internal/core/          # Channel, ChannelManager, entry list, message semantics
-internal/storage/       # Storage interface + memory/disk/db backends
-internal/cluster/       # Postgres LISTEN/NOTIFY broker (cluster mode only)
-internal/id/            # connection IDs, message IDs, msgSerial helpers
+internal/core/          # Channel + ChannelManager (live entry list)
+internal/storage/       # Storage interface + memory / bbolt / postgres backends
+                        #   (the postgres backend carries the cluster LISTEN/NOTIFY broker)
+internal/serial/        # channelSerial minting + global ordering
+internal/id/            # connection IDs, message IDs
 ```
 
 ### 5.1 Channel
@@ -444,10 +420,9 @@ The first `ATTACH` to a name (or the first publish) creates the Channel.
 The Channel is removed from the manager only when **both** are true:
 
 - it has no attachments, and
-- every entry on its linked list has aged past the message TTL (default
-  2 minutes; see §6).
+- every entry on its linked list has aged past the retention window (§6).
 
-Holding the Channel for the TTL window after the last detach keeps the
+Holding the Channel for the retention window after the last detach keeps the
 in-process list available to serve a fresh `ATTACH` that arrives soon
 after with a `channelSerial` covering still-live messages, without having
 to re-materialise the list from storage.
@@ -455,8 +430,8 @@ to re-materialise the list from storage.
 **Memory.** Go's GC reclaims entries once no attachment retains a
 reference. A slow attachment retains the prefix of the list between its
 cursor and the live tail, so memory grows with its lag. The retention
-policy (§6) bounds the working set: once a message ages past the TTL or
-the per-channel `max_messages` cap, the Channel drops its own
+policy (§6) is intended to bound the working set: once a message ages past
+the retention window or the per-channel `max_messages` cap, the Channel drops its own
 back-pointer to it, so any unreferenced entries become eligible for GC.
 
 ### 5.2 Connection loop
@@ -480,6 +455,13 @@ handled by the connection itself, calling into `ChannelManager` to
 get/release a Channel.
 
 ## 6. Storage
+
+> **Open design question — retention (TASK-26).** This section describes a
+> retention *mechanism* (a serial-ordered sweep bounded by a message TTL and
+> a per-channel `max_messages` cap), but the *policy* it enforces is not yet
+> settled: the default TTL value, the cap, and whether operators can
+> override either are still being decided. References elsewhere to "the
+> retention window" or messages "aging out" point back here.
 
 The storage interface has two facets: a process-wide `Storage` that
 hands out per-channel `ChannelStore`s and owns any shared resources
@@ -725,10 +707,10 @@ WHERE channel = $1
 A per-channel cap (counted in ChannelMessages = `DISTINCT
 channel_serial`) is applied in the same sweep.
 
-The default message TTL is **2 minutes**, matching Ably cloud's default.
-Whether — and how — operators can override the TTL and the per-channel
-message cap is still being decided (see the §6 retention note in the
-status callout).
+The intended default message TTL is **2 minutes**, matching Ably cloud's
+default. The TTL value, the per-channel message cap, and whether operators
+can override either are still being decided (TASK-26; see the retention
+note at the top of §6).
 
 ## 7. Pub/Sub
 
@@ -1082,8 +1064,8 @@ Each `SYNC` frame carries a page of members as PresenceMessages with
 action `PRESENT`. The `channelSerial` field doubles as the sync cursor:
 `<serial>:<cursor>` while pages follow, `<serial>:` (empty cursor part)
 on the final page to mark completion. At the scale we target the set
-usually fits a single frame; paging exists for large sets and can land
-incrementally (see the Status callout).
+usually fits a single frame; the cursor protocol allows paging for larger
+sets.
 
 Consistency between the snapshot and live delivery is resolved by the
 **client's merge**, exactly as in Ably: every PresenceMessage carries a
@@ -1247,9 +1229,9 @@ delete:
   subscriber opt into receiving full versions instead of incremental
   appends.
 
-Because append aggregation is stateful and conflation-sensitive, it is a
-**later phase** (see the Status callout): the core update / delete path
-ships first.
+Append aggregation is inherently stateful and conflation-sensitive, which
+is why its delivery contract is deliberately looser than that of update /
+delete.
 
 ### 13.4 Reads & history
 
