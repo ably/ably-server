@@ -76,16 +76,24 @@ type ProtocolMessage struct {
 	MsgSerial     int64              `json:"msgSerial,omitempty"     msgpack:"msgSerial,omitempty"`
 	Timestamp     int64              `json:"timestamp,omitempty"     msgpack:"timestamp,omitempty"`
 	Count         int                `json:"count,omitempty"         msgpack:"count,omitempty"`
-	// Serials carries the server-assigned serials back to the publisher
-	// on an ACK: the persisted Message.Serial of each message in a
-	// publish (idx order), or the new version serial of a mutation. SDKs
-	// read it to populate publish/update results (DESIGN.md §8, §13.1).
-	Serials       []string           `json:"serials,omitempty"       msgpack:"serials,omitempty"`
+	// Res carries the per-message publish results back to the publisher
+	// on an ACK (Ably's TR4s shape): one entry per message in the ack
+	// window, each holding the server-assigned serials. SDKs read it to
+	// populate publish/update results (DESIGN.md §8, §13.1).
+	Res           []*PublishResult   `json:"res,omitempty"           msgpack:"res,omitempty"`
 	Flags         int64              `json:"flags,omitempty"         msgpack:"flags,omitempty"`
 	Messages      []*Message         `json:"messages,omitempty"      msgpack:"messages,omitempty"`
 	Presence      []*PresenceMessage `json:"presence,omitempty"      msgpack:"presence,omitempty"`
 	Error         *ErrorInfo         `json:"error,omitempty"         msgpack:"error,omitempty"`
 	Params        map[string]string  `json:"params,omitempty"        msgpack:"params,omitempty"`
+}
+
+// PublishResult is one entry in an ACK's Res array (Ably's TR4s): the
+// serials the server assigned to one acknowledged message. For a create
+// it carries the message's Serial; for a mutation, the new version
+// serial.
+type PublishResult struct {
+	Serials []string `json:"serials,omitempty" msgpack:"serials,omitempty"`
 }
 
 // ErrorInfo describes an error in Ably's standard wire form, attached
