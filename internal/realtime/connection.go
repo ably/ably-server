@@ -8,6 +8,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/protocol"
 )
@@ -22,6 +23,7 @@ type connection struct {
 	format            protocol.Format
 	id                string
 	clientID          string // resolved clientId for this connection ("" = anonymous, "*" = wildcard); see DESIGN.md §3.2
+	principal         *auth.Principal // verified credential + token claims; clientId resolution (TASK-11) consumes this
 	heartbeatInterval time.Duration
 	logger            *slog.Logger
 	manager           *core.Manager

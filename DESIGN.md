@@ -26,7 +26,7 @@ This document describes how it works, section by section. The task list in
 
 `GET /` upgrades to WebSocket. The upgrade request carries:
 
-- **Authentication** — via `Authorization` header or `key` / `accessToken`
+- **Authentication** — via `Authorization` header or `key` / `access_token`
   query parameter (see §3).
 - **Protocol version** — required `v=N` query parameter; the server accepts
   `v=2` and above and rejects older versions with an `ERROR` frame and
@@ -91,7 +91,8 @@ Two accepted credential forms:
 1. **Basic auth** — `Authorization: Basic base64(appId.keyId:keySecret)` or
    `?key=...`. Carries the API key's full capability.
 2. **JWT** — bearer token signed with `keySecret` (HS256). Passed via
-   `Authorization: Bearer <jwt>` or `?accessToken=...`.
+   `Authorization: Bearer <jwt>` or the `?access_token=...` query param
+   (the form ably SDKs send; `?accessToken=...` is also accepted).
 
 JWT claims:
 

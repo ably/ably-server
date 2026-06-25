@@ -8,13 +8,22 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // Errors returned by Authenticator.Authenticate.
 var (
 	ErrNoCredentials = errors.New("no credentials presented")
 	ErrInvalidKey    = errors.New("invalid api key")
+	ErrInvalidToken  = errors.New("invalid token")
 )
+
+// clockSkewLeeway is the tolerance applied to time-based JWT claims
+// (iat, exp) to absorb small clock differences between token issuer and
+// this server.
+const clockSkewLeeway = 60 * time.Second
 
 // APIKey is a parsed Ably-format API key in the form
 // `appId.keyId:keySecret`.
@@ -24,6 +33,12 @@ type APIKey struct {
 	KeySecret string
 
 	raw string // cached `appId.keyId:keySecret` for constant-time compare
+}
+
+// Name returns the key's `appId.keyId` portion — the value carried as a
+// JWT `kid` header and as the key name in token-request paths.
+func (k APIKey) Name() string {
+	return k.AppID + "." + k.KeyID
 }
 
 // ParseAPIKey validates and decomposes an Ably-format API key. All
@@ -56,30 +71,121 @@ func ParseAPIKey(s string) (APIKey, error) {
 	}, nil
 }
 
+// Method identifies how a request authenticated.
+type Method int
+
+const (
+	// MethodBasic is API-key auth (Basic header or `key` query param).
+	MethodBasic Method = iota
+	// MethodToken is JWT bearer-token auth.
+	MethodToken
+)
+
+// Principal is the result of authenticating a request: how it
+// authenticated, plus any authorisation/identity claims a token carried
+// for downstream resolution. Capability enforcement (TASK-12) and
+// clientId resolution (TASK-11) consume these; this package only
+// surfaces them.
+type Principal struct {
+	Method Method
+
+	// Capability is the raw `x-ably-capability` claim (a JSON string), or
+	// "" if absent. Empty for Basic auth, where the key's full capability
+	// is implied.
+	Capability string
+
+	// ClientID is the `x-ably-clientId` claim; HasClientID distinguishes
+	// an absent claim from a present one (including the "*" wildcard,
+	// preserved verbatim). Always empty/false for Basic auth.
+	ClientID    string
+	HasClientID bool
+}
+
 // Authenticator verifies presented credentials against a configured API
 // key.
 type Authenticator struct {
-	expected []byte
+	key      APIKey
+	expected []byte // raw `appId.keyId:keySecret` for constant-time compare
+	parser   *jwt.Parser
 }
 
 // NewAuthenticator constructs an Authenticator for the given key.
 func NewAuthenticator(key APIKey) *Authenticator {
-	return &Authenticator{expected: []byte(key.raw)}
+	return &Authenticator{
+		key:      key,
+		expected: []byte(key.raw),
+		parser: jwt.NewParser(
+			jwt.WithValidMethods([]string{"HS256"}),
+			jwt.WithLeeway(clockSkewLeeway),
+			jwt.WithIssuedAt(),         // reject iat in the future (beyond leeway)
+			jwt.WithExpirationRequired(), // exp must be present
+		),
+	}
 }
 
-// Authenticate extracts the presented key from r (Basic auth header
-// preferred, then `key` query parameter) and verifies it against the
-// configured one. Returns ErrNoCredentials if no key is presented and
-// ErrInvalidKey if the credentials don't match.
-func (a *Authenticator) Authenticate(r *http.Request) error {
-	presented, ok := extractKey(r)
-	if !ok {
-		return ErrNoCredentials
+// Authenticate extracts and verifies the request's credentials. A bearer
+// token (Authorization: Bearer, or the access_token / accessToken query
+// param) is tried first, then an API key (Basic auth, or the `key` query
+// param). Returns ErrNoCredentials if none are presented, ErrInvalidKey
+// or ErrInvalidToken if verification fails.
+func (a *Authenticator) Authenticate(r *http.Request) (*Principal, error) {
+	if tok, ok := extractToken(r); ok {
+		return a.verifyToken(tok)
 	}
-	if subtle.ConstantTimeCompare([]byte(presented), a.expected) != 1 {
-		return ErrInvalidKey
+	if k, ok := extractKey(r); ok {
+		if subtle.ConstantTimeCompare([]byte(k), a.expected) != 1 {
+			return nil, ErrInvalidKey
+		}
+		return &Principal{Method: MethodBasic}, nil
 	}
-	return nil
+	return nil, ErrNoCredentials
+}
+
+// verifyToken verifies an HS256 JWT against the configured key's secret
+// and extracts the Ably claims. With a single configured key there is no
+// kid-based key selection (that arrives with multiple-key support,
+// TASK-5); the signature is checked against the one secret.
+func (a *Authenticator) verifyToken(tokenString string) (*Principal, error) {
+	claims := jwt.MapClaims{}
+	_, err := a.parser.ParseWithClaims(tokenString, claims, func(*jwt.Token) (any, error) {
+		return []byte(a.key.KeySecret), nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
+	}
+	if _, ok := claims["iat"]; !ok {
+		return nil, fmt.Errorf("%w: missing iat claim", ErrInvalidToken)
+	}
+
+	p := &Principal{Method: MethodToken}
+	if c, ok := claims["x-ably-capability"].(string); ok {
+		p.Capability = c
+	}
+	if cid, ok := claims["x-ably-clientId"].(string); ok {
+		p.ClientID = cid
+		p.HasClientID = true
+	}
+	return p, nil
+}
+
+// extractToken returns a presented bearer token. The Authorization
+// header (Bearer scheme) wins over the query parameters; both
+// access_token (the form ably SDKs send) and accessToken are accepted.
+func extractToken(r *http.Request) (string, bool) {
+	if h := r.Header.Get("Authorization"); h != "" {
+		if t, ok := strings.CutPrefix(h, "Bearer "); ok {
+			if t = strings.TrimSpace(t); t != "" {
+				return t, true
+			}
+		}
+	}
+	q := r.URL.Query()
+	for _, name := range []string{"access_token", "accessToken"} {
+		if t := q.Get(name); t != "" {
+			return t, true
+		}
+	}
+	return "", false
 }
 
 // extractKey returns the presented key from a request. Basic auth wins

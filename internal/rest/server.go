@@ -529,7 +529,10 @@ func (s *Server) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 // authenticate writes a 401 response on failure and returns false; on
 // success it returns true.
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) bool {
-	err := s.authn.Authenticate(r)
+	// The verified principal (token claims) is not consumed yet; clientId
+	// resolution and capability enforcement (TASK-11 / TASK-12) will thread
+	// it through to the handlers.
+	_, err := s.authn.Authenticate(r)
 	if err == nil {
 		return true
 	}

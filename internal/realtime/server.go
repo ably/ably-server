@@ -52,7 +52,8 @@ func NewServer(key auth.APIKey, manager *core.Manager, heartbeatInterval time.Du
 // and runs the connection loop. Auth failures are returned as HTTP 401
 // before the upgrade.
 func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
-	if err := s.authn.Authenticate(r); err != nil {
+	principal, err := s.authn.Authenticate(r)
+	if err != nil {
 		s.writeAuthError(w, err)
 		return
 	}
@@ -76,6 +77,7 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		format:            format,
 		id:                connID,
 		clientID:          r.URL.Query().Get("clientId"),
+		principal:         principal,
 		heartbeatInterval: s.heartbeatInterval,
 		logger:            s.logger.With("connId", connID),
 		manager:           s.manager,
