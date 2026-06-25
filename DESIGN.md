@@ -73,6 +73,7 @@ All REST endpoints live under the root and accept either `application/json` or
 | GET | `/channels/{channel}/messages/{serial}/versions` | all versions of a message (paginated) |
 | GET | `/channels/{channel}/presence` | current presence members (see §12) |
 | GET | `/channels/{channel}/presence/history` | presence history (paginated) |
+| POST | `/keys/{keyName}/requestToken` | mint a token (JWT) from a signed `TokenRequest` (see §3) |
 | GET | `/time` | server time (ms since epoch) |
 | GET | `/healthz` | liveness — no auth |
 | GET | `/readyz` | readiness — DB ping in `cluster` mode |
@@ -83,16 +84,18 @@ Pagination follows Ably's `Link` header convention (`first`, `next`).
 
 A single API key is configured via `ABLY_SERVER_API_KEY` in the canonical
 Ably format `appId.keyId:keySecret` (so SDKs that parse the key work
-unchanged). Tokens are minted by the SDK or out-of-band — the server only
-**verifies** them, it does not issue them.
+unchanged). The server **verifies** tokens presented on connect/request and
+also **issues** them on demand via `POST /keys/{keyName}/requestToken`
+(§3.3).
 
 Two accepted credential forms:
 
 1. **Basic auth** — `Authorization: Basic base64(appId.keyId:keySecret)` or
    `?key=...`. Carries the API key's full capability.
-2. **JWT** — bearer token signed with `keySecret` (HS256). Passed via
-   `Authorization: Bearer <jwt>` or the `?access_token=...` query param
-   (the form ably SDKs send; `?accessToken=...` is also accepted).
+2. **JWT** — bearer token signed with `keySecret` (HS256). Passed on REST as
+   `Authorization: Bearer base64(jwt)` (Ably base64-encodes the header value,
+   RSA3a — a raw token is also accepted) or, on the WS upgrade, as the
+   `?access_token=...` query param (`?accessToken=...` is also accepted).
 
 JWT claims:
 
@@ -194,6 +197,31 @@ Presence imposes a further requirement at *use* time rather than auth
 time: a member must be identified, so a connection that resolved to no
 `clientId` (anonymous) cannot enter presence, and a wildcard bearer must
 select a concrete `clientId` to enter (see §12.3).
+
+### 3.3 Token requests
+
+`POST /keys/{keyName}/requestToken` mints a token for a key holder. The
+body is an Ably `TokenRequest` (`keyName`, `ttl`, `capability`, `clientId`,
+`timestamp`, `nonce`, `mac`). The request is authenticated one of two ways:
+
+- **Signed** — the `mac` is `base64(HMAC-SHA256(text, keySecret))` over the
+  canonical text `keyName"\n" ttl"\n" capability"\n" clientId"\n"
+  timestamp"\n" nonce"\n"` (`ttl` empty when unset). The server recomputes
+  it and compares in constant time.
+- **Basic, same key** — a request without a `mac` is accepted only when it
+  also carries Basic auth for the same key (the holder is explicitly
+  authenticated, so the mac is unnecessary).
+
+The minted token is an **HS256 JWT** signed with the key secret, `kid` set
+to the key name, carrying `iat`/`exp` (from `ttl`, default 60 min), the
+request `nonce` as `jti` (so distinct requests yield distinct tokens), and
+`x-ably-capability` / `x-ably-clientId` when supplied. It is returned in a
+`TokenDetails` response body (`token` holds the JWT), which the SDK then
+presents as an `access_token` verified by the path above.
+
+> The requested `capability` is recorded on the token but not yet
+> *narrowed* against the key — capability enforcement is TASK-12. Nonce
+> replay tracking is not implemented; the mac alone guarantees integrity.
 
 ## 4. Attachments
 

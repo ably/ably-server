@@ -541,6 +541,88 @@ func (s *Server) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 
 // authenticate writes a 401 response on failure and returns false; on
 // success it returns true.
+// HandleRequestToken mints an Ably-compatible JWT for a signed (or
+// Basic-authenticated) TokenRequest and returns it as application/jwt
+// (DESIGN.md §3). The token is signed with the key's secret (HS256), so a
+// client can present it as an access_token that this server then verifies
+// via the normal token path.
+func (s *Server) HandleRequestToken(w http.ResponseWriter, r *http.Request) {
+	keyName := r.PathValue("keyName")
+
+	format, err := contentTypeFormat(r.Header.Get("Content-Type"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnsupportedMediaType)
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var tr auth.TokenRequest
+	if err := unmarshal(body, format, &tr); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if tr.KeyName == "" {
+		tr.KeyName = keyName
+	}
+	if tr.KeyName != keyName {
+		http.Error(w, "keyName mismatch between path and body", http.StatusBadRequest)
+		return
+	}
+
+	respFormat, err := acceptFormat(r.Header.Get("Accept"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotAcceptable)
+		return
+	}
+
+	if err := s.authn.ValidateTokenRequest(&tr, r); err != nil {
+		w.Header().Set("WWW-Authenticate", `Basic realm="ably-server"`)
+		http.Error(w, "invalid token request", http.StatusUnauthorized)
+		return
+	}
+
+	token, issued, expires, err := s.authn.MintToken(&tr)
+	if err != nil {
+		s.logger.Warn("mint token failed", "err", err)
+		http.Error(w, "token minting failed", http.StatusInternalServerError)
+		return
+	}
+
+	// The SDK decodes the requestToken response as a TokenDetails; the
+	// minted JWT rides in its Token field (DESIGN.md §3). issued/expires
+	// are milliseconds since epoch.
+	respBody, err := marshalValue(tokenDetailsResponse{
+		Token:      token,
+		KeyName:    tr.KeyName,
+		Issued:     issued.UnixMilli(),
+		Expires:    expires.UnixMilli(),
+		ClientID:   tr.ClientID,
+		Capability: tr.Capability,
+	}, respFormat)
+	if err != nil {
+		s.logger.Warn("token encode failed", "err", err)
+		http.Error(w, "encode failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeFor(respFormat))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(respBody)
+}
+
+// tokenDetailsResponse is the requestToken response (Ably TokenDetails).
+// issued/expires are milliseconds since epoch; Token carries the JWT.
+type tokenDetailsResponse struct {
+	Token      string `json:"token" msgpack:"token"`
+	KeyName    string `json:"keyName,omitempty" msgpack:"keyName,omitempty"`
+	Issued     int64  `json:"issued" msgpack:"issued"`
+	Expires    int64  `json:"expires" msgpack:"expires"`
+	ClientID   string `json:"clientId,omitempty" msgpack:"clientId,omitempty"`
+	Capability string `json:"capability,omitempty" msgpack:"capability,omitempty"`
+}
+
 // authenticate verifies the request's credentials. On success it returns
 // the verified principal and true; on failure it writes a 401 and returns
 // false. Capability enforcement (TASK-12) will also consume the principal.

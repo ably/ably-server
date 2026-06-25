@@ -3,10 +3,14 @@
 package auth
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -243,15 +247,123 @@ func MessageClientID(connClientID, opClientID string) (stamped string, ok bool) 
 	}
 }
 
+// defaultTokenTTL is the token lifetime used when a TokenRequest does not
+// specify one, matching Ably's 60-minute default.
+const defaultTokenTTL = 60 * time.Minute
+
+// TokenRequest is the body of POST /keys/{keyName}/requestToken (Ably
+// RSA9): a request to mint a token, signed by the key holder. Field names
+// match what ably SDKs send. TTL and Timestamp are milliseconds.
+type TokenRequest struct {
+	KeyName    string `json:"keyName"    msgpack:"keyName"`
+	TTL        int64  `json:"ttl"        msgpack:"ttl"`
+	Capability string `json:"capability" msgpack:"capability"`
+	ClientID   string `json:"clientId"   msgpack:"clientId"`
+	Timestamp  int64  `json:"timestamp"  msgpack:"timestamp"`
+	Nonce      string `json:"nonce"      msgpack:"nonce"`
+	MAC        string `json:"mac"        msgpack:"mac"`
+}
+
+// tokenRequestText builds the canonical string a TokenRequest's mac is
+// computed over (Ably RSA9): each field followed by a newline, in order.
+// ttl is empty when unset; the other fields are echoed verbatim so the
+// text matches the SDK's regardless of their content.
+func (tr *TokenRequest) tokenRequestText() string {
+	ttl := ""
+	if tr.TTL != 0 {
+		ttl = strconv.FormatInt(tr.TTL, 10)
+	}
+	return tr.KeyName + "\n" +
+		ttl + "\n" +
+		tr.Capability + "\n" +
+		tr.ClientID + "\n" +
+		strconv.FormatInt(tr.Timestamp, 10) + "\n" +
+		tr.Nonce + "\n"
+}
+
+// ValidateTokenRequest authenticates a token request against the
+// configured key. A request carrying a mac is verified by recomputing the
+// HMAC-SHA256 over the canonical text and comparing in constant time. A
+// request without a mac is accepted only when r also carries Basic auth
+// for the same key (the key holder is explicitly authenticated). Returns
+// ErrInvalidToken on any failure.
+func (a *Authenticator) ValidateTokenRequest(tr *TokenRequest, r *http.Request) error {
+	if tr.KeyName != a.key.Name() {
+		return fmt.Errorf("%w: unknown key %q", ErrInvalidToken, tr.KeyName)
+	}
+	if tr.MAC != "" {
+		expected := base64.StdEncoding.EncodeToString(a.hmac(tr.tokenRequestText()))
+		if subtle.ConstantTimeCompare([]byte(tr.MAC), []byte(expected)) != 1 {
+			return fmt.Errorf("%w: request mac does not match", ErrInvalidToken)
+		}
+		return nil
+	}
+	// Unsigned: only a Basic-auth request for the same key is trusted.
+	if k, ok := extractKey(r); ok && subtle.ConstantTimeCompare([]byte(k), a.expected) == 1 {
+		return nil
+	}
+	return fmt.Errorf("%w: request mac not provided", ErrInvalidToken)
+}
+
+// MintToken issues an HS256 JWT for a validated TokenRequest, signed with
+// the key's secret and carrying its name as the kid header. The token's
+// capability and clientId claims come from the request (constrained by the
+// key's capability once enforcement lands, TASK-12). Returns the signed
+// token and its expiry.
+func (a *Authenticator) MintToken(tr *TokenRequest) (token string, issued, expires time.Time, err error) {
+	issued = time.Now()
+	ttl := time.Duration(tr.TTL) * time.Millisecond
+	if ttl <= 0 {
+		ttl = defaultTokenTTL
+	}
+	expires = issued.Add(ttl)
+
+	claims := jwt.MapClaims{
+		"iat": issued.Unix(),
+		"exp": expires.Unix(),
+	}
+	if tr.Capability != "" {
+		claims["x-ably-capability"] = tr.Capability
+	}
+	if tr.ClientID != "" {
+		claims["x-ably-clientId"] = tr.ClientID
+	}
+	if tr.Nonce != "" {
+		// Bind the token to the request nonce so distinct requests yield
+		// distinct tokens even within the same second.
+		claims["jti"] = tr.Nonce
+	}
+	t := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	t.Header["kid"] = a.key.Name()
+	token, err = t.SignedString([]byte(a.key.KeySecret))
+	return token, issued, expires, err
+}
+
+// hmac returns the HMAC-SHA256 of text keyed with the configured key's
+// secret.
+func (a *Authenticator) hmac(text string) []byte {
+	h := hmac.New(sha256.New, []byte(a.key.KeySecret))
+	h.Write([]byte(text))
+	return h.Sum(nil)
+}
+
 // extractToken returns a presented bearer token. The Authorization
 // header (Bearer scheme) wins over the query parameters; both
 // access_token (the form ably SDKs send) and accessToken are accepted.
 func extractToken(r *http.Request) (string, bool) {
 	if h := r.Header.Get("Authorization"); h != "" {
 		if t, ok := strings.CutPrefix(h, "Bearer "); ok {
-			if t = strings.TrimSpace(t); t != "" {
-				return t, true
+			t = strings.TrimSpace(t)
+			if t == "" {
+				return "", false
 			}
+			// Ably sends the token base64-encoded in the Authorization
+			// header (RSA3a). A raw token (e.g. a JWT, whose '.' separators
+			// aren't valid base64) won't decode — fall back to it as-is.
+			if dec, err := base64.StdEncoding.DecodeString(t); err == nil {
+				return string(dec), true
+			}
+			return t, true
 		}
 	}
 	q := r.URL.Query()

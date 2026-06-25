@@ -1,9 +1,13 @@
 package auth
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -326,5 +330,99 @@ func TestMessageClientID(t *testing.T) {
 				t.Errorf("stamp = %q, want %q", stamp, tc.wantStamp)
 			}
 		})
+	}
+}
+
+// signTokenRequestForTest independently reproduces the RSA9 mac so the
+// tests guard the canonical text format, not just call the code under test.
+func signTokenRequestForTest(tr *TokenRequest, secret string) string {
+	ttl := ""
+	if tr.TTL != 0 {
+		ttl = strconv.FormatInt(tr.TTL, 10)
+	}
+	text := tr.KeyName + "\n" + ttl + "\n" + tr.Capability + "\n" + tr.ClientID + "\n" +
+		strconv.FormatInt(tr.Timestamp, 10) + "\n" + tr.Nonce + "\n"
+	h := hmac.New(sha256.New, []byte(secret))
+	h.Write([]byte(text))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+func TestValidateTokenRequest(t *testing.T) {
+	parsed, _ := ParseAPIKey(testKey)
+	a := NewAuthenticator(parsed)
+	base := func() *TokenRequest {
+		return &TokenRequest{KeyName: "app.key", TTL: 3600000, Capability: `{"*":["*"]}`, Timestamp: 1700000000000, Nonce: "abc123"}
+	}
+
+	t.Run("valid mac accepted", func(t *testing.T) {
+		tr := base()
+		tr.MAC = signTokenRequestForTest(tr, testSecret)
+		if err := a.ValidateTokenRequest(tr, httptest.NewRequest(http.MethodPost, "/", nil)); err != nil {
+			t.Fatalf("ValidateTokenRequest: %v", err)
+		}
+	})
+
+	t.Run("tampered mac rejected", func(t *testing.T) {
+		tr := base()
+		tr.MAC = signTokenRequestForTest(tr, testSecret)
+		tr.Capability = `{"*":["subscribe"]}` // change a signed field after signing
+		if err := a.ValidateTokenRequest(tr, httptest.NewRequest(http.MethodPost, "/", nil)); !errors.Is(err, ErrInvalidToken) {
+			t.Fatalf("err = %v, want ErrInvalidToken", err)
+		}
+	})
+
+	t.Run("wrong key rejected", func(t *testing.T) {
+		tr := base()
+		tr.KeyName = "other.key"
+		tr.MAC = signTokenRequestForTest(tr, testSecret)
+		if err := a.ValidateTokenRequest(tr, httptest.NewRequest(http.MethodPost, "/", nil)); !errors.Is(err, ErrInvalidToken) {
+			t.Fatalf("err = %v, want ErrInvalidToken", err)
+		}
+	})
+
+	t.Run("unsigned accepted with matching basic auth", func(t *testing.T) {
+		tr := base() // no mac
+		r := httptest.NewRequest(http.MethodPost, "/", nil)
+		r.SetBasicAuth("app.key", "secret")
+		if err := a.ValidateTokenRequest(tr, r); err != nil {
+			t.Fatalf("ValidateTokenRequest: %v", err)
+		}
+	})
+
+	t.Run("unsigned rejected without basic auth", func(t *testing.T) {
+		tr := base() // no mac, no basic
+		if err := a.ValidateTokenRequest(tr, httptest.NewRequest(http.MethodPost, "/", nil)); !errors.Is(err, ErrInvalidToken) {
+			t.Fatalf("err = %v, want ErrInvalidToken", err)
+		}
+	})
+}
+
+func TestMintTokenRoundTrip(t *testing.T) {
+	parsed, _ := ParseAPIKey(testKey)
+	a := NewAuthenticator(parsed)
+
+	tr := &TokenRequest{KeyName: "app.key", TTL: 3600000, Capability: `{"*":["*"]}`, ClientID: "alice", Nonce: "n1"}
+	tok, _, _, err := a.MintToken(tr)
+	if err != nil {
+		t.Fatalf("MintToken: %v", err)
+	}
+
+	// The minted token must verify via the normal path, presented the way
+	// SDKs send it: Authorization: Bearer base64(token).
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("Authorization", "Bearer "+base64.StdEncoding.EncodeToString([]byte(tok)))
+	p, err := a.Authenticate(r)
+	if err != nil {
+		t.Fatalf("Authenticate minted token: %v", err)
+	}
+	if p.Method != MethodToken || p.ClientID != "alice" || p.Capability != `{"*":["*"]}` {
+		t.Errorf("principal = %+v, want token/alice/full-capability", p)
+	}
+
+	// Distinct nonces yield distinct tokens.
+	tr2 := &TokenRequest{KeyName: "app.key", TTL: 3600000, Nonce: "n2"}
+	tok2, _, _, _ := a.MintToken(tr2)
+	if tok == tok2 {
+		t.Errorf("tokens with different nonces should differ")
 	}
 }

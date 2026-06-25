@@ -126,6 +126,7 @@ func run(ctx context.Context, opts runOpts) int {
 	mux.HandleFunc("GET /channels/{name}/messages/{serial}/versions", rs.HandleMessageVersions)
 	mux.HandleFunc("GET /channels/{name}/presence", rs.HandlePresence)
 	mux.HandleFunc("GET /channels/{name}/presence/history", rs.HandlePresenceHistory)
+	mux.HandleFunc("POST /keys/{keyName}/requestToken", rs.HandleRequestToken)
 	mux.HandleFunc("GET /time", rs.HandleTime)
 	mux.HandleFunc("GET /healthz", rs.HandleHealthz)
 	mux.HandleFunc("GET /readyz", rs.HandleReadyz)
