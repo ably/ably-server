@@ -114,22 +114,7 @@ func run(ctx context.Context, opts runOpts) int {
 	rt := realtime.NewServer(parsedKey, manager, *hbInterval, logger)
 	rs := rest.NewServer(parsedKey, manager, logger)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", rt.HandleWebSocket)
-	mux.HandleFunc("POST /channels/{name}/messages", rs.HandlePublish)
-	mux.HandleFunc("GET /channels/{name}/messages", rs.HandleHistory)
-	// ably-go's REST History() requests /history (TASK-57); serve it as
-	// an alias so the SDK's history reads work.
-	mux.HandleFunc("GET /channels/{name}/history", rs.HandleHistory)
-	mux.HandleFunc("PATCH /channels/{name}/messages/{serial}", rs.HandleMutate)
-	mux.HandleFunc("GET /channels/{name}/messages/{serial}", rs.HandleMessage)
-	mux.HandleFunc("GET /channels/{name}/messages/{serial}/versions", rs.HandleMessageVersions)
-	mux.HandleFunc("GET /channels/{name}/presence", rs.HandlePresence)
-	mux.HandleFunc("GET /channels/{name}/presence/history", rs.HandlePresenceHistory)
-	mux.HandleFunc("POST /keys/{keyName}/requestToken", rs.HandleRequestToken)
-	mux.HandleFunc("GET /time", rs.HandleTime)
-	mux.HandleFunc("GET /healthz", rs.HandleHealthz)
-	mux.HandleFunc("GET /readyz", rs.HandleReadyz)
+	mux := newMux(rt, rs)
 
 	srv := &http.Server{
 		Handler:           mux,
@@ -178,6 +163,31 @@ func run(ctx context.Context, opts runOpts) int {
 //
 // ctx bounds the cluster-mode dial + ping + migrate; it's ignored by
 // the in-process modes.
+// newMux builds the HTTP routing table. The WebSocket endpoint is bound to
+// the exact root with the `{$}` anchor: a bare `GET /` is a catch-all in
+// Go 1.22's ServeMux and would feed every unmatched GET path to the
+// upgrader (returning a confusing 400 with WebSocket headers). With `{$}`,
+// only `/` upgrades and unknown paths fall through to a clean 404.
+func newMux(rt *realtime.Server, rs *rest.Server) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", rt.HandleWebSocket)
+	mux.HandleFunc("POST /channels/{name}/messages", rs.HandlePublish)
+	mux.HandleFunc("GET /channels/{name}/messages", rs.HandleHistory)
+	// ably-go's REST History() requests /history (TASK-57); serve it as
+	// an alias so the SDK's history reads work.
+	mux.HandleFunc("GET /channels/{name}/history", rs.HandleHistory)
+	mux.HandleFunc("PATCH /channels/{name}/messages/{serial}", rs.HandleMutate)
+	mux.HandleFunc("GET /channels/{name}/messages/{serial}", rs.HandleMessage)
+	mux.HandleFunc("GET /channels/{name}/messages/{serial}/versions", rs.HandleMessageVersions)
+	mux.HandleFunc("GET /channels/{name}/presence", rs.HandlePresence)
+	mux.HandleFunc("GET /channels/{name}/presence/history", rs.HandlePresenceHistory)
+	mux.HandleFunc("POST /keys/{keyName}/requestToken", rs.HandleRequestToken)
+	mux.HandleFunc("GET /time", rs.HandleTime)
+	mux.HandleFunc("GET /healthz", rs.HandleHealthz)
+	mux.HandleFunc("GET /readyz", rs.HandleReadyz)
+	return mux
+}
+
 func openStorage(ctx context.Context, mode, dataDir, dbDSN string) (storage.Storage, error) {
 	switch mode {
 	case "memory":
