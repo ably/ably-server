@@ -1022,3 +1022,70 @@ func equalStringSlices(a, b []string) bool {
 	}
 	return true
 }
+
+// dialClientID connects like dial but sets the clientId query param, so
+// the connection resolves to a concrete identity (DESIGN.md §3.2).
+func dialClientID(t *testing.T, srv *httptest.Server, clientID string) *websocket.Conn {
+	t.Helper()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	u.Scheme = "ws"
+	q := u.Query()
+	q.Set("key", testKey)
+	q.Set("clientId", clientID)
+	u.RawQuery = q.Encode()
+	ws, _, err := websocket.DefaultDialer.DialContext(context.Background(), u.String(), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = ws.Close() })
+	return ws
+}
+
+// TestPublishStampsAndRejectsClientID covers the §3.2 message rules on a
+// concrete-clientId connection: an omitted clientId is stamped with the
+// connection's, and a mismatched clientId is NACKed.
+func TestPublishStampsAndRejectsClientID(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+
+	sub := dial(t, srv, "")
+	drainConnected(t, sub)
+	sendFrame(t, sub, protocol.FormatJSON, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "room"})
+	if msg := readFrame(t, sub, protocol.FormatJSON, 2*time.Second); msg.Action != protocol.ActionAttached {
+		t.Fatalf("expected ATTACHED, got %v", msg.Action)
+	}
+
+	pub := dialClientID(t, srv, "alice")
+	drainConnected(t, pub)
+
+	// Omitted clientId is stamped with the connection's resolved identity.
+	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "room",
+		MsgSerial: 1,
+		Messages:  []*protocol.Message{{Name: "n", Data: "d"}},
+	})
+	if ack := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {
+		t.Fatalf("publisher frame = %v, want ACK", ack.Action)
+	}
+	delivered := readFrame(t, sub, protocol.FormatJSON, 2*time.Second)
+	if delivered.Action != protocol.ActionMessage || len(delivered.Messages) != 1 {
+		t.Fatalf("subscriber frame = %v (%d msgs)", delivered.Action, len(delivered.Messages))
+	}
+	if got := delivered.Messages[0].ClientID; got != "alice" {
+		t.Errorf("stamped clientId = %q, want alice", got)
+	}
+
+	// A message asserting a different clientId is rejected.
+	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "room",
+		MsgSerial: 2,
+		Messages:  []*protocol.Message{{Name: "n", Data: "d", ClientID: "bob"}},
+	})
+	if nack := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); nack.Action != protocol.ActionNack {
+		t.Fatalf("publisher frame = %v, want NACK", nack.Action)
+	}
+}

@@ -48,7 +48,12 @@ func NewServer(key auth.APIKey, manager *core.Manager, logger *slog.Logger) *Ser
 // Message or an array of Messages, JSON or msgpack), and appends each
 // to the named channel.
 func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
-	if !s.authenticate(w, r) {
+	principal, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	clientID, ok := s.resolveRequestClientID(w, r, principal)
+	if !ok {
 		return
 	}
 	name := r.PathValue("name")
@@ -85,6 +90,14 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("action %s not permitted on POST; use PATCH for mutations", m.Action), http.StatusBadRequest)
 			return
 		}
+		// Resolve and stamp each message's clientId against the request's
+		// identity (DESIGN.md §3.2), as for the realtime publish path.
+		cid, ok := auth.MessageClientID(clientID, m.ClientID)
+		if !ok {
+			http.Error(w, "message clientId not permitted", http.StatusBadRequest)
+			return
+		}
+		m.ClientID = cid
 	}
 
 	respFormat, err := acceptFormat(r.Header.Get("Accept"))
@@ -164,7 +177,7 @@ func marshalValue(v any, format protocol.Format) ([]byte, error) {
 // Capability enforcement (the `history` op) is deferred to TASK-12;
 // today the endpoint requires only the API key.
 func (s *Server) HandleHistory(w http.ResponseWriter, r *http.Request) {
-	if !s.authenticate(w, r) {
+	if _, ok := s.authenticate(w, r); !ok {
 		return
 	}
 	name := r.PathValue("name")
@@ -227,7 +240,7 @@ func (s *Server) HandleHistory(w http.ResponseWriter, r *http.Request) {
 // (TASK-12) is unbuilt, so the endpoint requires only the API key, like
 // publish. TASK-51 adds the message-* ownership check once TASK-12 lands.
 func (s *Server) HandleMutate(w http.ResponseWriter, r *http.Request) {
-	if !s.authenticate(w, r) {
+	if _, ok := s.authenticate(w, r); !ok {
 		return
 	}
 	name := r.PathValue("name")
@@ -304,7 +317,7 @@ func (s *Server) HandleMutate(w http.ResponseWriter, r *http.Request) {
 // tombstone if deleted. A message that never existed (or aged out) is a
 // 404. Gated by history (API key only today; capability is TASK-12).
 func (s *Server) HandleMessage(w http.ResponseWriter, r *http.Request) {
-	if !s.authenticate(w, r) {
+	if _, ok := s.authenticate(w, r); !ok {
 		return
 	}
 	name := r.PathValue("name")
@@ -353,7 +366,7 @@ func (s *Server) HandleMessage(w http.ResponseWriter, r *http.Request) {
 // except the cursor is a version serial. A message with no versions is a
 // 404. Gated by history (API key only today; capability is TASK-12).
 func (s *Server) HandleMessageVersions(w http.ResponseWriter, r *http.Request) {
-	if !s.authenticate(w, r) {
+	if _, ok := s.authenticate(w, r); !ok {
 		return
 	}
 	name := r.PathValue("name")
@@ -411,7 +424,7 @@ func (s *Server) HandleMessageVersions(w http.ResponseWriter, r *http.Request) {
 // Capability enforcement (the `subscribe` op) is deferred to TASK-12;
 // today the endpoint requires only the API key, like message history.
 func (s *Server) HandlePresence(w http.ResponseWriter, r *http.Request) {
-	if !s.authenticate(w, r) {
+	if _, ok := s.authenticate(w, r); !ok {
 		return
 	}
 	name := r.PathValue("name")
@@ -455,7 +468,7 @@ func (s *Server) HandlePresence(w http.ResponseWriter, r *http.Request) {
 // scanning the presence kind. Capability enforcement (the `history` op)
 // is deferred to TASK-12.
 func (s *Server) HandlePresenceHistory(w http.ResponseWriter, r *http.Request) {
-	if !s.authenticate(w, r) {
+	if _, ok := s.authenticate(w, r); !ok {
 		return
 	}
 	name := r.PathValue("name")
@@ -528,13 +541,13 @@ func (s *Server) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 
 // authenticate writes a 401 response on failure and returns false; on
 // success it returns true.
-func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) bool {
-	// The verified principal (token claims) is not consumed yet; clientId
-	// resolution and capability enforcement (TASK-11 / TASK-12) will thread
-	// it through to the handlers.
-	_, err := s.authn.Authenticate(r)
+// authenticate verifies the request's credentials. On success it returns
+// the verified principal and true; on failure it writes a 401 and returns
+// false. Capability enforcement (TASK-12) will also consume the principal.
+func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*auth.Principal, bool) {
+	principal, err := s.authn.Authenticate(r)
 	if err == nil {
-		return true
+		return principal, true
 	}
 	w.Header().Set("WWW-Authenticate", `Basic realm="ably-server"`)
 	switch {
@@ -543,7 +556,19 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) bool {
 	default:
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 	}
-	return false
+	return nil, false
+}
+
+// resolveRequestClientID applies the §3.2 resolution for a REST request:
+// the verified principal plus the clientId query param yield the request's
+// clientId. On a disallowed param it writes a 401 and returns ok=false.
+func (s *Server) resolveRequestClientID(w http.ResponseWriter, r *http.Request, p *auth.Principal) (string, bool) {
+	clientID, err := auth.ResolveClientID(p, r.URL.Query().Get("clientId"))
+	if err != nil {
+		http.Error(w, "clientId not permitted by credential", http.StatusUnauthorized)
+		return "", false
+	}
+	return clientID, true
 }
 
 // contentTypeFormat resolves a Content-Type header to a protocol

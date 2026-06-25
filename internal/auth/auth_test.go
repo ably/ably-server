@@ -211,7 +211,7 @@ func TestAuthenticateJWT(t *testing.T) {
 
 	t.Run("within-leeway clock skew accepted", func(t *testing.T) {
 		tok := mintToken(t, testSecret, jwt.MapClaims{
-			"iat": now.Add(30 * time.Second).Unix(), // slightly future, within leeway
+			"iat": now.Add(30 * time.Second).Unix(),  // slightly future, within leeway
 			"exp": now.Add(-30 * time.Second).Unix(), // slightly past, within leeway
 		})
 		r := httptest.NewRequest(http.MethodGet, "/?access_token="+tok, nil)
@@ -255,4 +255,76 @@ func TestAuthenticateJWT(t *testing.T) {
 			t.Fatalf("Authenticate err = %v, want ErrInvalidToken", err)
 		}
 	})
+}
+
+func TestResolveClientID(t *testing.T) {
+	basic := &Principal{Method: MethodBasic}
+	tokenNoClaim := &Principal{Method: MethodToken}
+	tokenConcrete := &Principal{Method: MethodToken, ClientID: "bob", HasClientID: true}
+	tokenWildcard := &Principal{Method: MethodToken, ClientID: WildcardClientID, HasClientID: true}
+
+	cases := []struct {
+		name    string
+		p       *Principal
+		param   string
+		want    string
+		wantErr bool
+	}{
+		{name: "basic no param is wildcard", p: basic, param: "", want: WildcardClientID},
+		{name: "basic param pins identity", p: basic, param: "alice", want: "alice"},
+		{name: "token no claim, no param is anonymous", p: tokenNoClaim, param: "", want: ""},
+		{name: "token no claim, param rejected", p: tokenNoClaim, param: "alice", wantErr: true},
+		{name: "token concrete claim, no param", p: tokenConcrete, param: "", want: "bob"},
+		{name: "token concrete claim, matching param", p: tokenConcrete, param: "bob", want: "bob"},
+		{name: "token concrete claim, mismatched param rejected", p: tokenConcrete, param: "alice", wantErr: true},
+		{name: "token wildcard, no param retains wildcard", p: tokenWildcard, param: "", want: WildcardClientID},
+		{name: "token wildcard, param narrows", p: tokenWildcard, param: "alice", want: "alice"},
+		{name: "token wildcard, literal star param rejected", p: tokenWildcard, param: WildcardClientID, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ResolveClientID(tc.p, tc.param)
+			if tc.wantErr {
+				if !errors.Is(err, ErrClientIDMismatch) {
+					t.Fatalf("err = %v, want ErrClientIDMismatch", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("ResolveClientID = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMessageClientID(t *testing.T) {
+	cases := []struct {
+		name      string
+		conn, msg string
+		wantStamp string
+		wantOK    bool
+	}{
+		{name: "anonymous, no msg id", conn: "", msg: "", wantStamp: "", wantOK: true},
+		{name: "anonymous asserting id rejected", conn: "", msg: "x", wantOK: false},
+		{name: "wildcard, no msg id stays unidentified", conn: WildcardClientID, msg: "", wantStamp: "", wantOK: true},
+		{name: "wildcard assumes any id", conn: WildcardClientID, msg: "x", wantStamp: "x", wantOK: true},
+		{name: "wildcard literal star rejected", conn: WildcardClientID, msg: WildcardClientID, wantOK: false},
+		{name: "concrete, no msg id stamps conn", conn: "alice", msg: "", wantStamp: "alice", wantOK: true},
+		{name: "concrete, matching id", conn: "alice", msg: "alice", wantStamp: "alice", wantOK: true},
+		{name: "concrete, mismatched id rejected", conn: "alice", msg: "bob", wantOK: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stamp, ok := MessageClientID(tc.conn, tc.msg)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if ok && stamp != tc.wantStamp {
+				t.Errorf("stamp = %q, want %q", stamp, tc.wantStamp)
+			}
+		})
+	}
 }

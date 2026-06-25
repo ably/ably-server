@@ -156,33 +156,39 @@ is `requested ∩ capability-permitted`. Empty intersection → `ERROR` with
 
 ### 3.2 Client ID
 
-The connection's `clientId` is stamped by the server onto every outbound
-`Message.clientId` published by that connection. The client cannot
-override it: inbound `Message` frames whose `clientId` is set to anything
-other than the connection's resolved value are rejected with `NACK`.
+A connection (or REST request) resolves to one of three identities:
+
+- **concrete** `clientId` — the server stamps it onto every outbound
+  `Message.clientId` that omits one, and rejects (`NACK`) any inbound
+  message asserting a *different* one;
+- **wildcard** (`*`) — the bearer may assume any identity, chosen per
+  operation: each message carries its own `clientId`, stamped through
+  unchanged, and a message with none stays unidentified;
+- **none** (anonymous) — the bearer may assert no identity; a message
+  carrying any `clientId` is rejected.
 
 Resolution depends on the credential and the `clientId` query parameter on
 the upgrade (WS) or request (REST):
 
 | Credential | `x-ably-clientId` claim | `clientId` query param | Resolved `clientId` |
 |---|---|---|---|
-| Basic | n/a | absent | none (anonymous) |
+| Basic | n/a | absent | `*` (wildcard — a key may assume any identity) |
 | Basic | n/a | `<value>` | `<value>` |
 | JWT | absent | absent | none (anonymous) |
 | JWT | absent | `<value>` | rejected (no permission to assert clientId) |
 | JWT | `<concrete>` | absent | `<concrete>` (claim value) |
 | JWT | `<concrete>` | `<concrete>` matching claim | `<concrete>` |
 | JWT | `<concrete>` | `<value>` ≠ claim | rejected |
-| JWT | `*` | absent | none (anonymous) |
+| JWT | `*` | absent | `*` (wildcard) |
 | JWT | `*` | `<value>` | `<value>` |
 
-`*` is a wildcard marker that means "the bearer of this token may assume any
-`clientId`". It is **never** itself used as a `clientId` on messages — if
-the bearer wants to be identified, they must select a concrete value via
-the `clientId` query parameter.
+`*` is a wildcard marker meaning "the bearer may assume any `clientId`". It
+is **never** itself used as a `clientId` on a message or as a member
+identity; to act under a fixed identity the bearer selects a concrete
+value via the `clientId` query parameter.
 
 A connection or REST request that fails the table above is rejected at
-auth time (WS: `ERROR` then close; REST: `401`).
+auth time — the WS upgrade or REST request returns `401`.
 
 Presence imposes a further requirement at *use* time rather than auth
 time: a member must be identified, so a connection that resolved to no

@@ -58,6 +58,12 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	clientID, err := auth.ResolveClientID(principal, r.URL.Query().Get("clientId"))
+	if err != nil {
+		s.writeAuthError(w, err)
+		return
+	}
+
 	format, err := protocol.FormatFromQuery(r.URL.Query().Get("format"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -76,7 +82,7 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		ws:                ws,
 		format:            format,
 		id:                connID,
-		clientID:          r.URL.Query().Get("clientId"),
+		clientID:          clientID,
 		principal:         principal,
 		heartbeatInterval: s.heartbeatInterval,
 		logger:            s.logger.With("connId", connID),
@@ -93,6 +99,8 @@ func (s *Server) writeAuthError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, auth.ErrNoCredentials):
 		http.Error(w, "no credentials presented", http.StatusUnauthorized)
+	case errors.Is(err, auth.ErrClientIDMismatch):
+		http.Error(w, "clientId not permitted by credential", http.StatusUnauthorized)
 	default:
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 	}

@@ -198,6 +198,21 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 		}
 	}
 
+	// Resolve and stamp each message's clientId against the connection's
+	// identity (DESIGN.md §3.2): a message may omit it (we stamp the
+	// connection's), match it, or — for a wildcard connection — assert any
+	// concrete identity. Asserting a disallowed identity is rejected.
+	for _, m := range msg.Messages {
+		cid, ok := auth.MessageClientID(c.clientID, m.ClientID)
+		if !ok {
+			c.logger.Warn("message clientId not permitted; NACKing",
+				"channel", msg.Channel, "msgSerial", msg.MsgSerial, "msgClientId", m.ClientID)
+			c.nack(ctx, msg.MsgSerial, nil)
+			return
+		}
+		m.ClientID = cid
+	}
+
 	ch, err := c.manager.GetChannel(ctx, msg.Channel)
 	if err != nil {
 		c.logger.Warn("publish failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerial, "err", err)

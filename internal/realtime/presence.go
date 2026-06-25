@@ -4,12 +4,15 @@ import (
 	"context"
 	"time"
 
+	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/protocol"
 )
 
 // wildcardClientID is the §3.2 marker meaning "the bearer may assume any
-// clientId". It is never itself a member identity.
-const wildcardClientID = "*"
+// clientId". It is never itself a member identity. Aliased to the
+// canonical constant in internal/auth so connection resolution and the
+// presence/message rules agree.
+const wildcardClientID = auth.WildcardClientID
 
 // teardownLeaveTimeout bounds the synthesised-LEAVE publishes done when a
 // connection terminates; the connection's own context is already gone by

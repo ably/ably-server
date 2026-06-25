@@ -20,6 +20,15 @@ var (
 	ErrInvalidToken  = errors.New("invalid token")
 )
 
+// ErrClientIDMismatch is returned by ResolveClientID when the requested
+// clientId is not permitted by the credential.
+var ErrClientIDMismatch = errors.New("clientId not permitted by credential")
+
+// WildcardClientID is the clientId marker (DESIGN.md §3.2) meaning the
+// credential's bearer may assume any identity, choosing it per operation.
+// It is never itself stamped as a message or member identity.
+const WildcardClientID = "*"
+
 // clockSkewLeeway is the tolerance applied to time-based JWT claims
 // (iat, exp) to absorb small clock differences between token issuer and
 // this server.
@@ -166,6 +175,72 @@ func (a *Authenticator) verifyToken(tokenString string) (*Principal, error) {
 		p.HasClientID = true
 	}
 	return p, nil
+}
+
+// ResolveClientID derives a connection's (or REST request's) clientId
+// from the verified principal and the clientId supplied out-of-band (the
+// `clientId` query param), per the DESIGN.md §3.2 table. It returns ""
+// (anonymous — may assert no identity), WildcardClientID (may assume any
+// identity per operation), or a concrete clientId. ErrClientIDMismatch is
+// returned when the supplied param is not permitted by the credential.
+func ResolveClientID(p *Principal, param string) (string, error) {
+	if p.Method == MethodBasic {
+		// A key holder is fully trusted and may assume any identity. With
+		// no clientId param the connection is wildcard (identity chosen per
+		// operation, like an Ably key); with one it is pinned to that value.
+		if param == "" {
+			return WildcardClientID, nil
+		}
+		return param, nil
+	}
+	// Token auth.
+	if !p.HasClientID {
+		// No x-ably-clientId claim: the bearer may not assert an identity.
+		if param != "" {
+			return "", ErrClientIDMismatch
+		}
+		return "", nil
+	}
+	if p.ClientID == WildcardClientID {
+		switch param {
+		case "":
+			return WildcardClientID, nil // retain wildcard; identity chosen per op
+		case WildcardClientID:
+			return "", ErrClientIDMismatch // "*" is never a concrete identity
+		default:
+			return param, nil // narrow the wildcard to one identity
+		}
+	}
+	// Concrete claim: the param must match it or be omitted.
+	if param == "" || param == p.ClientID {
+		return p.ClientID, nil
+	}
+	return "", ErrClientIDMismatch
+}
+
+// MessageClientID applies the §3.2 per-operation rule for a message or
+// presence-message clientId. connClientID is the connection's resolved
+// clientId (from ResolveClientID); opClientID is the clientId the
+// operation carries. It returns the clientId to stamp (possibly "") and
+// ok=false if the operation asserts an identity the connection may not
+// use. An anonymous connection may carry no identity; a wildcard
+// connection may assume any concrete identity (or none); a concrete
+// connection may omit (stamped with its own) or match it.
+func MessageClientID(connClientID, opClientID string) (stamped string, ok bool) {
+	switch connClientID {
+	case "":
+		return "", opClientID == ""
+	case WildcardClientID:
+		if opClientID == WildcardClientID {
+			return "", false
+		}
+		return opClientID, true
+	default:
+		if opClientID == "" || opClientID == connClientID {
+			return connClientID, true
+		}
+		return "", false
+	}
 }
 
 // extractToken returns a presented bearer token. The Authorization
