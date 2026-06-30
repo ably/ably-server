@@ -137,6 +137,26 @@ for ably-go; `RealtimeHost`/`RestHost`/`Port`/`Tls=false` for IO.Ably).
 Same-origin subpath mounting (`/ably`) remains blocked on an SDK `basePath`
 option and is correctly deferred.
 
+## A note on auth
+
+For local dev over plain `http://`, you'd reach for API-key (basic) auth —
+but **Ably's spec (RSC18/TO3d) requires TLS for an API key**, because the key
+is a long-lived secret that would otherwise travel in cleartext. That secure
+default is correct; what differs across SDKs is whether they give you a
+*conscious dev opt-out*:
+
+| SDK | Key (basic) auth over plain HTTP | Dev opt-out |
+|---|---|---|
+| ably-go | refused by default (RSC18) | ✅ `WithInsecureAllowBasicAuthWithoutTLS()` |
+| ably-js | permissive (connects, warns) | n/a |
+| IO.Ably (.NET) | refused (`EnsureSecureConnection`) | ❌ none — the gap |
+
+The PoC's portable answer for non-TLS loopback is **token auth** (short-lived
+tokens are allowed over HTTP by all SDKs; the embedded server issues them at
+`POST /keys/{keyName}/requestToken`). Recommendation: **IO.Ably should add a
+dev-only opt-out matching ably-go's** — worth raising with the .NET SDK team.
+Realtime is unaffected on all SDKs; this is a REST-over-plain-HTTP concern.
+
 ## Reliability / fault-injection (run, not described)
 
 | Case | Go in-proc | Node (Express & Fastify) | .NET (YARP) |
