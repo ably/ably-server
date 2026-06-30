@@ -283,9 +283,12 @@ connections open. That rules out, by architecture (not by polish):
 - **Serverless / FaaS / edge** (Lambda, Vercel/Netlify Functions, Cloudflare
   Workers, Deno Deploy, GCF, Azure Functions) — request-scoped, scale-to-zero,
   no persistent WS, usually no child-binary spawn. Nothing to embed into.
-- **Horizontally scaled multi-instance needing shared state** — each instance
-  is its own `memory`-mode node; replicas don't share channels. Needs
-  `cluster` mode (shared Postgres), i.e. real infrastructure again.
+- **Horizontally scaled multi-instance, in `memory` mode** — replicas don't
+  share channels. Not a dead end: `ably-server`'s `cluster` mode (stateless
+  nodes in front of a shared Postgres) gives real cross-instance fan-out — but
+  running Postgres + orchestrating replicas leaves the "just a package"
+  sweet spot, and that's the point to ask "why not the managed cloud?" The
+  embed shines single-instance; shared-state scale is the upgrade path.
 - **No-exec / locked-down filesystems** for the child-process tracks (Go
   in-process is exempt — nothing is spawned).
 - **WSGI Python** (Flask, sync Django) for the in-process WS proxy — WSGI

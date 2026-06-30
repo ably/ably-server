@@ -80,14 +80,17 @@ it's exactly what some environments break.
   arbitrary child binary, and don't hold persistent WebSocket connections.
   There's no long-lived process to embed into. (A serverless front talking to
   a *separately hosted* ably-server is fine — but that's not embedding.)
-- **Horizontally scaled / multi-instance, expecting shared state** — this is
-  the big one. Each instance embeds its **own** `memory`-mode node, so two
-  replicas (pods, dynos, autoscaled VMs, a rolling deploy mid-cutover) are
-  **two isolated Ablys**: a client on instance A never sees a publish on
-  instance B. Embedding is single-node by design. Sharing state across
-  instances needs `cluster` mode (shared Postgres) — which is no longer
-  "zero dependency, no separate server," so at that point you're really
-  running infrastructure again.
+- **Horizontally scaled / multi-instance, in `memory` mode** — each instance
+  is its own in-memory node, so two replicas (pods, dynos, a rolling deploy
+  mid-cutover) are **two isolated Ablys**: a client on A never sees a publish
+  on B. This is a `memory`-mode limit, *not* a dead end — `ably-server`'s
+  `cluster` mode (stateless nodes in front of a shared Postgres) gives real
+  cross-instance fan-out, and that's the design. But the moment you're running
+  Postgres and orchestrating replicas, you've left the "just a package,
+  nothing else" sweet spot. That's the boundary, and it's the honest place to
+  ask "why not the managed cloud?" rather than scale a self-hosted,
+  single-region server. The embed shines at single-instance; shared-state
+  scale is the on-ramp's *upgrade*, not its job.
 - **No-exec / locked-down filesystems** — App Engine standard, distroless
   images without a shell/exec, `noexec` mounts, strict SELinux/AppArmor. The
   child-process tracks can't spawn the binary. (Go in-process is the
