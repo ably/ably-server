@@ -280,9 +280,15 @@ familiar, not smelly.
 Embedding assumes one long-lived process that owns a port and holds
 connections open. That rules out, by architecture (not by polish):
 
-- **Serverless / FaaS / edge** (Lambda, Vercel/Netlify Functions, Cloudflare
-  Workers, Deno Deploy, GCF, Azure Functions) — request-scoped, scale-to-zero,
-  no persistent WS, usually no child-binary spawn. Nothing to embed into.
+- **Serverless / FaaS / edge** (Lambda, Cloudflare Workers, Deno Deploy, GCF,
+  Azure Functions, Netlify Functions) — request-scoped, scale-to-zero, no
+  long-lived process to embed into. *Nuance:* Vercel Functions (Fluid compute)
+  now support WebSockets + Socket.IO and can even bundle/spawn binaries, so WS
+  is no longer the blocker there — but the embed still doesn't fit because
+  instances are duration-capped (WS drops at 800s/1800s), autoscaled, and each
+  holds its own isolated `memory`-mode node (Vercel says use an external store
+  for shared state). Point the SDK at a long-lived ably-server / cloud instead.
+  Detail in [USING.md](USING.md#a-note-on-vercel-and-netlify-the-websocket-question).
 - **Horizontally scaled multi-instance, in `memory` mode** — replicas don't
   share channels. Not a dead end: `ably-server`'s `cluster` mode (stateless
   nodes in front of a shared Postgres) gives real cross-instance fan-out — but

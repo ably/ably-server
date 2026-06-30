@@ -61,9 +61,11 @@ It's an on-ramp. It is explicitly *not* meant to be a robust, at-scale
 production service. That distinction matters, because it answers the obvious
 objections:
 
-- **Serverless and edge are out.** Lambda, Vercel/Netlify functions,
-  Cloudflare Workers and the like have no long-lived process to embed into.
-  That's fine, that's not the use case.
+- **Serverless and edge are out as an embed target.** Even where the platform
+  now supports WebSockets (Vercel does, on Fluid compute; Netlify still
+  doesn't), the function instance is ephemeral, duration-capped and autoscaled,
+  not the long-lived single process the embed assumes. That's fine, it's not
+  the use case. You point the SDK at a long-lived server or the cloud instead.
 - **Scale is the upgrade, not the job.** A single embedded node in memory mode
   is one isolated Ably. ably-server *does* scale, that's the design: stateless
   nodes in front of a shared Postgres (`cluster` mode), and it works. But the

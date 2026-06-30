@@ -74,12 +74,13 @@ it's exactly what some environments break.
 
 ### Won't work (architectural mismatch — don't try)
 
-- **Serverless / FaaS / edge runtimes** — AWS Lambda, Vercel / Netlify
-  Functions, Cloudflare Workers, Deno Deploy, Google Cloud Functions, Azure
-  Functions. They're request-scoped and scale to zero, usually can't spawn an
-  arbitrary child binary, and don't hold persistent WebSocket connections.
-  There's no long-lived process to embed into. (A serverless front talking to
-  a *separately hosted* ably-server is fine — but that's not embedding.)
+- **Serverless / FaaS / edge runtimes** — AWS Lambda, Cloudflare Workers, Deno
+  Deploy, Google Cloud Functions, Azure Functions, Netlify Functions. They're
+  request-scoped, scale to zero, and (mostly) can't spawn an arbitrary child
+  binary or hold a long-lived process to embed into. Point a *separately
+  hosted* ably-server (or Ably cloud) at them instead — that's not embedding.
+  See the Vercel note below: WebSockets are no longer the blocker there, but
+  the embed still doesn't fit.
 - **Horizontally scaled / multi-instance, in `memory` mode** — each instance
   is its own in-memory node, so two replicas (pods, dynos, a rolling deploy
   mid-cutover) are **two isolated Ablys**: a client on A never sees a publish
@@ -102,6 +103,29 @@ it's exactly what some environments break.
 - **Same-origin subpath with a stock SDK, today** — the SDKs have no
   `basePath` option yet (see the subpath section). Use a dedicated port or
   subdomain until that lands.
+
+### A note on Vercel and Netlify (the WebSocket question)
+
+Vercel **now supports WebSockets** in Functions (including `ws`, Socket.IO,
+and Python), on [Fluid compute](https://vercel.com/docs/functions/websockets).
+You could even bundle and spawn the binary
+([large functions](https://vercel.com/docs/functions/limitations) allow 5 GB
+bundles "for binaries"; Node.js has full `child_process` coverage). So "no
+WebSockets" is no longer why serverless is out — that reason is stale.
+
+But **embedding the sidecar still doesn't fit**, for the instance lifecycle:
+a WebSocket "closes when a Function reaches its maximum duration" (800s GA,
+1800s beta, 300s Hobby), so the spawned server and its in-memory state recycle
+every ~13–30 minutes; instances autoscale and "new connections are not
+guaranteed to reach the same instance" (Vercel's own advice is to keep shared
+state in an external store like Redis), so each instance is an **isolated,
+resetting `memory`-mode node**; and there's a **1,024 file-descriptor** ceiling
+per instance. You'd get fragmented realtime unless you front it with a shared
+Postgres — at which point the "just a package" value is gone. The fit on
+Vercel is to use its native WebSockets for your app's own realtime, or point an
+unmodified Ably SDK at a long-lived ably-server / Ably cloud. Neither is
+embedding. **Netlify Functions**, by contrast, still don't hold persistent
+WebSockets in 2026 — their guidance is to use a realtime provider.
 
 ### Friction points (it works, but mind these)
 
