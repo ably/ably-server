@@ -1,0 +1,1 @@
+{"label":"python-postkill","endpoint":"127.0.0.1:8595","pass":true,"startedAt":"2026-06-30T23:30:36+02:00","wallMs":13.066,"scenarios":[{"name":"connect","pass":true,"durationMs":4.918,"metrics":{"connectMs":4.89}},{"name":"pubsub","pass":true,"durationMs":7.997,"metrics":{"maxMs":0.41,"meanMs":0.31,"minMs":0.28,"p50Ms":0.3,"p99Ms":0.41,"samples":20}}]}

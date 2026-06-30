@@ -1,0 +1,26 @@
+== Flask (WSGI) embedding: REST works, WS does not ==
+date: 2026-06-30T21:26:34Z  publicPort: 8588
+
+flask app pid: 57459
+app /readyz green via Flask proxy
+
+-- REST through Flask (proxied to the embedded child) --
+GET /time            -> HTTP 200
+POST publish         -> HTTP 201  body: {"serials":["01782854794905-001@192f8d47eb:000"]}
+GET history          -> HTTP 200  body: [{"serial":"01782854794905-001@192f8d47eb:000","action":0,"name":"ev","data":"flask-rest-hi","version":{"serial":"01782854794905-001@192f8d47eb:000","timestamp":1782854794905}}]
+
+-- WebSocket upgrade through Flask (the WSGI limitation) --
+Attempting an Upgrade: websocket handshake to ws://127.0.0.1:8588/ ...
+HTTP/1.1 400 BAD REQUEST
+(WSGI cannot complete a WS upgrade in-process: Werkzeug's dev server
+ rejects the Upgrade request outright; even a production WSGI server
+ has no PEP-3333 hook to hijack the socket. The realtime transport
+ therefore does NOT work through Flask — use the FastAPI/ASGI example
+ or an ASGI server / ingress in front for the WS path.)
+
+-- Clean shutdown (SIGTERM) --
+embedded child before SIGTERM: 57464
+flask app exited
+embedded child 57464 gone — no orphan (signal handler stopped it)
+
+== FLASK REST-ONLY DEMO COMPLETE (REST works; WS unsupported by WSGI) ==
