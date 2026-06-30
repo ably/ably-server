@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Embedded Ably — live realtime, served by your own web server</title>
+<!-- Unmodified ably-js, straight from the CDN. The only realtime endpoint
+     it talks to is THIS page's own origin — the web server that served
+     this HTML is also answering Ably traffic. No separate server. -->
+<script src="https://cdn.ably.com/lib/ably.min-2.js"></script>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #121722; --line: #232a3a; --ink: #e6eaf2;
+    --muted: #8b95a7; --accent: #ff5416; --ok: #2ecc71; --warn: #f1c40f; --err: #e74c3c;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); line-height: 1.5; }
+  header { padding: 28px 24px 8px; max-width: 980px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 14px; margin: 0; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 16px 24px 48px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .wrap { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 12px; font-weight: 600; }
+  .pill { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; font-family: var(--mono); padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.err { background: var(--err); }
+  #feed { list-style: none; margin: 0; padding: 0; height: 280px; overflow-y: auto; display: flex; flex-direction: column-reverse; gap: 6px; font-family: var(--mono); font-size: 13px; }
+  #feed li { padding: 7px 10px; background: #0e1320; border: 1px solid var(--line); border-radius: 8px; animation: in .25s ease; }
+  #feed li .who { color: var(--accent); } #feed li .t { color: var(--muted); float: right; }
+  @keyframes in { from { opacity: 0; transform: translateY(4px); } }
+  form { display: flex; gap: 8px; margin-top: 12px; }
+  input[type=text] { flex: 1; background: #0e1320; border: 1px solid var(--line); color: var(--ink); border-radius: 8px; padding: 9px 11px; font-family: var(--sans); font-size: 14px; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 9px 16px; font-weight: 600; cursor: pointer; font-size: 14px; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  pre { background: #0e1320; border: 1px solid var(--line); border-radius: 8px; padding: 12px; overflow-x: auto; font-family: var(--mono); font-size: 12.5px; color: #cdd6e6; margin: 0; }
+  .k { color: #7aa2f7; } .s { color: #9ece6a; } .c { color: var(--muted); }
+  .why { max-width: 980px; margin: 0 auto; padding: 0 24px 40px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  @media (max-width: 760px) { .why { grid-template-columns: 1fr; } }
+  .why div { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  .why b { display: block; font-size: 14px; margin-bottom: 3px; } .why p { margin: 0; color: var(--muted); font-size: 13px; }
+  .hint { color: var(--muted); font-size: 13px; margin: 10px 0 0; }
+  code { font-family: var(--mono); color: var(--accent); }
+  .meta { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-top: 8px; word-break: break-all; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Realtime, embedded.</h1>
+  <p class="sub">This page is served by an ordinary web server (Go, Node, .NET or Python). That <em>same</em> server is also answering Ably SDK traffic — so the messages below are flowing through a realtime endpoint your app hosts itself. No separate server, no extra infrastructure to install.</p>
+</header>
+
+<div class="wrap">
+  <div class="card">
+    <h2>Live feed <span id="status" class="pill" style="float:right"><span class="dot" id="dot"></span><span id="state">connecting…</span></span></h2>
+    <ul id="feed"></ul>
+    <form id="pub">
+      <input id="msg" type="text" placeholder="Type a message and hit send…" autocomplete="off" />
+      <button id="send" type="submit" disabled>Send</button>
+    </form>
+    <p class="hint">Open this page in <b>two browser tabs</b> — every message appears in both, instantly, over the embedded endpoint.</p>
+    <p class="meta" id="endpoint"></p>
+  </div>
+
+  <div class="card">
+    <h2>The entire client wiring</h2>
+    <pre><span class="c">// unmodified ably-js, pointed at this page's own origin</span>
+<span class="k">const</span> ably = <span class="k">new</span> Ably.Realtime({
+  key: <span class="s">'app.key:secret'</span>,   <span class="c">// dev key for the embedded server</span>
+  restHost: location.hostname,
+  realtimeHost: location.hostname,
+  port: <span class="k">Number</span>(location.port),
+  tls: location.protocol === <span class="s">'https:'</span>,
+});
+<span class="k">const</span> channel = ably.channels.get(<span class="s">'demo:feed'</span>);
+channel.subscribe(<span class="s">'msg'</span>, (m) => render(m.data));
+channel.publish(<span class="s">'msg'</span>, { text, who });</pre>
+    <p class="hint">That's it. The host app just reverse-proxies (or in Go, in-process mounts) Ably on its own port. In production you'd swap the dev key for token auth (an <code>authUrl</code>), and ship the server binary as a normal package dependency.</p>
+  </div>
+</div>
+
+<div class="why">
+  <div><b>No dependency to install</b><p>The realtime endpoint ships inside your app — a package dependency, not a service to provision.</p></div>
+  <div><b>No separate server to run</b><p>It's the same process (or a supervised child) on the same port. One thing to deploy.</p></div>
+  <div><b>Just an endpoint, attached</b><p>Point any unmodified Ably SDK at host + port. Pub/sub, history, presence, resume — all there.</p></div>
+</div>
+
+<script>
+(function () {
+  var stateEl = document.getElementById('state'), dot = document.getElementById('dot');
+  var feed = document.getElementById('feed'), form = document.getElementById('pub');
+  var input = document.getElementById('msg'), send = document.getElementById('send');
+  var who = 'tab-' + Math.random().toString(36).slice(2, 6);
+  var loc = window.location;
+  var port = Number(loc.port) || (loc.protocol === 'https:' ? 443 : 80);
+  document.getElementById('endpoint').textContent =
+    'endpoint: ' + loc.protocol + '//' + loc.hostname + ':' + port + '  ·  client: ' + who;
+
+  function setState(s, cls) { stateEl.textContent = s; dot.className = 'dot ' + (cls || ''); }
+  function render(d) {
+    var li = document.createElement('li');
+    var t = new Date().toLocaleTimeString();
+    li.innerHTML = '<span class="who">' + (d.who || '?') + '</span> ' +
+      String(d.text).replace(/</g, '&lt;') + '<span class="t">' + t + '</span>';
+    feed.prepend(li);
+  }
+
+  var ably = new Ably.Realtime({
+    key: 'app.key:secret',
+    restHost: loc.hostname, realtimeHost: loc.hostname,
+    port: port, tls: loc.protocol === 'https:',
+  });
+  ably.connection.on(function (change) {
+    var s = change.current;
+    setState(s, s === 'connected' ? 'ok' : (s === 'failed' || s === 'disconnected' || s === 'suspended') ? 'err' : 'warn');
+    send.disabled = s !== 'connected';
+  });
+
+  var channel = ably.channels.get('demo:feed');
+  channel.subscribe('msg', function (m) { render(m.data); });
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var text = input.value.trim();
+    if (!text) return;
+    channel.publish('msg', { text: text, who: who });
+    input.value = '';
+  });
+})();
+</script>
+</body>
+</html>

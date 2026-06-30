@@ -39,11 +39,22 @@ type config struct {
 	key            string // appId.keyId:keySecret
 	label          string
 	scenarios      []string
-	binary         bool // SDK protocol: msgpack when true, JSON when false
+	binary         bool   // SDK protocol: msgpack when true, JSON when false
+	basePath       string // e.g. "/ably" when the server is mounted under a subpath
 	latencySamples int
 	historyCount   int
 	soakMessages   int
 	opTimeout      time.Duration
+}
+
+// pathPrefix returns the normalised base path ("" or "/ably"), used to
+// build REST and WebSocket URLs when the server is mounted under a subpath.
+func (c config) pathPrefix() string {
+	p := strings.TrimRight(c.basePath, "/")
+	if p != "" && !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return p
 }
 
 // keyName returns the basic-auth username (appId.keyId) for REST calls.
@@ -98,8 +109,9 @@ func main() {
 	}
 	flag.StringVar(&c.key, "key", defaultKey, "API key appId.keyId:keySecret (env: ABLY_SERVER_API_KEY)")
 	flag.StringVar(&c.label, "label", "unlabelled", "label for this run in the report")
-	flag.StringVar(&scenarios, "scenarios", "all", "comma list: connect,pubsub,restpubsub,history,resume,soak (or all)")
+	flag.StringVar(&scenarios, "scenarios", "all", "comma list: connect,pubsub,restpubsub,history,resume,soak,rawpubsub (or all)")
 	flag.BoolVar(&c.binary, "binary", false, "use the msgpack SDK protocol instead of JSON")
+	flag.StringVar(&c.basePath, "base-path", "", "subpath the server is mounted under, e.g. /ably (runs raw-protocol scenarios only; stock SDKs have no basePath option yet)")
 	flag.IntVar(&c.latencySamples, "latency-samples", 20, "round-trips to sample for pubsub latency")
 	flag.IntVar(&c.historyCount, "history-count", 10, "messages to publish+read back in the history scenario")
 	flag.IntVar(&c.soakMessages, "soak-messages", 200, "messages for the soak scenario (0 disables)")
@@ -112,23 +124,33 @@ func main() {
 		os.Exit(2)
 	}
 
-	// Scenario registry, run in this fixed order.
+	// Scenario registry, run in this fixed order. rawpubsub uses only the
+	// wire protocol (no ably-go SDK), so it is the one pub/sub scenario that
+	// can target a subpath mount.
 	registry := []struct {
 		name string
 		fn   scenarioFunc
+		raw  bool // uses only raw protocol — safe under --base-path
 	}{
-		{"connect", scenarioConnect},
-		{"pubsub", scenarioPubSub},
-		{"restpubsub", scenarioRESTPubSub},
-		{"history", scenarioHistory},
-		{"resume", scenarioResume},
-		{"soak", scenarioSoak},
+		{"connect", scenarioConnect, false},
+		{"pubsub", scenarioPubSub, false},
+		{"restpubsub", scenarioRESTPubSub, false},
+		{"history", scenarioHistory, false},
+		{"rawpubsub", scenarioRawPubSub, true},
+		{"resume", scenarioResume, true},
+		{"soak", scenarioSoak, false},
 	}
 
-	want := map[string]bool{}
+	// Stock SDKs build root-rooted URLs (no basePath option — EMBEDDING-POC
+	// §6), so under --base-path only the raw-protocol scenarios can run.
+	// "all" then means the raw-capable set.
 	all := scenarios == "all"
+	want := map[string]bool{}
 	for _, s := range strings.Split(scenarios, ",") {
 		want[strings.TrimSpace(s)] = true
+	}
+	if c.pathPrefix() != "" {
+		fmt.Fprintf(os.Stderr, "  (base-path %q: running raw-protocol scenarios only; stock SDKs cannot target a subpath yet)\n", c.pathPrefix())
 	}
 
 	started := time.Now()
@@ -145,6 +167,14 @@ func main() {
 	for _, s := range registry {
 		if !all && !want[s.name] {
 			continue
+		}
+		// rawpubsub is part of the raw subpath suite, not the default SDK
+		// "all" run (pubsub already covers SDK pub/sub at root).
+		if all && s.name == "rawpubsub" && c.pathPrefix() == "" {
+			continue
+		}
+		if c.pathPrefix() != "" && !s.raw {
+			continue // SDK-based scenario cannot target a subpath
 		}
 		if s.name == "soak" && c.soakMessages <= 0 {
 			continue

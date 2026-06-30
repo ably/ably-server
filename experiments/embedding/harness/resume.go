@@ -140,6 +140,57 @@ func scenarioResume(ctx context.Context, c config) (map[string]any, error) {
 	}, nil
 }
 
+// scenarioRawPubSub proves pub/sub at the wire-protocol level: a raw WS
+// attaches and subscribes, a REST publish goes in, and the frames come
+// back — using no SDK, so it is the one pub/sub check that can target a
+// subpath mount (--base-path). It exercises the same proxy path a real
+// SDK would, minus the SDK's root-rooted URL assumption.
+func scenarioRawPubSub(ctx context.Context, c config) (map[string]any, error) {
+	channel := chanName("rawpubsub")
+	ws, err := dialWS(c, channel)
+	if err != nil {
+		return nil, fmt.Errorf("dial: %w", err)
+	}
+	defer ws.Close()
+	if err := awaitConnected(ws, c.opTimeout); err != nil {
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	if err := sendAttach(ws, channel, ""); err != nil {
+		return nil, fmt.Errorf("attach: %w", err)
+	}
+	if _, err := awaitAttached(ws, channel, c.opTimeout); err != nil {
+		return nil, fmt.Errorf("attached: %w", err)
+	}
+
+	want := []string{"r1", "r2", "r3"}
+	for _, d := range want {
+		if err := restPublish(ctx, c, channel, "ev", d); err != nil {
+			return nil, fmt.Errorf("publish %s: %w", d, err)
+		}
+	}
+	got := make([]string, 0, len(want))
+	for len(got) < len(want) {
+		frame, err := readFrame(ws, c.opTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("read message: %w", err)
+		}
+		if frame.Action != protocol.ActionMessage || frame.Channel != channel {
+			continue
+		}
+		for _, m := range frame.Messages {
+			if d, ok := m.Data.(string); ok {
+				got = append(got, d)
+			}
+		}
+	}
+	for i, w := range want {
+		if got[i] != w {
+			return nil, fmt.Errorf("message[%d] = %q, want %q (full=%v)", i, got[i], w, got)
+		}
+	}
+	return map[string]any{"delivered": len(got), "basePath": c.pathPrefix()}, nil
+}
+
 // dialWS opens a raw WebSocket to the endpoint's root, authenticating with
 // the API key in the query string (the server accepts ?key=…) and pinning
 // the JSON protocol so we can speak internal/protocol over text frames.
@@ -147,7 +198,8 @@ func dialWS(c config, _ string) (*websocket.Conn, error) {
 	q := url.Values{}
 	q.Set("key", c.key)
 	q.Set("format", "json")
-	u := url.URL{Scheme: "ws", Host: c.addr(), Path: "/", RawQuery: q.Encode()}
+	wsPath := c.pathPrefix() + "/"
+	u := url.URL{Scheme: "ws", Host: c.addr(), Path: wsPath, RawQuery: q.Encode()}
 	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
 	conn, resp, err := dialer.Dial(u.String(), nil)
 	if err != nil {

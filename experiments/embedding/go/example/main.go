@@ -1,8 +1,11 @@
 // Command example is a tiny Go host app that embeds ably-server in-process
-// (EMBEDDING-POC.md §8 M1) and serves it on a dedicated port. This file is
-// the entire integration glue a Go developer writes: import the package,
-// New, mount the handler, defer Close. An unmodified Ably SDK then points
-// at this host+port.
+// (EMBEDDING-POC.md §8 M1) and serves it on a dedicated port. The Ably
+// integration is the few lines between the glue markers: import the
+// package, New, mount the handler, defer Close. An unmodified Ably SDK
+// then points at this host+port.
+//
+// It optionally also serves the browser demo at /demo/ (pass --demo-dir),
+// which is just one of the host app's own routes sitting next to Ably.
 package main
 
 import (
@@ -22,6 +25,7 @@ import (
 func main() {
 	listen := flag.String("listen", "127.0.0.1:8500", "dedicated port for the embedded Ably endpoint")
 	key := flag.String("api-key", env("ABLY_SERVER_API_KEY", "app.key:secret"), "API key appId.keyId:keySecret")
+	demoDir := flag.String("demo-dir", "", "if set, serve the browser demo from this dir at /demo/")
 	flag.Parse()
 
 	// --- the glue: embed ably-server in-process ---
@@ -30,9 +34,20 @@ func main() {
 		log.Fatalf("embed ably-server: %v", err)
 	}
 	defer embedded.Close()
-
-	srv := &http.Server{Addr: *listen, Handler: embedded.Handler, ReadHeaderTimeout: 10 * time.Second}
 	// --- end glue ---
+
+	// Ably owns the root (WebSocket at /, REST under /channels …). The host
+	// app's own routes — here, the optional demo page — sit alongside it.
+	var handler http.Handler = embedded.Handler
+	if *demoDir != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/demo/", http.StripPrefix("/demo/", http.FileServer(http.Dir(*demoDir))))
+		mux.Handle("/", embedded.Handler)
+		handler = mux
+		log.Printf("serving browser demo at http://%s/demo/", *listen)
+	}
+
+	srv := &http.Server{Addr: *listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

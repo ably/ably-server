@@ -313,7 +313,7 @@ func restPublish(ctx context.Context, c config, channel, name, data string) erro
 	u := url.URL{
 		Scheme: "http",
 		Host:   c.addr(),
-		Path:   "/channels/" + url.PathEscape(channel) + "/messages",
+		Path:   c.pathPrefix() + "/channels/" + url.PathEscape(channel) + "/messages",
 	}
 	body := fmt.Sprintf(`{"name":%q,"data":%q}`, name, data)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader([]byte(body)))
