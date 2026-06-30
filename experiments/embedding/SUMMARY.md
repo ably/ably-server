@@ -15,6 +15,71 @@ dimension, is in [RESULTS.md](RESULTS.md); how to run it is in
 [demo/index.html](demo/index.html) that you can open in two tabs and watch
 realtime flow through an endpoint your own web server is hosting.
 
+## What it looks like
+
+Two ends to it: the host app embeds Ably on its own port, and an unmodified
+Ably SDK points at that port. Node and Python below; the others (Go in-process,
+.NET via YARP, Fastify) are in [USING.md](USING.md).
+
+**Node (Express).** Embed it:
+
+```js
+import express from 'express';
+import { startEmbeddedServer } from '@ably/embedded-server';
+import { mountAblyProxy } from '@ably/embedded-server/express';
+
+const supervisor = await startEmbeddedServer({ apiKey: 'app.key:secret' });
+const app = express();
+const proxy = mountAblyProxy(app, { supervisor });   // Ably on this app's port
+const server = app.listen(8541);
+server.on('upgrade', proxy.upgrade);                  // forward WebSocket upgrades
+```
+
+Use it, with an unmodified ably-js (browser or Node):
+
+```js
+import * as Ably from 'ably';
+const ably = new Ably.Realtime({
+  key: 'app.key:secret',
+  restHost: '127.0.0.1', realtimeHost: '127.0.0.1', port: 8541, tls: false,
+});
+const channel = ably.channels.get('demo');
+channel.subscribe('msg', (m) => console.log(m.data));
+await channel.publish('msg', 'hello from an embedded Ably');
+```
+
+**Python (FastAPI).** Embed it:
+
+```python
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from ably_embedded import AblyServerSupervisor, make_proxy_app
+
+supervisor = AblyServerSupervisor(api_key="app.key:secret")
+
+@asynccontextmanager
+async def lifespan(app):
+    await supervisor.start()        # spawn the child, wait for /readyz
+    yield
+    await supervisor.stop()         # stop it with the app, no orphan
+
+app = FastAPI(lifespan=lifespan)
+proxy = make_proxy_app(supervisor)  # catch-all ASGI reverse-proxy (WS + REST)
+# your own routes live on `app`; Ably traffic falls through to `proxy`
+# (see examples/fastapi_app.py for the ASGI fall-through wiring)
+```
+
+Use it, with an unmodified ably-python:
+
+```python
+from ably import AblyRealtime
+# ably-python folds host:port into realtime_host (it ignores the `port` option)
+ably = AblyRealtime(key="app.key:secret", realtime_host="127.0.0.1:8581", tls=False)
+channel = ably.channels.get("demo")
+await channel.subscribe("greeting", lambda m: print(m.data))
+await channel.publish("greeting", "hello from an embedded Ably")
+```
+
 ## Why I tried this
 
 Paddy's [PDR-090](https://ably.atlassian.net/wiki/spaces/product/pages/5171281935/PDR-090+Source-available+Ably+implementation)
