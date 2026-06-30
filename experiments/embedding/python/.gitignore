@@ -1,0 +1,13 @@
+# Python virtualenv (created locally; never committed)
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# The prebuilt server binary is a build input, not source
+bin/
+
+# Scratch
+*.log
+*.out
