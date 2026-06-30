@@ -33,8 +33,8 @@ import (
 func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolMessage) {
 	if len(msg.Messages) != 1 {
 		c.logger.Warn("mutation must carry exactly one message; rejecting",
-			"channel", msg.Channel, "count", len(msg.Messages), "msgSerial", msg.MsgSerial)
-		c.nack(ctx, msg.MsgSerial, &protocol.ErrorInfo{
+			"channel", msg.Channel, "count", len(msg.Messages), "msgSerial", msg.MsgSerialValue())
+		c.nack(ctx, msg.MsgSerialValue(), &protocol.ErrorInfo{
 			Message:    "a mutation must carry exactly one message",
 			Code:       40000,
 			StatusCode: 400,
@@ -44,8 +44,8 @@ func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolM
 	m := msg.Messages[0]
 	if !m.Action.IsMutation() || m.Serial == "" {
 		c.logger.Warn("mutation missing action or target serial; rejecting",
-			"channel", msg.Channel, "action", m.Action.String(), "msgSerial", msg.MsgSerial)
-		c.nack(ctx, msg.MsgSerial, &protocol.ErrorInfo{
+			"channel", msg.Channel, "action", m.Action.String(), "msgSerial", msg.MsgSerialValue())
+		c.nack(ctx, msg.MsgSerialValue(), &protocol.ErrorInfo{
 			Message:    "a mutation requires an action and a target serial",
 			Code:       40000,
 			StatusCode: 400,
@@ -55,8 +55,8 @@ func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolM
 
 	ch, err := c.manager.GetChannel(ctx, msg.Channel)
 	if err != nil {
-		c.logger.Warn("mutation failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerial, "err", err)
-		c.nack(ctx, msg.MsgSerial, nil)
+		c.logger.Warn("mutation failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerialValue(), "err", err)
+		c.nack(ctx, msg.MsgSerialValue(), nil)
 		return
 	}
 
@@ -71,8 +71,8 @@ func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolM
 	if err != nil {
 		if errors.Is(err, storage.ErrTargetNotFound) {
 			c.logger.Warn("mutation target not found; NACKing",
-				"channel", msg.Channel, "target", m.Serial, "msgSerial", msg.MsgSerial)
-			c.nack(ctx, msg.MsgSerial, &protocol.ErrorInfo{
+				"channel", msg.Channel, "target", m.Serial, "msgSerial", msg.MsgSerialValue())
+			c.nack(ctx, msg.MsgSerialValue(), &protocol.ErrorInfo{
 				Message:    "target message not found",
 				Code:       40400,
 				StatusCode: 404,
@@ -80,8 +80,8 @@ func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolM
 			return
 		}
 		c.logger.Warn("mutation failed; NACKing",
-			"channel", msg.Channel, "target", m.Serial, "msgSerial", msg.MsgSerial, "err", err)
-		c.nack(ctx, msg.MsgSerial, nil)
+			"channel", msg.Channel, "target", m.Serial, "msgSerial", msg.MsgSerialValue(), "err", err)
+		c.nack(ctx, msg.MsgSerialValue(), nil)
 		return
 	}
 

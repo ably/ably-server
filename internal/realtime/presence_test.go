@@ -83,7 +83,7 @@ func enter(t *testing.T, ws *websocket.Conn, channel string, msgSerial int64) {
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionPresence,
 		Channel:   channel,
-		MsgSerial: msgSerial,
+		MsgSerial: protocol.Int64(msgSerial),
 		Presence:  []*protocol.PresenceMessage{{Action: protocol.PresenceEnter}},
 	})
 	if ack := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {
@@ -242,7 +242,7 @@ func TestPresenceEnterCrossesConnections(t *testing.T) {
 	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionPresence,
 		Channel:   "room",
-		MsgSerial: 1,
+		MsgSerial: protocol.Int64(1),
 		Presence:  []*protocol.PresenceMessage{{Action: protocol.PresenceEnter, Data: "hi"}},
 	})
 	if ack := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {
@@ -288,7 +288,7 @@ func TestPresenceUpdateAndLeaveDelivered(t *testing.T) {
 		sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
 			Action:    protocol.ActionPresence,
 			Channel:   "room",
-			MsgSerial: int64(i + 1),
+			MsgSerial: protocol.Int64(int64(i + 1)),
 			Presence:  []*protocol.PresenceMessage{{Action: action}},
 		})
 		if ack := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {
@@ -315,15 +315,15 @@ func TestPresenceAnonymousRejected(t *testing.T) {
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionPresence,
 		Channel:   "room",
-		MsgSerial: 7,
+		MsgSerial: protocol.Int64(7),
 		Presence:  []*protocol.PresenceMessage{{Action: protocol.PresenceEnter}},
 	})
 	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
 	if msg.Action != protocol.ActionNack {
 		t.Fatalf("Action = %v, want NACK", msg.Action)
 	}
-	if msg.MsgSerial != 7 {
-		t.Errorf("MsgSerial = %d, want 7", msg.MsgSerial)
+	if msg.MsgSerialValue() != 7 {
+		t.Errorf("MsgSerial = %d, want 7", msg.MsgSerialValue())
 	}
 	if msg.Error == nil || msg.Error.Code != 91000 {
 		t.Errorf("Error = %+v, want code 91000", msg.Error)
@@ -341,7 +341,7 @@ func TestPresenceClientIDMismatchRejected(t *testing.T) {
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionPresence,
 		Channel:   "room",
-		MsgSerial: 3,
+		MsgSerial: protocol.Int64(3),
 		Presence:  []*protocol.PresenceMessage{{Action: protocol.PresenceEnter, ClientID: "bob"}},
 	})
 	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
@@ -361,7 +361,7 @@ func TestPresenceRequiresPresenceMode(t *testing.T) {
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionPresence,
 		Channel:   "room",
-		MsgSerial: 5,
+		MsgSerial: protocol.Int64(5),
 		Presence:  []*protocol.PresenceMessage{{Action: protocol.PresenceEnter}},
 	})
 	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
@@ -385,7 +385,7 @@ func TestPresenceImplicitLeaveOnDisconnect(t *testing.T) {
 	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionPresence,
 		Channel:   "room",
-		MsgSerial: 1,
+		MsgSerial: protocol.Int64(1),
 		Presence:  []*protocol.PresenceMessage{{Action: protocol.PresenceEnter}},
 	})
 	if ack := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {
@@ -425,7 +425,7 @@ func TestPresenceDetachLeaves(t *testing.T) {
 	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionPresence,
 		Channel:   "room",
-		MsgSerial: 1,
+		MsgSerial: protocol.Int64(1),
 		Presence:  []*protocol.PresenceMessage{{Action: protocol.PresenceEnter}},
 	})
 	if ack := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {

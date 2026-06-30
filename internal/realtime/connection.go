@@ -22,7 +22,7 @@ type connection struct {
 	ws                *websocket.Conn
 	format            protocol.Format
 	id                string
-	clientID          string // resolved clientId for this connection ("" = anonymous, "*" = wildcard); see DESIGN.md §3.2
+	clientID          string          // resolved clientId for this connection ("" = anonymous, "*" = wildcard); see DESIGN.md §3.2
 	principal         *auth.Principal // verified credential + token claims; clientId resolution (TASK-11) consumes this
 	heartbeatInterval time.Duration
 	logger            *slog.Logger
@@ -47,7 +47,26 @@ func (c *connection) run(ctx context.Context) {
 	defer cancel()
 
 	// CONNECTED is the first frame we emit; buffer is empty here.
-	if !c.queue(ctx, &protocol.ProtocolMessage{Action: protocol.ActionConnected, ConnectionID: c.id}) {
+	// connectionDetails (Ably CD2) must always be present: ably-js rejects a
+	// CONNECTED without it. maxIdleInterval is derived from the server
+	// heartbeat cadence so the SDK's inactivity timer comfortably spans the
+	// gap between heartbeats.
+	connected := &protocol.ProtocolMessage{
+		Action:       protocol.ActionConnected,
+		ConnectionID: c.id,
+		ConnectionDetails: &protocol.ConnectionDetails{
+			ClientID:        c.clientID,
+			ConnectionKey:   c.id,
+			MaxIdleInterval: c.heartbeatInterval.Milliseconds(),
+		},
+	}
+	// A wildcard ("*") credential resolves the clientId per publish rather
+	// than at the connection level; do not advertise "*" as the connection
+	// clientId.
+	if c.clientID == "*" {
+		connected.ConnectionDetails.ClientID = ""
+	}
+	if !c.queue(ctx, connected) {
 		return
 	}
 
@@ -179,13 +198,13 @@ func (c *connection) handleDetach(ctx context.Context, name string) {
 // (or NACKs) the publisher.
 func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMessage) {
 	if msg.Channel == "" {
-		c.logger.Warn("MESSAGE with empty channel name; rejecting", "msgSerial", msg.MsgSerial)
-		c.nack(ctx, msg.MsgSerial, nil)
+		c.logger.Warn("MESSAGE with empty channel name; rejecting", "msgSerial", msg.MsgSerialValue())
+		c.nack(ctx, msg.MsgSerialValue(), nil)
 		return
 	}
 	if len(msg.Messages) == 0 {
-		c.logger.Warn("MESSAGE with no payload; rejecting", "msgSerial", msg.MsgSerial)
-		c.nack(ctx, msg.MsgSerial, nil)
+		c.logger.Warn("MESSAGE with no payload; rejecting", "msgSerial", msg.MsgSerialValue())
+		c.nack(ctx, msg.MsgSerialValue(), nil)
 		return
 	}
 	// Mutations (update/delete/append) reuse the MESSAGE frame,
@@ -206,8 +225,8 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 		cid, ok := auth.MessageClientID(c.clientID, m.ClientID)
 		if !ok {
 			c.logger.Warn("message clientId not permitted; NACKing",
-				"channel", msg.Channel, "msgSerial", msg.MsgSerial, "msgClientId", m.ClientID)
-			c.nack(ctx, msg.MsgSerial, nil)
+				"channel", msg.Channel, "msgSerial", msg.MsgSerialValue(), "msgClientId", m.ClientID)
+			c.nack(ctx, msg.MsgSerialValue(), nil)
 			return
 		}
 		m.ClientID = cid
@@ -215,14 +234,14 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 
 	ch, err := c.manager.GetChannel(ctx, msg.Channel)
 	if err != nil {
-		c.logger.Warn("publish failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerial, "err", err)
-		c.nack(ctx, msg.MsgSerial, nil)
+		c.logger.Warn("publish failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerialValue(), "err", err)
+		c.nack(ctx, msg.MsgSerialValue(), nil)
 		return
 	}
 	cm, _, err := ch.Publish(ctx, msg.Messages)
 	if err != nil {
-		c.logger.Warn("publish failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerial, "err", err)
-		c.nack(ctx, msg.MsgSerial, nil)
+		c.logger.Warn("publish failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerialValue(), "err", err)
+		c.nack(ctx, msg.MsgSerialValue(), nil)
 		return
 	}
 	// Count is 1: an ACK acknowledges protocol messages (one msgSerial per

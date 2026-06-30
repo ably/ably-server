@@ -26,8 +26,8 @@ const teardownLeaveTimeout = 5 * time.Second
 // ACK/NACKs on the msgSerial.
 func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolMessage) {
 	if msg.Channel == "" || len(msg.Presence) == 0 {
-		c.logger.Warn("PRESENCE with empty channel or no payload; rejecting", "msgSerial", msg.MsgSerial)
-		c.nack(ctx, msg.MsgSerial, nil)
+		c.logger.Warn("PRESENCE with empty channel or no payload; rejecting", "msgSerial", msg.MsgSerialValue())
+		c.nack(ctx, msg.MsgSerialValue(), nil)
 		return
 	}
 
@@ -35,8 +35,8 @@ func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolM
 	a, ok := c.attachments[msg.Channel]
 	if !ok || !a.hasMode(protocol.FlagPresence) {
 		c.logger.Warn("PRESENCE without an attached PRESENCE-mode channel; rejecting",
-			"channel", msg.Channel, "msgSerial", msg.MsgSerial)
-		c.nack(ctx, msg.MsgSerial, &protocol.ErrorInfo{
+			"channel", msg.Channel, "msgSerial", msg.MsgSerialValue())
+		c.nack(ctx, msg.MsgSerialValue(), &protocol.ErrorInfo{
 			Message:    "presence requires an attachment with the presence mode",
 			Code:       40160,
 			StatusCode: 401,
@@ -49,8 +49,8 @@ func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolM
 		cid, ok := resolvePresenceClientID(c.clientID, p.ClientID)
 		if !ok {
 			c.logger.Warn("PRESENCE clientId rejected", "channel", msg.Channel,
-				"connClientId", c.clientID, "msgClientId", p.ClientID, "msgSerial", msg.MsgSerial)
-			c.nack(ctx, msg.MsgSerial, &protocol.ErrorInfo{
+				"connClientId", c.clientID, "msgClientId", p.ClientID, "msgSerial", msg.MsgSerialValue())
+			c.nack(ctx, msg.MsgSerialValue(), &protocol.ErrorInfo{
 				Message:    "invalid clientId for presence",
 				Code:       91000,
 				StatusCode: 400,
@@ -62,8 +62,8 @@ func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolM
 	}
 
 	if _, _, err := a.channel.PublishPresence(ctx, msg.Presence); err != nil {
-		c.logger.Warn("presence publish failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerial, "err", err)
-		c.nack(ctx, msg.MsgSerial, nil)
+		c.logger.Warn("presence publish failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerialValue(), "err", err)
+		c.nack(ctx, msg.MsgSerialValue(), nil)
 		return
 	}
 
@@ -200,7 +200,7 @@ func (c *connection) publishLeaves(ctx context.Context, channel string, set map[
 func (c *connection) nack(ctx context.Context, msgSerial int64, errInfo *protocol.ErrorInfo) {
 	c.queue(ctx, &protocol.ProtocolMessage{
 		Action:    protocol.ActionNack,
-		MsgSerial: msgSerial,
+		MsgSerial: protocol.Int64(msgSerial),
 		Count:     1,
 		Error:     errInfo,
 	})

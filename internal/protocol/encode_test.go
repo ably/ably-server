@@ -10,7 +10,7 @@ func TestRoundTrip(t *testing.T) {
 	original := &ProtocolMessage{
 		Action:       ActionConnected,
 		ConnectionID: "abc123def456",
-		MsgSerial:    42,
+		MsgSerial:    Int64(42),
 		Timestamp:    1700000000000,
 	}
 
