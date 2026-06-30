@@ -228,6 +228,32 @@ suggests either is blocked.
    instance needs `cluster` mode (shared Postgres). The embed is explicitly
    single-node; this is the scale path, not a PoC gap.
 
+## Where it does NOT fit (decision boundary)
+
+Embedding assumes one long-lived process that owns a port and holds
+connections open. That rules out, by architecture (not by polish):
+
+- **Serverless / FaaS / edge** (Lambda, Vercel/Netlify Functions, Cloudflare
+  Workers, Deno Deploy, GCF, Azure Functions) — request-scoped, scale-to-zero,
+  no persistent WS, usually no child-binary spawn. Nothing to embed into.
+- **Horizontally scaled multi-instance needing shared state** — each instance
+  is its own `memory`-mode node; replicas don't share channels. Needs
+  `cluster` mode (shared Postgres), i.e. real infrastructure again.
+- **No-exec / locked-down filesystems** for the child-process tracks (Go
+  in-process is exempt — nothing is spawned).
+- **WSGI Python** (Flask, sync Django) for the in-process WS proxy — WSGI
+  can't carry WebSockets; use ASGI or an ingress.
+
+Friction (works, but plan for it): a WS-unaware ingress/LB with short idle
+timeouts; single-port platforms (Heroku) vs. the dedicated-port model;
+Alpine/musl (ship a static `CGO_ENABLED=0` binary); Windows child
+supervision; per-OS/arch binary distribution + signing; `memory` mode is
+ephemeral; Go in-process shares the host's crash blast radius.
+
+**Sweet spot:** local dev, CI, single-tenant / self-hosted single-instance
+apps, desktop/CLI bundling realtime, demos, on-prem single box. Full
+per-language fit + friction detail in [USING.md](USING.md#when-it-fits--and-when-not-to-embed).
+
 ## Reproduce
 
 ```sh

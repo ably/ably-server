@@ -65,6 +65,81 @@ Two shapes, by language:
   restarts it on crash, stops it with the app, and reverse-proxies WebSocket +
   REST to it. The server crash is isolated from the host app.
 
+## When it fits — and when NOT to embed
+
+Embedding needs **one long-lived process that owns a port and holds
+connections open** (or, for Go, that process is your app). That assumption is
+what makes it shine for dev, CI, single-tenant and self-hosted apps — and
+it's exactly what some environments break.
+
+### Won't work (architectural mismatch — don't try)
+
+- **Serverless / FaaS / edge runtimes** — AWS Lambda, Vercel / Netlify
+  Functions, Cloudflare Workers, Deno Deploy, Google Cloud Functions, Azure
+  Functions. They're request-scoped and scale to zero, usually can't spawn an
+  arbitrary child binary, and don't hold persistent WebSocket connections.
+  There's no long-lived process to embed into. (A serverless front talking to
+  a *separately hosted* ably-server is fine — but that's not embedding.)
+- **Horizontally scaled / multi-instance, expecting shared state** — this is
+  the big one. Each instance embeds its **own** `memory`-mode node, so two
+  replicas (pods, dynos, autoscaled VMs, a rolling deploy mid-cutover) are
+  **two isolated Ablys**: a client on instance A never sees a publish on
+  instance B. Embedding is single-node by design. Sharing state across
+  instances needs `cluster` mode (shared Postgres) — which is no longer
+  "zero dependency, no separate server," so at that point you're really
+  running infrastructure again.
+- **No-exec / locked-down filesystems** — App Engine standard, distroless
+  images without a shell/exec, `noexec` mounts, strict SELinux/AppArmor. The
+  child-process tracks can't spawn the binary. (Go in-process is the
+  exception — nothing is spawned, so this restriction doesn't apply.)
+- **WSGI Python** — Flask, classic synchronous Django, Bottle. WSGI has no
+  WebSocket; it can reverse-proxy REST but not the realtime WS in-process.
+  Use an ASGI stack (FastAPI / Starlette / async Django / aiohttp), or front
+  the WS with an ingress.
+- **Same-origin subpath with a stock SDK, today** — the SDKs have no
+  `basePath` option yet (see the subpath section). Use a dedicated port or
+  subdomain until that lands.
+
+### Friction points (it works, but mind these)
+
+- **A WebSocket-unaware ingress / LB / CDN in front of you.** Your own load
+  balancer or reverse proxy must forward the `Upgrade` header and not kill
+  idle connections — many default to short idle timeouts that drop WS. This
+  is a deployment-config issue, not an embedding one, but people hit it.
+- **Single-port platforms** (Heroku's one `$PORT`, some PaaS). You get one
+  port, so Ably takes that port's root (your app loses `/`) or you use a
+  subdomain. Same-origin `/ably` needs the deferred SDK `basePath`.
+- **Alpine / musl containers.** Ship a **static** binary (`CGO_ENABLED=0` —
+  ably-server is pure Go, so this just works); a glibc-linked binary won't
+  run on musl. The binary must also match the container's OS/arch.
+- **Windows child supervision.** No POSIX `SIGTERM`; graceful shutdown of the
+  child needs Windows-specific signalling. The Go in-process path avoids it.
+- **Binary distribution cost.** Per-OS/arch binaries multiply package size;
+  macOS notarisation and Windows code-signing are real productisation costs.
+- **`memory` mode is ephemeral.** A restart loses channel state and history.
+  Fine for dev/CI; for durability use `disk` (single node) or `cluster`.
+- **Go in-process shares the blast radius.** A panic in the server takes the
+  host app down. The child-process tracks (Node/.NET/Python) isolate a crash
+  and auto-restart it — that's the main reason to prefer them over Go
+  in-process for anything but Go-native, single-instance use.
+
+### Where it works *well*, per language
+
+| Language | Sweet spot | Watch out for |
+|---|---|---|
+| **Go** | Go services, CLIs, desktop apps, single-binary distribution — in-process, zero glue, lowest overhead, no binary to ship | shared blast radius (no crash isolation) |
+| **Node** | dev servers, single-instance Express/Fastify apps, Electron apps, local tooling — idiomatic middleware, crash-isolated child | per-os/cpu binary packaging; remember to wire the WS `upgrade` (Express) |
+| **.NET** | single-instance ASP.NET apps, desktop hosts, on-prem — YARP is the cleanest WS proxy of the set | IO.Ably refuses key auth over plain HTTP (use token auth); .NET runtime required |
+| **Python** | FastAPI / Starlette dev servers, local AI apps (ASGI) — clean async proxy | **WSGI (Flask/sync Django) can't proxy WS in-process**; check ably-python realtime support |
+
+### The one-line rule
+
+**Embed for: local dev, CI/test, single-tenant or self-hosted single-instance
+apps, desktop/CLI apps that bundle realtime, demos, on-prem-on-one-box.**
+**Don't embed for: serverless/edge, or multi-replica production realtime that
+needs shared durable state** — there, use Ably's platform (or `cluster` mode
+if you're self-hosting at scale).
+
 ## Per-language: dev/local now, production later
 
 In the PoC you **build the binary locally and link it** (the dev/local path
