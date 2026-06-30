@@ -1,9 +1,18 @@
 # Embedding ably-server in other-language applications: a PoC brief
 
-> **Status:** Draft brief. Branch `embedding-poc`. This document defines a
-> proof of concept; no implementation has landed yet. See
-> [DESIGN.md](DESIGN.md) for the server's own design and
+> **Status:** Self-contained execution brief. Branch `embedding-poc`. No
+> implementation has landed yet. This document is the **single source of
+> truth** for the experiment — an agent started inside this repo and pointed
+> here has everything it needs to run it end to end. Read
+> [§8 Execution guide and milestones](#8-execution-guide-and-milestones)
+> first. See [DESIGN.md](DESIGN.md) for the server's design and
 > [README.md](README.md) for what it is.
+>
+> **Routing decision (locked):** the PoC catches the standard, well-known
+> Ably endpoints on a **dedicated port** and makes **no SDK change**.
+> Mounting under a subpath namespace such as `/ably` is **deferred** until
+> the Ably SDKs support a base path. See
+> [§6 Routing decision](#6-routing-decision-locked).
 
 ## 1. Objective
 
@@ -27,22 +36,21 @@ npm install @ably/embedded-server      # (or pip / dotnet add / go get)
 
 Because `ably-server` is a single, dependency-free Go binary (the `memory`
 and `disk` modes need no external service) with a clean lifecycle
-(`--listen`, a ready-port signal, `/healthz` + `/readyz`, graceful
-shutdown), it can be embedded into Node, a second managed-runtime language,
-and Go with **low integration cost**, and the realtime transports keep
-working because traffic flows over a **real local socket**, not a
-foreign-function call.
+(`--listen`, `/healthz` + `/readyz`, graceful shutdown), it can be embedded
+into Node, a second managed-runtime language, and Go with **low integration
+cost**, and the realtime transports keep working because traffic flows over
+a **real local socket**, not a foreign-function call.
 
 ## 3. Why this matters
 
 `ably-server`'s stated reason to exist is "drop-in Ably for local dev, CI,
 and self-hosting: the SDK doesn't change, only the endpoint does"
 ([README.md](README.md)). Embedding is the strongest form of that promise:
-if it is genuinely low-friction, `ably-server` becomes *installable
-realtime infrastructure* ("install a package and you have an Ably endpoint")
-— a real distribution wedge and a concrete data point for the wider
-build-vs-adapt question. The point of this PoC is to find out how good or
-bad that experience actually is, per ecosystem, before betting on it.
+if it is genuinely low-friction, `ably-server` becomes *installable realtime
+infrastructure* ("install a package and you have an Ably endpoint") — a real
+distribution wedge and a concrete data point for the wider build-vs-adapt
+question. The point of this PoC is to find out how good or bad that
+experience actually is, per ecosystem, before betting on it.
 
 ## 4. Scope
 
@@ -55,6 +63,8 @@ bad that experience actually is, per ecosystem, before betting on it.
 - **Integration model:** embedded **sidecar binary** supervised by the host
   process, with the host reverse-proxying realtime traffic to it. Use
   `memory` mode (zero external dependencies) for the PoC.
+- **Unmodified SDKs against a dedicated port.** No SDK changes. The host
+  points its Ably SDK at the embedded server by host + port.
 - **Functional proof:** an unmodified Ably SDK (`ably-js` for Node,
   `ably-go` for Go, the Ably .NET SDK for .NET) connects *through the host
   app* to the embedded server and performs pub/sub, history, and
@@ -62,6 +72,7 @@ bad that experience actually is, per ecosystem, before betting on it.
 
 ### Out of scope
 
+- Any SDK change, and any subpath / namespace mounting (deferred — see §6).
 - Production availability, multi-region, and `cluster`-mode scale testing
   (the PoC runs a single embedded node per app, in `memory` mode).
 - Presence, push, Spaces, Chat, LiveObjects (already out of `ably-server`
@@ -73,16 +84,16 @@ bad that experience actually is, per ecosystem, before betting on it.
 ## 5. The integration model (and why not FFI)
 
 Ship the **prebuilt binary inside the language package** and supervise it
-from the host process:
+from the host process. **No change to `ably-server` is required** — the PoC
+embeds the binary as built:
 
 1. **Resolve + spawn** the right per-platform binary on startup.
-2. **Discover its port** from the ready signal (it already supports
-   `--listen :0`; `run()` reports the bound address via `runOpts.Ready`,
-   see [cmd/ably-server/main.go](cmd/ably-server/main.go)).
-3. **Health-check** `/readyz` before routing traffic.
-4. **Reverse-proxy** a chosen route (or a dedicated port) to it, with
-   WebSocket upgrade support.
-5. **Supervise:** restart on crash; shut down gracefully with the app
+2. **Discover its port:** the supervisor picks a free TCP port and passes
+   `--listen 127.0.0.1:<port>`, then waits for `/readyz` to go green. (See
+   "deferred" below for a more robust ready-signal option.)
+3. **Reverse-proxy** the well-known endpoints (or a dedicated port) to it,
+   with WebSocket upgrade support.
+4. **Supervise:** restart on crash; shut down gracefully with the app
    (`--shutdown-grace`).
 
 **Why a child process and not a Go FFI binding.** The realtime transports
@@ -103,31 +114,40 @@ binary via PyPI platform wheels; `sqlite-jdbc` / `netty-tcnative` bundle
 per-OS natives in a Maven JAR and extract at runtime; NuGet uses
 `runtimes/<rid>/native/`.
 
-## 6. The routing constraint (`/ably` on the same origin)
+## 6. Routing decision (locked)
 
-Confirmed against `ably-js` 2.22.1 source: the SDK builds **root-rooted
-URLs** and has **no base-path option**. REST is `https://<host>:<port>/...`
-(`baseclient.ts` `baseUri`), the WebSocket transport connects to
-`wss://<host>:<port>/` (`websockettransport.ts`), and the comet fallback
-uses a hardcoded `/comet/...` (`comettransport.ts`). The configurable knobs
-are `endpoint` / `restHost` / `realtimeHost` / `port` / `tlsPort` /
-`fallbackHosts` — host and port only.
+**Decision:** the host app routes the **standard, well-known Ably endpoints**
+to the embedded server on a **dedicated port** (or subdomain), and the PoC
+makes **no change to the Ably SDKs**.
 
-So an **unmodified SDK cannot be pointed at `app.example.com/ably/...`**.
-Options:
+**Why.** Confirmed against `ably-js` 2.22.1 source: the SDK builds
+root-rooted URLs and has **no base-path option**. REST is
+`https://<host>:<port>/...` (`baseclient.ts` `baseUri`), WebSocket connects
+to `wss://<host>:<port>/` (`websockettransport.ts`), and comet uses a
+hardcoded `/comet/...` (`comettransport.ts`). The configurable knobs are
+`endpoint` / `restHost` / `realtimeHost` / `port` / `tlsPort` only. A
+same-origin subpath is therefore impossible with a stock SDK today, and
+forcing it would mean shipping a forked SDK — which defeats the "unmodified
+SDK" point of the whole exercise.
 
-| Routing | Works with stock SDK? | How | Trade-off |
-|---|---|---|---|
-| **Dedicated port** | ✅ today | App on 443, server on e.g. 8443; SDK `{ host, port: 8443, tls }` | Still one deployable / one supervisor, just not one port |
-| **Subdomain** | ✅ today | `realtime.example.com` → server; SDK `endpoint`/`*Host` | Cleanest for TLS/CDN; one DNS record |
-| **Same-origin `/ably`** | ⚠️ needs small SDK feature | Server: wrap the mux in `http.StripPrefix("/ably", …)` (trivial; it switches on root paths). Client: add a `basePath` option | The only option needing a code change |
+So the host points its SDK at the embedded server by host + port, e.g.:
 
-The server side of same-origin is a one-liner here. The client side is a
-**small, additive** SDK feature: thread a `basePath` through the 3 URI
-builders plus `ClientOptions` (~3 call sites + 1 type per SDK), opt-in and
-non-breaking. **The PoC uses a dedicated port** by default; an optional
-stretch milestone spikes `basePath` in `ably-js` to demonstrate true
-same-origin `/ably` end-to-end and to size the SDK change for real.
+```js
+// ably-js
+new Ably.Realtime({
+  key,
+  restHost: '127.0.0.1', realtimeHost: '127.0.0.1',
+  port: embeddedPort, tls: false,
+});
+```
+
+**Deferred (future, explicitly NOT in this PoC):** add an opt-in `basePath`
+option to the SDKs — a small, additive change threading it through the three
+URI builders plus `ClientOptions` (~3 call sites + 1 type per SDK) — then
+mount the server under a namespace such as `/ably` on the host's main
+origin. The server side is already trivial (wrap the mux in
+`http.StripPrefix("/ably", …)`). We prove the model first with unmodified
+SDKs; the subpath ergonomics come later, SDK-side.
 
 ## 7. What we measure: the trade-off framework
 
@@ -146,61 +166,129 @@ recorded metrics and a method — no hand-waving.
 **Bracket the spectrum with two baselines** so the numbers mean something:
 
 - **Floor (do-nothing):** point the SDK straight at a standalone
-  `ably-server` binary / container. Isolates the *embedding* cost from the
-  server itself.
-- **Ceiling (best case):** Go in-process mount. Shows the lower bound on
-  glue and overhead that the managed-runtime languages are measured against.
+  `ably-server` binary. Isolates the *embedding* cost from the server itself.
+- **Ceiling (best case):** Go in-process mount. Shows the lower bound on glue
+  and overhead that the managed-runtime languages are measured against.
 
-## 8. Method and milestones
+## 8. Execution guide and milestones
 
-- **M0 — Harness + baselines.** A shared, language-agnostic conformance
-  script (publish, subscribe, history, resume-after-drop) runnable against
-  any endpoint. Run it against a plain `ably-server` binary to set the floor
-  numbers. **Confirm transport coverage first:** the server today exposes
-  WebSocket at `GET /` and REST; verify whether a non-WebSocket fallback
-  (comet/SSE) exists, because the "mixed transport" reliability leg depends
-  on it. If absent, either scope the reliability test to WebSocket + REST or
-  raise a server task.
-- **M1 — Embedding affordances.** Confirm/extend the hooks an embedder
-  needs: a `--base-path` flag that wraps the mux in `http.StripPrefix`; a
-  machine-readable ready signal a parent can read without scraping logs
-  (e.g. the bound address as a JSON line on stdout, building on
-  `runOpts.Ready`); confirm `/readyz` semantics. (Backlog tasks.)
-- **M2 — Go in-process embed (ceiling).** Mount the handler under `/ably` in
-  a tiny Go app; run the harness; record metrics.
-- **M3 — Node package (primary).** A local `@ably/embedded-server`-style
-  package: per-platform binary resolution, spawn/supervise, and an
-  Express + Fastify middleware that proxies with WebSocket support. Run the
-  harness through it; record metrics.
-- **M4 — Second language: .NET + YARP.** A local NuGet-style package,
-  `Process` supervision, a YARP route with WebSocket proxying and path
-  transform. Run the harness; record metrics.
-- **M5 — (stretch) `basePath` SDK spike.** Implement `basePath` in `ably-js`
-  and demonstrate same-origin `/ably` end-to-end; size the change across the
-  SDK family.
-- **M6 — Measure + write up.** Fill the trade-off matrix with measured
-  numbers for Node, .NET, and Go; deliver a recommendation.
+**This brief is self-contained.** An agent started inside this repo and
+pointed at this file needs no prior conversation. Work on the
+`embedding-poc` branch.
+
+### Prerequisites (toolchains the session needs)
+
+- **Go 1.25+** — build/run `ably-server`; the Go track.
+- **Node 20+** and a package manager (npm/pnpm) — the Node track.
+- **.NET SDK 8+** — the .NET track.
+- **Network access** for npm/NuGet and to fetch the public Ably SDKs
+  (`ably-js`, Ably .NET, `ably-go`).
+- **No database, no external services** (the PoC uses `memory` mode).
+- Optional: the **Backlog.md CLI** (`backlog`) to track tasks the repo's
+  way; install with `npm i -g backlog.md` if absent, or execute the
+  milestones directly and track via commits.
+
+### Working layout
+
+Put all PoC code under `experiments/embedding/` so the tracks do not
+collide (this matters for running them in parallel):
+
+```
+experiments/embedding/
+  harness/   # language-agnostic conformance scenarios (pub/sub, history, resume) + runner
+  go/        # M1 Go in-process embed (inside this module — can import internal/)
+  node/      # M2 Node package + example app
+  dotnet/    # M3 .NET + YARP package + example app
+  RESULTS.md # M4 output: the filled trade-off matrix + recommendation
+```
+
+Add a `.gitignore` for `node_modules/`, `bin/`, `obj/`, and any downloaded
+binaries. The Go track lives inside the module (`github.com/ably/ably-server`)
+so it can import `internal/...`; keep it from perturbing the main module's
+`go test ./...` (build tag or a clearly separate package).
+
+### Kickoff
+
+The repo tracks work with Backlog.md ([backlog/AGENT_GUIDELINES.md](backlog/AGENT_GUIDELINES.md)).
+First action: create the milestone tasks via the CLI (commands in §11). Set
+each task In Progress and assign it when you start; check acceptance
+criteria as you go; add a Final Summary when done. If the CLI is
+unavailable, proceed and track progress in atomic per-milestone commits.
+
+### Dependency graph and parallelization
+
+```
+M0  harness + baseline ──┬──►  M1  Go embed   ─┐
+   (only hard prereq)    ├──►  M2  Node        ─┼──►  M4  measure + write up
+                         └──►  M3  .NET + YARP ─┘     (barrier: needs all 3)
+```
+
+**M0 is the only hard prerequisite.** M1, M2 and M3 are independent (separate
+directories, separate stacks) and **should run in parallel** — one subagent
+or git worktree per track. M4 is the join point: it needs all three tracks'
+measured numbers.
+
+### Milestones
+
+- **M0 — Harness + baseline.** Build a conformance harness (publish,
+  subscribe, history, resume-after-drop) runnable against any endpoint by
+  host+port. Run it against a plain binary to set the floor:
+  `ABLY_SERVER_API_KEY=app.key:secret go run ./cmd/ably-server --mode memory --listen :8080`.
+  **Confirm transport coverage first:** the server exposes WebSocket at
+  `GET /` and REST; verify whether a non-WebSocket fallback (comet/SSE)
+  exists. If not, scope the cross-transport reliability leg to
+  WebSocket + REST (and optionally raise a server task). No server change is
+  needed: the supervisor picks a free port and passes `--listen`, then polls
+  `/readyz`.
+- **M1 — Go in-process embed (ceiling; parallel).** In
+  `experiments/embedding/go`, a tiny Go app that wires the same
+  manager/handlers as [cmd/ably-server/main.go](cmd/ably-server/main.go) and
+  mounts them **in-process** (no child process), then runs the harness.
+  Establishes the DX/overhead lower bound.
+- **M2 — Node package (primary; parallel).** In `experiments/embedding/node`,
+  a local package that resolves + spawns the prebuilt binary (free port +
+  `--listen`, health-check `/readyz`, restart-on-crash, shutdown with the
+  app), plus **Express and Fastify** middleware that reverse-proxy to it with
+  WebSocket support. Example app + harness run + recorded metrics.
+- **M3 — .NET + YARP (second; parallel).** In `experiments/embedding/dotnet`,
+  a local package, `Process` supervision, and a **YARP** route with
+  WebSocket proxying. Example app + harness run + recorded metrics.
+- **M4 — Measure + write up (barrier).** Fill the §7 trade-off matrix with
+  **measured** numbers for Go, Node and .NET in
+  `experiments/embedding/RESULTS.md`; deliver a clear recommendation.
+
+**Deferred (not in this PoC):** a machine-readable ready-line on stdout for
+more robust port discovery; and the `basePath` SDK feature + same-origin
+`/ably` namespace (§6).
+
+### Quality bar
+
+- Each track's harness run must **actually pass** (pub/sub + history + resume
+  through the host app) — capture real output; do not assume or fake.
+- Record **measured** numbers, not estimates.
+- Fault-injection (`kill -9`, `SIGTERM`, mid-stream drop) must be **run**,
+  not described.
+- Atomic commit per milestone. Do not push to `ably/server` or open a PR
+  without the owner's go-ahead.
 
 ## 9. Success criteria
 
-- The harness passes (pub/sub + history + resume) **through the host app**
-  in Node, .NET, and Go, over WebSocket (and a non-WebSocket path where the
+- The harness passes (pub/sub + history + resume) **through the host app** in
+  Node, .NET and Go, over WebSocket (and a non-WebSocket path where the
   server supports one).
 - The embedded server survives `kill -9` and is auto-restarted; the host app
   survives a server crash; graceful shutdown is clean.
-- The trade-off matrix (§7) is filled with **measured** numbers, not
-  estimates, for all six dimensions across the three languages.
+- `RESULTS.md` contains the §7 matrix filled with **measured** numbers for
+  all six dimensions across the three languages.
 - A clear recommendation: is embedded distribution worth productising, for
   which ecosystems, and what (if anything) must change in `ably-server` or
-  the SDKs (notably `basePath`).
+  the SDKs later (notably `basePath` for same-origin mounting).
 
 ## 10. Risks and open questions
 
-- **Same-origin `/ably` needs an SDK change.** Accept dedicated-port for the
-  PoC, or invest in the `basePath` spike (M5)? Decision needed early.
 - **Binary distribution overhead.** Go binaries are ~10–20 MB; per-platform
   packages multiply registry footprint. macOS Gatekeeper notarisation and
-  code-signing on Windows are real productisation costs. Measure size; flag
+  Windows code-signing are real productisation costs. Measure size; flag
   signing as out-of-PoC but on the cost ledger.
 - **Single embedded node = no shared state.** Two app instances each embed
   their own `memory`-mode node and will not see each other's channels.
@@ -212,26 +300,31 @@ recorded metrics and a method — no hand-waving.
 - **Transport parity.** If `ably-server` lacks a comet/SSE fallback, the
   cross-transport reliability claim is limited to WebSocket; confirm in M0.
 
-## 11. Proposed Backlog.md tasks
+## 11. Kickoff tasks (Backlog.md)
 
-The Backlog.md CLI is the source of truth for tasks (see
-[backlog/AGENT_GUIDELINES.md](backlog/AGENT_GUIDELINES.md)); these are not
-yet created because the CLI is not installed in this environment. Seed them
-with (titles indicative):
+The Backlog.md CLI is the source of truth for tasks
+([backlog/AGENT_GUIDELINES.md](backlog/AGENT_GUIDELINES.md)). Create these at
+kickoff (titles indicative; M1–M3 can be worked in parallel):
 
 ```sh
-backlog task create "Add --base-path flag mounting the mux under a path prefix (http.StripPrefix)" \
-  -d "Let an embedder mount the server under e.g. /ably; switch on root paths after stripping." \
-  --ac "GET /ably/ upgrades to WebSocket" --ac "REST under /ably/channels/... works" \
-  --ac "default (no --base-path) behaviour unchanged"
-backlog task create "Emit a machine-readable ready signal (bound addr as JSON on stdout)" \
-  -d "A supervising parent process can read the ephemeral port without scraping logs; builds on runOpts.Ready."
-backlog task create "Embedding conformance harness (publish/subscribe/history/resume) runnable against any endpoint" \
-  --ac "passes against a standalone ably-server binary (baseline)"
-backlog task create "Go in-process embed example + harness run (DX ceiling)"
-backlog task create "Node embedded-server package: binary resolution + supervise + Express/Fastify WS proxy"
-backlog task create "Second language (.NET + YARP) embedded-server package + harness run"
-backlog task create "Fill the embedding trade-off matrix with measured numbers + recommendation"
+backlog task create "Embedding conformance harness (pub/sub, history, resume) runnable against any host:port" \
+  -d "Language-agnostic scenarios + runner. Baseline run against a standalone ably-server binary." \
+  --ac "harness drives publish, subscribe, history and resume-after-drop" \
+  --ac "passes against a plain ably-server --mode memory binary (baseline numbers recorded)" \
+  --ac "confirms whether a non-WebSocket transport exists; scopes reliability leg accordingly"
+backlog task create "M1: Go in-process embed example + harness run (DX ceiling)" \
+  --ac "ably-server handlers mounted in-process in a tiny Go app (no child process)" \
+  --ac "harness passes through it; metrics recorded"
+backlog task create "M2: Node embedded-server package: binary resolve+supervise + Express/Fastify WS proxy" \
+  --ac "spawns binary on a free port, health-checks /readyz, restarts on crash, shuts down with app" \
+  --ac "Express and Fastify middleware proxy realtime traffic incl. WebSocket" \
+  --ac "harness passes through an example Node app; metrics recorded"
+backlog task create "M3: .NET + YARP embedded-server package + harness run" \
+  --ac "Process supervision + YARP route with WebSocket proxying" \
+  --ac "harness passes through an example .NET app; metrics recorded"
+backlog task create "M4: Fill the embedding trade-off matrix (RESULTS.md) + recommendation" \
+  --ac "all six dimensions measured for Go, Node and .NET" \
+  --ac "RESULTS.md states a clear go/no-go recommendation per ecosystem"
 ```
 
 ## 12. References
