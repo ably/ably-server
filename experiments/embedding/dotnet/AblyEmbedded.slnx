@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/examples/">
+    <Project Path="examples/ExampleApp/ExampleApp.csproj" />
+    <Project Path="examples/SdkSmoke/SdkSmoke.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Ably.Embedded/Ably.Embedded.csproj" />
+  </Folder>
+</Solution>

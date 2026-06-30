@@ -1,0 +1,1 @@
+{"pass":true,"connectMs":98,"roundTripMs":27,"historyCount":1,"channel":"dotnet-sdk-smoke-e10d893cfaa54458bbe16547ea67e869","restFinding":"basic-auth REST over http blocked by SDK (EnsureSecureConnection); no ClientOptions opt-out; token-auth REST over http works through YARP"}
