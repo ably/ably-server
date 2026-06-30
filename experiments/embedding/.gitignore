@@ -1,0 +1,22 @@
+# Build outputs and downloaded/extracted binaries
+bin/
+obj/
+dist/
+*.exe
+ably-server
+ably-server-bin
+
+# Node
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+*.tsbuildinfo
+
+# .NET
+**/bin/
+**/obj/
+*.user
+
+# Harness artifacts (the built binary; raw measured reports under results/ ARE tracked)
+harness/harness
+*.out
