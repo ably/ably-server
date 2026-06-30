@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Ably.Embedded: the integration glue a host-app developer consumes.
+    It supervises the prebuilt ably-server binary as a child process and
+    exposes a YARP wiring helper so the host can reverse-proxy realtime
+    (WebSocket) + REST traffic to it on a dedicated port.
+
+    Targets net8.0 for portability (the PoC brief requires .NET 8+); it
+    builds and runs against any installed runtime >= 8. On this machine
+    only the net10.0 shared framework is installed, so the example app and
+    smoke test target net10.0 (see their csproj + NOTES.md). The library
+    itself uses no APIs newer than net8.0.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- YARP: the in-process reverse proxy with first-class WebSocket support. -->
+    <PackageReference Include="Yarp.ReverseProxy" Version="2.3.0" />
+  </ItemGroup>
+
+</Project>

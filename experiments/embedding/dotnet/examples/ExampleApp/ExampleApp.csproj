@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <!--
+    Minimal ASP.NET host that embeds ably-server behind YARP. Targets
+    net10.0 because that is the only .NET runtime installed on this PoC
+    machine; the Ably.Embedded library it references targets net8.0 and is
+    runtime-compatible with .NET 8+.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Ably.Embedded\Ably.Embedded.csproj" />
+  </ItemGroup>
+
+</Project>
