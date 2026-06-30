@@ -1,0 +1,1 @@
+{"label":"node-fastify-postkill","endpoint":"127.0.0.1:8556","pass":true,"startedAt":"2026-06-30T20:54:05+02:00","wallMs":6.76,"scenarios":[{"name":"connect","pass":true,"durationMs":1.202,"metrics":{"connectMs":1.18}},{"name":"pubsub","pass":true,"durationMs":5.442,"metrics":{"maxMs":0.21,"meanMs":0.17,"minMs":0.15,"p50Ms":0.17,"p99Ms":0.21,"samples":20}}]}

@@ -1,0 +1,36 @@
+{
+  "name": "@ably/embedded-server",
+  "version": "0.0.0-poc",
+  "private": true,
+  "description": "PoC: embed an ably-server child process in a Node host app and reverse-proxy realtime (WebSocket) + REST to it on a dedicated port. Express and Fastify adapters.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./express": "./src/express.js",
+    "./fastify": "./src/fastify.js",
+    "./supervise": "./src/supervise.js"
+  },
+  "main": "./src/index.js",
+  "bin": {
+    "ably-embedded-resolve": "./src/cli-resolve.js"
+  },
+  "scripts": {
+    "example:express": "node examples/express-app.js",
+    "example:fastify": "node examples/fastify-app.js",
+    "smoke": "node examples/ably-js-smoke.js"
+  },
+  "dependencies": {
+    "@fastify/http-proxy": "^11.3.0",
+    "fastify": "^5.2.0",
+    "http-proxy-middleware": "^3.0.5"
+  },
+  "devDependencies": {
+    "ably": "^2.6.0",
+    "express": "^4.21.0"
+  },
+  "//comment-packaging": "In a real package the prebuilt binary would ship via optionalDependencies keyed by os/cpu (esbuild precedent), e.g. @ably/embedded-server-darwin-arm64 -> bin/ably-server. For this PoC the binary is built locally into ./bin and resolved from there."
+}

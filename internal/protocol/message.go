@@ -68,24 +68,77 @@ type ChannelMessage struct {
 
 // ProtocolMessage is one frame on the realtime WebSocket connection.
 type ProtocolMessage struct {
-	Action        Action             `json:"action"                  msgpack:"action"`
-	ID            string             `json:"id,omitempty"            msgpack:"id,omitempty"`
-	ConnectionID  string             `json:"connectionId,omitempty"  msgpack:"connectionId,omitempty"`
-	Channel       string             `json:"channel,omitempty"       msgpack:"channel,omitempty"`
-	ChannelSerial string             `json:"channelSerial,omitempty" msgpack:"channelSerial,omitempty"`
-	MsgSerial     int64              `json:"msgSerial,omitempty"     msgpack:"msgSerial,omitempty"`
-	Timestamp     int64              `json:"timestamp,omitempty"     msgpack:"timestamp,omitempty"`
-	Count         int                `json:"count,omitempty"         msgpack:"count,omitempty"`
+	Action        Action `json:"action"                  msgpack:"action"`
+	ID            string `json:"id,omitempty"            msgpack:"id,omitempty"`
+	ConnectionID  string `json:"connectionId,omitempty"  msgpack:"connectionId,omitempty"`
+	Channel       string `json:"channel,omitempty"       msgpack:"channel,omitempty"`
+	ChannelSerial string `json:"channelSerial,omitempty" msgpack:"channelSerial,omitempty"`
+	// MsgSerial is the publisher's per-connection message serial and the
+	// correlation key for ACK/NACK frames. It is a pointer so a meaningful
+	// zero serialises while an absent serial (most frames, e.g. HEARTBEAT)
+	// is omitted: msgSerial is 0-based, so the FIRST publish on a connection
+	// carries msgSerial=0, and a plain `omitempty int64` would silently drop
+	// it from the ACK — leaving SDKs (e.g. ably-js) unable to correlate the
+	// ack to the pending publish and hanging the publish promise forever.
+	MsgSerial *int64 `json:"msgSerial,omitempty"     msgpack:"msgSerial,omitempty"`
+	Timestamp int64  `json:"timestamp,omitempty"     msgpack:"timestamp,omitempty"`
+	Count     int    `json:"count,omitempty"         msgpack:"count,omitempty"`
 	// Res carries the per-message publish results back to the publisher
 	// on an ACK (Ably's TR4s shape): one entry per message in the ack
 	// window, each holding the server-assigned serials. SDKs read it to
 	// populate publish/update results (DESIGN.md §8, §13.1).
-	Res           []*PublishResult   `json:"res,omitempty"           msgpack:"res,omitempty"`
-	Flags         int64              `json:"flags,omitempty"         msgpack:"flags,omitempty"`
-	Messages      []*Message         `json:"messages,omitempty"      msgpack:"messages,omitempty"`
-	Presence      []*PresenceMessage `json:"presence,omitempty"      msgpack:"presence,omitempty"`
-	Error         *ErrorInfo         `json:"error,omitempty"         msgpack:"error,omitempty"`
-	Params        map[string]string  `json:"params,omitempty"        msgpack:"params,omitempty"`
+	Res      []*PublishResult   `json:"res,omitempty"           msgpack:"res,omitempty"`
+	Flags    int64              `json:"flags,omitempty"         msgpack:"flags,omitempty"`
+	Messages []*Message         `json:"messages,omitempty"      msgpack:"messages,omitempty"`
+	Presence []*PresenceMessage `json:"presence,omitempty"      msgpack:"presence,omitempty"`
+	Error    *ErrorInfo         `json:"error,omitempty"         msgpack:"error,omitempty"`
+	Params   map[string]string  `json:"params,omitempty"        msgpack:"params,omitempty"`
+	// ConnectionDetails is carried on the CONNECTED frame (Ably CD2). Some
+	// SDKs (notably ably-js) treat a CONNECTED without connectionDetails as
+	// a protocol error and refuse the connection, so it must always be
+	// present on CONNECTED.
+	ConnectionDetails *ConnectionDetails `json:"connectionDetails,omitempty" msgpack:"connectionDetails,omitempty"`
+}
+
+// ConnectionDetails carries per-connection limits and identity on the
+// CONNECTED frame (Ably CD2). The server emits it so SDKs can configure
+// their idle/heartbeat timers and surface the connection identity.
+type ConnectionDetails struct {
+	// ClientID is the resolved client identity for the connection ("" when
+	// anonymous). Wildcard ("*") credentials resolve per-publish, so the
+	// connection-level clientId is left empty in that case.
+	ClientID string `json:"clientId,omitempty" msgpack:"clientId,omitempty"`
+	// ConnectionKey names the connection for recovery/transfer (Ably CD2c).
+	ConnectionKey string `json:"connectionKey,omitempty" msgpack:"connectionKey,omitempty"`
+	// MaxMessageSize is the largest single message the server accepts, in
+	// bytes (Ably CD2d).
+	MaxMessageSize int64 `json:"maxMessageSize,omitempty" msgpack:"maxMessageSize,omitempty"`
+	// MaxFrameSize is the largest protocol frame the server accepts, in
+	// bytes (Ably CD2e).
+	MaxFrameSize int64 `json:"maxFrameSize,omitempty" msgpack:"maxFrameSize,omitempty"`
+	// ConnectionStateTTL is how long the server retains connection state
+	// for a resume after an ungraceful disconnect, in milliseconds (CD2f).
+	ConnectionStateTTL int64 `json:"connectionStateTtl,omitempty" msgpack:"connectionStateTtl,omitempty"`
+	// MaxIdleInterval is the maximum time the server will allow to elapse
+	// between activity (frames/heartbeats) before it considers the
+	// connection idle, in milliseconds (CD2h). SDKs derive their inactivity
+	// timer from this.
+	MaxIdleInterval int64 `json:"maxIdleInterval,omitempty" msgpack:"maxIdleInterval,omitempty"`
+}
+
+// Int64 returns a pointer to v. It is a convenience for setting optional
+// pointer fields such as ProtocolMessage.MsgSerial, where a meaningful zero
+// must serialise (so it cannot be a plain omitempty value field).
+func Int64(v int64) *int64 { return &v }
+
+// MsgSerialValue returns the frame's MsgSerial, or 0 if unset. Inbound
+// frames from SDKs always carry msgSerial (it is 0-based), but a defensive
+// default keeps a malformed frame from panicking.
+func (m *ProtocolMessage) MsgSerialValue() int64 {
+	if m == nil || m.MsgSerial == nil {
+		return 0
+	}
+	return *m.MsgSerial
 }
 
 // PublishResult is one entry in an ACK's Res array (Ably's TR4s): the
