@@ -61,11 +61,20 @@ It's an on-ramp. It is explicitly *not* meant to be a robust, at-scale
 production service. That distinction matters, because it answers the obvious
 objections:
 
-- **Serverless and edge are out as an embed target.** Even where the platform
-  now supports WebSockets (Vercel does, on Fluid compute; Netlify still
-  doesn't), the function instance is ephemeral, duration-capped and autoscaled,
-  not the long-lived single process the embed assumes. That's fine, it's not
-  the use case. You point the SDK at a long-lived server or the cloud instead.
+- **Serverless and edge are out as an embed target, and this one's worth being
+  precise about because it's changed.** Vercel Functions now support
+  WebSockets and Socket.IO (on Fluid compute), and could even bundle and spawn
+  the binary; Netlify Functions still don't hold persistent WebSockets. But
+  WebSockets were never the real blocker. A function instance is ephemeral,
+  duration-capped (connections drop at the 800s/1800s limit) and autoscaled,
+  so an embedded server would reset and fragment into isolated nodes across
+  instances, which is why Vercel itself tells you to keep shared state in an
+  external store. That a WebSocket-capable serverless platform still doesn't
+  fit the embed is the clearest proof of where this belongs: the embed's home
+  is a long-lived host (a container, a VM, a dev machine, a desktop app), and
+  scale belongs on the cloud. On serverless you point the SDK at a long-lived
+  ably-server or Ably cloud, which isn't embedding. Detail and sources are in
+  [USING.md](USING.md) and [RESULTS.md](RESULTS.md).
 - **Scale is the upgrade, not the job.** A single embedded node in memory mode
   is one isolated Ably. ably-server *does* scale, that's the design: stateless
   nodes in front of a shared Postgres (`cluster` mode), and it works. But the
