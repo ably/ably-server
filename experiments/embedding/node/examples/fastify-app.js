@@ -2,14 +2,22 @@
 //
 // Run:
 //   ABLY_PUBLIC_PORT=8542 node examples/fastify-app.js
+//   # subpath mount: ABLY_MOUNT=/ably ABLY_PUBLIC_PORT=8542 node examples/fastify-app.js
 //
 // Then point an unmodified ably-js SDK at 127.0.0.1:<ABLY_PUBLIC_PORT> (tls:false).
+// Browser demo is served at /demo/.
 
+import path from 'node:path';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import Fastify from 'fastify';
 import { startEmbeddedServer } from '../src/index.js';
 import { registerAblyProxy } from '../src/fastify.js';
 
 const PORT = Number(process.env.ABLY_PUBLIC_PORT ?? 8542);
+const MOUNT = process.env.ABLY_MOUNT ?? '/';
+const DEMO_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'demo');
+const demoHtml = readFileSync(path.join(DEMO_DIR, 'index.html'), 'utf8');
 
 const supervisor = await startEmbeddedServer({
   apiKey: process.env.ABLY_SERVER_API_KEY ?? 'app.key:secret',
@@ -22,10 +30,17 @@ supervisor.on('ready', (port) => console.log(`[fastify-app] embedded server (re)
 // forceCloseConnections drops lingering keep-alive/WS sockets on close() so
 // a SIGTERM shutdown completes promptly instead of hanging on open sockets.
 const fastify = Fastify({ forceCloseConnections: true });
-await registerAblyProxy(fastify, { supervisor });
+// The host app's own routes (registered before the proxy so they win):
+// the browser demo, and a home page when Ably is under a subpath.
+fastify.get('/demo', (_req, reply) => reply.type('text/html').send(demoHtml));
+fastify.get('/demo/', (_req, reply) => reply.type('text/html').send(demoHtml));
+if (MOUNT !== '/') {
+  fastify.get('/', (_req, reply) => reply.type('text/plain').send(`host app home — Ably is embedded under ${MOUNT}/`));
+}
+await registerAblyProxy(fastify, { supervisor, mountPath: MOUNT });
 
 await fastify.listen({ port: PORT, host: '0.0.0.0' });
-console.log(`[fastify-app] listening on http://127.0.0.1:${PORT} (proxying to embedded ably-server)`);
+console.log(`[fastify-app] listening on http://127.0.0.1:${PORT} — Ably under ${MOUNT}, demo at /demo/`);
 
 // --- graceful shutdown: stop the app AND the child (no orphan) ---
 let shuttingDown = false;

@@ -46,4 +46,14 @@ public sealed class AblyServerOptions
 
     /// <summary>Delay before respawning after an unexpected exit.</summary>
     public TimeSpan RestartDelay { get; set; } = TimeSpan.FromMilliseconds(200);
+
+    /// <summary>
+    /// Public subpath to expose Ably under. Defaults to <c>/</c> (the
+    /// dedicated-port model — EMBEDDING-POC.md §6). Set to e.g. <c>/ably</c>
+    /// to mount it under a prefix alongside the host app's own routes; YARP
+    /// strips the prefix before forwarding, so the embedded server still sees
+    /// root-rooted paths. Note: stock Ably SDKs have no basePath option yet,
+    /// so a subpath is reachable by raw clients/the harness, not stock SDKs.
+    /// </summary>
+    public string MountPath { get; set; } = "/";
 }

@@ -2,14 +2,20 @@
 //
 // This is the glue a host-app developer writes. Run:
 //   ABLY_PUBLIC_PORT=8541 node examples/express-app.js
+//   # subpath mount: ABLY_MOUNT=/ably ABLY_PUBLIC_PORT=8541 node examples/express-app.js
 //
 // Then point an unmodified ably-js SDK at 127.0.0.1:<ABLY_PUBLIC_PORT> (tls:false).
+// Browser demo is served at /demo/.
 
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { startEmbeddedServer } from '../src/index.js';
 import { mountAblyProxy } from '../src/express.js';
 
 const PORT = Number(process.env.ABLY_PUBLIC_PORT ?? 8541);
+const MOUNT = process.env.ABLY_MOUNT ?? '/'; // '/' (dedicated port) or e.g. '/ably'
+const DEMO_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'demo');
 
 const supervisor = await startEmbeddedServer({
   apiKey: process.env.ABLY_SERVER_API_KEY ?? 'app.key:secret',
@@ -21,10 +27,16 @@ supervisor.on('restart', (n) => console.log(`[express-app] restarting embedded s
 supervisor.on('ready', (port) => console.log(`[express-app] embedded server (re)ready on internal port ${port} (pid ${supervisor.child?.pid})`));
 
 const app = express();
-const proxy = mountAblyProxy(app, { supervisor });
+// The host app's own routes: a browser demo, and (in subpath mode) a home page.
+app.use('/demo', express.static(DEMO_DIR));
+if (MOUNT !== '/') {
+  app.get('/', (_req, res) => res.type('text').send(`host app home — Ably is embedded under ${MOUNT}/`));
+}
+// Ably: catch-all at root, or only under MOUNT when a subpath is given.
+const proxy = mountAblyProxy(app, { supervisor, mountPath: MOUNT });
 
 const server = app.listen(PORT, () => {
-  console.log(`[express-app] listening on http://127.0.0.1:${PORT} (proxying to embedded ably-server)`);
+  console.log(`[express-app] listening on http://127.0.0.1:${PORT} — Ably under ${MOUNT}, demo at /demo/`);
 });
 server.on('upgrade', proxy.upgrade); // WebSocket upgrades bypass the Express stack
 

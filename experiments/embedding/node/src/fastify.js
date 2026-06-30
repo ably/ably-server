@@ -17,11 +17,16 @@ import fastifyHttpProxy from '@fastify/http-proxy';
  * @param {import('fastify').FastifyInstance} fastify
  * @param {object} opts
  * @param {{ port: number }} opts.supervisor the started supervisor
+ * @param {string} [opts.mountPath] subpath to expose Ably under (default '/').
+ *   '/ably' proxies only that prefix and strips it (rewritePrefix '/'), so the
+ *   host app keeps the rest of its routes.
  * @returns {Promise<void>}
  */
 export async function registerAblyProxy(fastify, opts) {
   const { supervisor } = opts;
   if (!supervisor) throw new Error('registerAblyProxy: opts.supervisor is required');
+
+  const mountPath = (opts.mountPath || '/').replace(/\/$/, '') || '/';
 
   await fastify.register(fastifyHttpProxy, {
     // The child's port is fixed for the life of a given child. @fastify/http-proxy
@@ -29,12 +34,12 @@ export async function registerAblyProxy(fastify, opts) {
     // internal port across crash-restarts (it reuses supervisor.port), so this
     // stays valid through a respawn.
     upstream: `http://127.0.0.1:${supervisor.port}`,
-    prefix: '/',
+    // prefix is the public mount point; rewritePrefix '/' strips it so the
+    // child sees root-rooted paths. @fastify/http-proxy applies this to the
+    // WebSocket upgrade too.
+    prefix: mountPath,
     rewritePrefix: '/',
     websocket: true,
-    // Preserve the request as-is; do not strip or rewrite the query string.
-    replyOptions: {
-      // keep original host header semantics simple for a dedicated port
-    },
+    replyOptions: {},
   });
 }

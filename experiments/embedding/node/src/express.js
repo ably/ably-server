@@ -21,12 +21,18 @@ import { createProxyMiddleware } from 'http-proxy-middleware';
  * @param {import('express').Express} app
  * @param {object} opts
  * @param {{ port: number }} opts.supervisor  the started supervisor (reads .port live)
+ * @param {string} [opts.mountPath]  subpath to expose Ably under (default '/').
+ *   When set (e.g. '/ably'), only that prefix is proxied and it is stripped
+ *   before reaching the child, so the host app keeps the rest of its routes.
  * @param {(msg:string)=>void} [opts.log]
  * @returns {{ middleware: import('express').RequestHandler, upgrade: Function }}
  */
 export function mountAblyProxy(app, opts) {
   const { supervisor } = opts;
   if (!supervisor) throw new Error('mountAblyProxy: opts.supervisor is required');
+
+  const mountPath = (opts.mountPath || '/').replace(/\/$/, '') || '/';
+  const subpath = mountPath !== '/';
 
   // router() is re-evaluated per request, so if the supervisor restarts the
   // child on a *new* port we still proxy to the live one.
@@ -36,6 +42,11 @@ export function mountAblyProxy(app, opts) {
     ws: true,
     // Faithfully forward; do not buffer the (streamed) WS frames.
     xfwd: false,
+    // Subpath mode: only proxy <mountPath>/* (HTTP and WS), and strip the
+    // prefix so the child — which serves /, /channels, … at its root — sees
+    // root-rooted paths. http-proxy-middleware applies both to WS upgrades.
+    pathFilter: subpath ? (path) => path === mountPath || path.startsWith(mountPath + '/') : undefined,
+    pathRewrite: subpath ? { ['^' + mountPath]: '' } : undefined,
     logger: opts.log ? { info: opts.log, warn: opts.log, error: opts.log } : undefined,
     on: {
       error(err, _req, res) {

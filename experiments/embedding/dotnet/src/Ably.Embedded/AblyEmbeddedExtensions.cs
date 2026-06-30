@@ -43,7 +43,7 @@ public static class AblyEmbeddedExtensions
         // port is known. Until then the destination is a placeholder; the
         // hosted service overwrites it with the real loopback address before
         // marking the app ready.
-        var provider = new InMemoryConfigProvider(BuildRoutes(), BuildClusters(destinationAddress: "http://127.0.0.1:1"));
+        var provider = new InMemoryConfigProvider(BuildRoutes(options.MountPath), BuildClusters(destinationAddress: "http://127.0.0.1:1"));
         services.AddSingleton(provider);
         services.AddSingleton<IProxyConfigProvider>(sp => sp.GetRequiredService<InMemoryConfigProvider>());
         services.AddReverseProxy();
@@ -63,18 +63,41 @@ public static class AblyEmbeddedExtensions
         return endpoints;
     }
 
-    private static IReadOnlyList<RouteConfig> BuildRoutes() =>
-    [
-        new RouteConfig
+    private static IReadOnlyList<RouteConfig> BuildRoutes(string mountPath)
+    {
+        var mount = mountPath.TrimEnd('/');
+        if (mount.Length == 0)
         {
-            RouteId = "ably-embedded",
-            ClusterId = "ably-embedded",
-            // Catch-all: dedicated-port model (EMBEDDING-POC.md §6) — every
+            // Dedicated-port model (EMBEDDING-POC.md §6): catch-all — every
             // path (WS upgrade at '/', REST under /channels, /keys, /time,
             // /healthz, /readyz) routes to the embedded server.
-            Match = new RouteMatch { Path = "/{**catch-all}" },
-        },
-    ];
+            return
+            [
+                new RouteConfig
+                {
+                    RouteId = "ably-embedded",
+                    ClusterId = "ably-embedded",
+                    Match = new RouteMatch { Path = "/{**catch-all}" },
+                },
+            ];
+        }
+        // Subpath model: match only <mount>/** and strip the prefix so the
+        // child sees root-rooted paths. PathRemovePrefix applies to the
+        // WebSocket upgrade too.
+        return
+        [
+            new RouteConfig
+            {
+                RouteId = "ably-embedded",
+                ClusterId = "ably-embedded",
+                Match = new RouteMatch { Path = mount + "/{**catch-all}" },
+                Transforms = new[]
+                {
+                    new Dictionary<string, string> { ["PathRemovePrefix"] = mount },
+                },
+            },
+        ];
+    }
 
     private static IReadOnlyList<ClusterConfig> BuildClusters(string destinationAddress) =>
     [
@@ -92,8 +115,8 @@ public static class AblyEmbeddedExtensions
     /// Rewrites the YARP cluster destination to the supervisor's actual
     /// loopback address. Called once the child port is known.
     /// </summary>
-    internal static void PointAt(this InMemoryConfigProvider provider, Uri baseAddress) =>
-        provider.Update(BuildRoutes(), BuildClusters(baseAddress.ToString()));
+    internal static void PointAt(this InMemoryConfigProvider provider, Uri baseAddress, string mountPath) =>
+        provider.Update(BuildRoutes(mountPath), BuildClusters(baseAddress.ToString()));
 
     /// <summary>
     /// Bridges the supervisor lifecycle into the host's hosted-service
@@ -102,13 +125,14 @@ public static class AblyEmbeddedExtensions
     private sealed class AblyEmbeddedHostedService(
         AblyServerSupervisor supervisor,
         InMemoryConfigProvider proxyConfig,
+        AblyServerOptions options,
         ILogger<AblyEmbeddedHostedService> logger) : IHostedService
     {
         public async Task StartAsync(CancellationToken cancellationToken)
         {
             await supervisor.StartAsync(cancellationToken).ConfigureAwait(false);
-            proxyConfig.PointAt(supervisor.BaseAddress);
-            logger.LogInformation("YARP now proxying to embedded ably-server at {Addr}", supervisor.BaseAddress);
+            proxyConfig.PointAt(supervisor.BaseAddress, options.MountPath);
+            logger.LogInformation("YARP now proxying to embedded ably-server at {Addr} (mount {Mount})", supervisor.BaseAddress, options.MountPath);
         }
 
         public async Task StopAsync(CancellationToken cancellationToken)
