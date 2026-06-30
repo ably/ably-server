@@ -228,6 +228,44 @@ suggests either is blocked.
    instance needs `cluster` mode (shared Postgres). The embed is explicitly
    single-node; this is the scale path, not a PoC gap.
 
+## Prior art — is this a hack, or precedent?
+
+Spawning and supervising a child binary and talking to it over localhost is a
+**mainstream, well-trodden pattern**, not a smell. It shows up in three
+established lineages:
+
+- **Ship a prebuilt native binary inside a language package** — esbuild, ruff,
+  swc, Biome, Prisma, Playwright (browsers), `sharp`, tree-sitter, Tailwind
+  standalone, `sentry-cli`, and Cloudflare's own `wrangler` (which bundles the
+  `workerd` runtime). Utterly normal in 2026.
+- **Spawn + supervise a real server process you talk to over localhost** —
+  `mongodb-memory-server`, `embedded-postgres` / `pg-embed`,
+  `redis-memory-server` (download + run + supervise + tear down a *real*
+  server binary); **Prisma**'s Node ORM supervising its Rust `query-engine`
+  binary for the app's lifetime; Playwright / Puppeteer / ChromeDriver /
+  Selenium (spawn a browser binary, talk CDP/WebDriver over a local port);
+  Testcontainers (spin up real dependencies, tear down); **dapr** (the sidecar
+  pattern productised — a companion process over localhost); local emulators
+  (Firebase Emulator Suite, Stripe CLI, LocalStack, MinIO, Azurite).
+- **Reverse-proxy to a colocated upstream** — Vite / CRA / Next dev-server
+  proxies, nginx, Caddy, YARP. Bread-and-butter.
+
+The honest counterpoint: the reactions people *dislike* are specific, and we
+can design them out — (1) **install-time binary downloads** (the
+`mongodb-memory-server` CI-flake / supply-chain reputation) → ship prebuilt
+platform packages instead, not postinstall downloads; (2) **orphaned/zombie
+children and shutdown ordering** (we hit and fixed exactly this) → the library
+owns supervision; (3) **extra process + deploy weight** → the Go in-process
+path removes it. The most instructive precedent is **Prisma**: it shipped this
+exact model at huge scale *and* invested heavily to move its engine
+**in-process** (Node-API, then a WASM/Rust-free direction) to cut cold-start
+and serverless friction — which both proves the pattern is legitimate and
+validates why our **Go in-process track is the ceiling**. Executed well
+(prebuilt packages, clean supervision, explicit single-instance/serverless
+boundaries, an in-process option where the language allows), developers who
+already use esbuild / Prisma / Playwright / Testcontainers will find this
+familiar, not smelly.
+
 ## Where it does NOT fit (decision boundary)
 
 Embedding assumes one long-lived process that owns a port and holds
