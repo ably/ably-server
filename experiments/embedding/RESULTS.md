@@ -7,12 +7,13 @@
 ## Bottom line
 
 **Embedding `ably-server` as a dependency of a non-Go web app works, and is
-low-friction in all three target ecosystems.** An unmodified Ably SDK
+low-friction across all four ecosystems.** An unmodified Ably SDK
 connects *through the host app* to an embedded server and does pub/sub,
 history, and resume-after-drop over a real local socket. The conformance
-harness passes 6/6 in **Go (in-process), Node (Express and Fastify), and
-.NET (YARP)**; the embedded server survives `kill -9` and is auto-restarted;
-graceful shutdown is clean with no orphaned process.
+harness passes 6/6 in **Go (in-process), Node (Express and Fastify), .NET
+(YARP), and Python (FastAPI/Starlette)**; the embedded server survives
+`kill -9` and is auto-restarted; graceful shutdown is clean with no orphaned
+process.
 
 Two caveats worth productising around, both surfaced by *running* it:
 
@@ -36,6 +37,7 @@ behind. See [§ Recommendation](#recommendation).
 | **Ceiling** (M1) | Go host imports the package, mounts the handler **in-process** | ably-go | [`go/`](go/) |
 | **Node** (M2) | Host supervises the binary as a child, **reverse-proxies** (Express + Fastify) | ably-go + **ably-js** | [`node/`](node/) |
 | **.NET** (M3) | Host supervises the binary as a child, **YARP** reverse-proxy | ably-go + **IO.Ably** | [`dotnet/`](dotnet/) |
+| **Python** (TASK-70) | Host supervises the binary as a child, **ASGI** reverse-proxy (FastAPI/Starlette) | ably-go + **ably-python** | [`python/`](python/) |
 
 The **conformance harness** ([`harness/`](harness/)) is one Go binary run
 against every track by host+port, so the numbers are apples-to-apples. Its
@@ -43,42 +45,43 @@ six scenarios — connect, pubsub (realtime round-trip), restpubsub (REST→WS),
 history, resume-after-drop, soak — use the unmodified `ably-go` SDK, except
 `resume`, which uses the raw wire protocol so the drop is deterministic and
 proxy-independent. Each managed-runtime track additionally runs a **native
-SDK smoke** (ably-js / IO.Ably) to prove that ecosystem's own SDK works
-through the proxy.
+SDK smoke** (ably-js / IO.Ably / ably-python) to prove that ecosystem's own
+SDK works through the proxy.
 
 Environment: macOS 15 (Darwin 25.5.0) arm64, Go 1.25.11, Node v24.11.0,
-.NET SDK 10.0.301, ably-go v1.4.0, ably-js 2.x, IO.Ably 1.2.18. `memory`
-mode (zero external dependencies). All loopback.
+.NET SDK 10.0.301, Python 3.14.5, ably-go v1.4.0, ably-js 2.x, IO.Ably
+1.2.18, ably-python 3.1.2. `memory` mode (zero external dependencies). All
+loopback.
 
 ## The trade-off matrix (§7)
 
-| Dimension | Floor (standalone) | Go in-process (ceiling) | Node (Express / Fastify) | .NET (YARP) |
-|---|---|---|---|---|
-| **Dev efficiency** — steps to first message | run 1 binary | **3** (import → mount handler → point SDK) | **4** (`npm i` → binary → ~8 lines → point SDK) | **3** from prebuilt (`dotnet build` → run → point SDK); ~1.6 s warm |
-| **DX** — integration glue | n/a | **~3 lines** (`New` + mount `Handler` + `Close`) | **~8 lines** (supervisor + proxy + WS `upgrade` wiring) | **~20 lines** (host builder + YARP route + supervisor) |
-| **DX** — new concepts | n/a | ~1 (it's an `http.Handler`) | ~2 (child process; wire WS `upgrade`) | ~2 (child process; YARP cluster destination) |
-| **DX** — idiomatic fit | n/a | native `net/http` | Express middleware / Fastify plugin | ASP.NET + YARP config |
-| **Portability** — binary | 15.5 MB standalone | **+9.1 MB compiled into the host binary**, any Go target, no extra toolchain | 15.5 MB prebuilt **per os/cpu**, no toolchain on user machine | 15.5 MB prebuilt + **.NET runtime**; NuGet `runtimes/<rid>` |
-| **Ease of use** — auto free-port | — | host owns the port | **yes** (supervisor; proxy reads it live) | **yes** (supervisor; injected into YARP) |
-| **Ease of use** — auto-shutdown with app | — | inherent (`defer Close`) | yes (SIGTERM handler) | yes (host lifetime) |
-| **Reliability** — harness 6/6 | **PASS** | **PASS** | **PASS / PASS** | **PASS** |
-| **Reliability** — server crash → auto-restart | n/a | **N/A** (no child) | **yes** (kill -9 → respawn → harness passes) | **yes** (kill -9 → respawn → harness passes) |
-| **Reliability** — graceful shutdown | n/a | clean (exit 0) | clean (exit 0, ~0.1 s, no orphan) | clean (exit 0, no orphan) |
-| **Complexity** — processes | 1 | **1** | 2 | 2 |
-| **Complexity** — failure blast radius | n/a | **shared** (in-process) | **isolated** (child) | **isolated** (child) |
-| **Native SDK through host** | — | ably-go | **ably-js ✓** (after the 2 server fixes) | **IO.Ably realtime ✓**; key-auth REST-over-HTTP ✗ |
+| Dimension | Floor (standalone) | Go in-process (ceiling) | Node (Express / Fastify) | .NET (YARP) | Python (FastAPI) |
+|---|---|---|---|---|---|
+| **Dev efficiency** — steps to first message | run 1 binary | **3** (import → mount handler → point SDK) | **4** (`npm i` → binary → ~8 lines → point SDK) | **3** from prebuilt (`dotnet build` → run → point SDK); ~1.6 s warm | **4** (venv+pip → binary → ~20 lines → point SDK) |
+| **DX** — integration glue | n/a | **~3 lines** (`New` + mount `Handler` + `Close`) | **~8 lines** (supervisor + proxy + WS `upgrade` wiring) | **~20 lines** (host builder + YARP route + supervisor) | **~20 lines** (lifespan supervisor + `make_proxy_app` + ASGI fall-through) |
+| **DX** — new concepts | n/a | ~1 (it's an `http.Handler`) | ~2 (child process; wire WS `upgrade`) | ~2 (child process; YARP cluster destination) | ~2 (child process; ASGI fall-through routing) |
+| **DX** — idiomatic fit | n/a | native `net/http` | Express middleware / Fastify plugin | ASP.NET + YARP config | FastAPI/Starlette ASGI (WSGI can't do WS) |
+| **Portability** — binary | 15.5 MB standalone | **+9.1 MB compiled into the host binary**, any Go target, no extra toolchain | 15.5 MB prebuilt **per os/cpu**, no toolchain on user machine | 15.5 MB prebuilt + **.NET runtime**; NuGet `runtimes/<rid>` | 15.5 MB prebuilt + **Python runtime**; PyPI platform wheels |
+| **Ease of use** — auto free-port | — | host owns the port | **yes** (supervisor; proxy reads it live) | **yes** (supervisor; injected into YARP) | **yes** (supervisor; proxy reads it live) |
+| **Ease of use** — auto-shutdown with app | — | inherent (`defer Close`) | yes (SIGTERM handler) | yes (host lifetime) | yes (ASGI lifespan) |
+| **Reliability** — harness 6/6 | **PASS** | **PASS** | **PASS / PASS** | **PASS** | **PASS** |
+| **Reliability** — server crash → auto-restart | n/a | **N/A** (no child) | **yes** (kill -9 → respawn → harness passes) | **yes** (kill -9 → respawn → harness passes) | **yes** (kill -9 → respawn → harness passes) |
+| **Reliability** — graceful shutdown | n/a | clean (exit 0) | clean (exit 0, ~0.1 s, no orphan) | clean (exit 0, no orphan) | clean (exit 0, no orphan) |
+| **Complexity** — processes | 1 | **1** | 2 | 2 | 2 |
+| **Complexity** — failure blast radius | n/a | **shared** (in-process) | **isolated** (child) | **isolated** (child) | **isolated** (child) |
+| **Native SDK through host** | — | ably-go | **ably-js ✓** (after the 2 server fixes) | **IO.Ably realtime ✓**; key-auth REST-over-HTTP ✗ | **ably-python realtime ✓** (key auth, no token) |
 
 ### Measured conformance (all tracks, same harness)
 
-| Scenario | Floor | Go in-proc | Node Express | Node Fastify | .NET YARP |
-|---|---|---|---|---|---|
-| connect (ms) | 1.98 | 1.63 | 4.17 | 4.20 | 4.98–10.2 |
-| pubsub mean / p99 (ms) | 0.14 / 0.18 | 0.11 / 0.16 | 0.15 / 0.18 | 0.19 / 0.28 | 0.16–0.26 / 0.27–0.42 |
-| restpubsub mean (ms) | 0.32 | 0.29 | 0.67 | 1.97 | 0.47–0.64 |
-| history (10, ordered) | ✓ | ✓ | ✓ | ✓ | ✓ |
-| resume (RESUMED, lossless) | ✓ | ✓ | ✓ | ✓ | ✓ |
-| soak (200 msgs, loss / dupes) | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
-| soak throughput (msg/s) | ~2037 | ~2247 | ~1005 | ~542 | ~1800–2150 |
+| Scenario | Floor | Go in-proc | Node Express | Node Fastify | .NET YARP | Python FastAPI |
+|---|---|---|---|---|---|---|
+| connect (ms) | 1.98 | 1.63 | 4.17 | 4.20 | 4.98–10.2 | 7.34 |
+| pubsub mean / p99 (ms) | 0.14 / 0.18 | 0.11 / 0.16 | 0.15 / 0.18 | 0.19 / 0.28 | 0.16–0.26 / 0.27–0.42 | 0.37 / 0.47 |
+| restpubsub mean (ms) | 0.32 | 0.29 | 0.67 | 1.97 | 0.47–0.64 | 1.96 |
+| history (10, ordered) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| resume (RESUMED, lossless) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| soak (200 msgs, loss / dupes) | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| soak throughput (msg/s) | ~2037 | ~2247 | ~1005 | ~542 | ~1800–2150 | ~1114 |
 
 Reading the numbers: the embedding **proxy overhead is small** — single-digit
 millisecond connects and sub-millisecond pub/sub round-trips even through a
@@ -149,6 +152,7 @@ default is correct; what differs across SDKs is whether they give you a
 |---|---|---|
 | ably-go | refused by default (RSC18) | ✅ `WithInsecureAllowBasicAuthWithoutTLS()` |
 | ably-js | permissive (connects, warns) | n/a |
+| ably-python | permissive (key over the WS query string worked, no token) | n/a |
 | IO.Ably (.NET) | refused (`EnsureSecureConnection`) | ❌ none — the gap |
 
 The PoC's portable answer for non-TLS loopback is **token auth** (short-lived
@@ -212,9 +216,14 @@ suggests either is blocked.
   binary packaging** via `optionalDependencies` (the esbuild model) plus
   macOS notarisation / Windows signing.
 - **.NET — ship it, close behind.** YARP is the cleanest in-process WS proxy
-  of the three. Realtime works unmodified; document the IO.Ably
+  of the set. Realtime works unmodified; document the IO.Ably
   **key-auth-over-HTTP** limitation (use TLS or token auth). Packaging via
   NuGet `runtimes/<rid>/native`.
+- **Python — ship it for ASGI.** FastAPI/Starlette (any ASGI host) proxies
+  WS + REST cleanly; ably-python realtime works unmodified. **WSGI (Flask,
+  sync Django) cannot proxy the WS in-process** — REST-only, or front it with
+  an ASGI server / ingress. Packaging via PyPI platform wheels (the ruff
+  model).
 
 **What must change beyond this PoC:**
 1. Promote the two server fixes to mainline (TASK-68 `connectionDetails`,

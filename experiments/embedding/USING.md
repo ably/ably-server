@@ -37,7 +37,7 @@ to see it live.
 | **Node** (Express) | `cd experiments/embedding/node && npm i && ABLY_PUBLIC_PORT=8541 node examples/express-app.js` | `node examples/ably-js-smoke.js` (ABLY_PUBLIC_PORT=8541) — unmodified ably-js |
 | **Node** (Fastify) | `ABLY_PUBLIC_PORT=8542 node examples/fastify-app.js` | `experiments/embedding/harness/harness --port 8542 --label node` |
 | **.NET** (YARP) | `cd experiments/embedding/dotnet && dotnet run --project examples/ExampleApp -- --port 8561` | `dotnet run --project examples/SdkSmoke -- --port 8561` — unmodified IO.Ably |
-| **Python** (FastAPI) | `cd experiments/embedding/python && python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt && ABLY_PUBLIC_PORT=8581 uvicorn examples.fastapi_app:app --port 8581` | `python examples/ably_python_smoke.py` (ABLY_PUBLIC_PORT=8581) |
+| **Python** (FastAPI) | `cd experiments/embedding/python && go build -o bin/ably-server ../../../cmd/ably-server && python3 -m venv .venv && ./.venv/bin/pip install fastapi "uvicorn[standard]" websockets httpx ably && ABLY_PUBLIC_PORT=8581 ./.venv/bin/uvicorn examples.fastapi_app:app --port 8581` | `ABLY_PUBLIC_PORT=8581 ./.venv/bin/python examples/ably_python_smoke.py` — unmodified ably-python |
 
 (The harness binary is built once with
 `go build -o experiments/embedding/harness/harness ./experiments/embedding/harness`.)
@@ -209,19 +209,29 @@ app.Run();
 
 ### Python — FastAPI/Starlette (ASGI)
 
-> Status: the Python track is being finalised on branch `embed-poc-py` and
-> merges into this branch shortly; the snippet below is its intended shape.
-
 ```python
-from ably_embedded import lifespan, mount_ably          # supervisor + ASGI proxy
-app = FastAPI(lifespan=lifespan)
-mount_ably(app)                                          # WS + REST reverse proxy
-# uvicorn examples.fastapi_app:app --port 8581
+from ably_embedded import AblyServerSupervisor, make_proxy_app
+
+supervisor = AblyServerSupervisor(api_key="app.key:secret")
+proxy = make_proxy_app(supervisor, base_path="")     # catch-all ASGI reverse-proxy
+
+@asynccontextmanager
+async def lifespan(app):
+    await supervisor.start()                          # spawn child + /readyz gate
+    yield
+    await supervisor.stop()                           # SIGTERM the child, no orphan
+
+# FastAPI serves your routes (and /demo/); `proxy` is the fall-through ASGI app
+# for Ably traffic (WS + REST). See examples/fastapi_app.py for the ~20-line wiring.
+# Run: uvicorn examples.fastapi_app:app --port 8581   (ABLY_BASE_PATH=/ably for subpath)
 ```
 A WSGI framework (Flask, classic Django) can reverse-proxy REST but **not
-WebSockets in-process** — WS needs an ASGI server (uvicorn/hypercorn) or an
-ingress (nginx/Traefik). Use FastAPI/Starlette/aiohttp/async-Django for the
-full embed; see [python/NOTES.md](python/NOTES.md).
+WebSockets in-process** — WSGI has no socket-hijack hook, so the WS upgrade
+returns 400 (`examples/flask_app.py` demonstrates REST-200 / WS-400). Use
+FastAPI/Starlette/Quart/async-Django for the full embed; see
+[python/NOTES.md](python/NOTES.md). Note: ably-python ignores the
+`ClientOptions` port on its WS transport — fold `host:port` into
+`realtime_host` (e.g. `realtime_host="127.0.0.1:8581"`, `tls=False`).
 *Production:* ship the binary in a **PyPI platform wheel** (the ruff
 precedent); `pip install` pulls the right wheel for the OS/arch.
 
