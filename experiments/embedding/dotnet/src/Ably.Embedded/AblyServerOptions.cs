@@ -16,9 +16,9 @@ public sealed class AblyServerOptions
 
     /// <summary>
     /// Absolute path to the prebuilt <c>ably-server</c> binary. If null, the
-    /// supervisor resolves it next to the host app's content root under
+    /// embedded server resolves it next to the host app's content root under
     /// <c>bin/ably-server</c> (plus a few common fallbacks). See
-    /// <see cref="AblyServerSupervisor"/> for the resolution order.
+    /// <see cref="AblyServer"/> for the resolution order.
     /// </summary>
     public string? BinaryPath { get; set; }
 
@@ -39,8 +39,8 @@ public sealed class AblyServerOptions
 
     /// <summary>
     /// Graceful-shutdown window passed as <c>--shutdown-grace</c>. The
-    /// supervisor also waits up to this long for the child to exit on its own
-    /// SIGTERM before force-killing.
+    /// embedded server also waits up to this long for the child to exit on its
+    /// own SIGTERM before force-killing.
     /// </summary>
     public TimeSpan ShutdownGrace { get; set; } = TimeSpan.FromSeconds(10);
 
@@ -48,7 +48,7 @@ public sealed class AblyServerOptions
     public TimeSpan ReadyTimeout { get; set; } = TimeSpan.FromSeconds(15);
 
     /// <summary>
-    /// When true (default) the supervisor respawns the child if it exits
+    /// When true (default) the embedded server respawns the child if it exits
     /// without having been asked to stop. Set false to disable auto-restart.
     /// </summary>
     public bool RestartOnExit { get; set; } = true;

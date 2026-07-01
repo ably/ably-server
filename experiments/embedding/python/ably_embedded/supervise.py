@@ -1,4 +1,4 @@
-"""Supervisor for an embedded ably-server child process.
+"""AblyServer: supervises an embedded ably-server child process.
 
 Responsibilities (EMBEDDING-POC.md §5):
 
@@ -10,7 +10,7 @@ Responsibilities (EMBEDDING-POC.md §5):
   6. stop(): SIGTERM the child, then SIGKILL on grace timeout. No orphan.
 
 asyncio-native: the watchdog and the readiness poll are coroutines, so the
-supervisor composes cleanly with an ASGI app's lifespan. No dependency
+embedded server composes cleanly with an ASGI app's lifespan. No dependency
 beyond the standard library + httpx (already a proxy dependency).
 """
 
@@ -160,7 +160,7 @@ class AblyServer:
     @property
     def failed(self) -> bool:
         """True once the child has crashed past max_restarts and the
-        supervisor has given up — it will not come back on its own."""
+        embedded server has given up — it will not come back on its own."""
         return self._failed
 
     def _emit(self, event: str, payload: object = None) -> None:
@@ -172,7 +172,7 @@ class AblyServer:
     async def start(self) -> int:
         """Spawn the child and wait until /readyz is green. Returns the port."""
         if self._started:
-            raise RuntimeError("supervisor already started")
+            raise RuntimeError("server already started")
         self._started = True
 
         if not Path(self.binary_path).exists():

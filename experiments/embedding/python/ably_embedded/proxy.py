@@ -60,12 +60,12 @@ def _normalise_base_path(base_path: str) -> str:
 class AblyProxy:
     """Pure-ASGI reverse-proxy app for the embedded ably-server.
 
-    Reads the upstream port LIVE from the supervisor on every request, so a
+    Reads the upstream port LIVE from the AblyServer on every request, so a
     crash-restart onto the same port (or a different one) is transparent.
     """
 
-    def __init__(self, supervisor, *, base_path: str = "") -> None:
-        self._supervisor = supervisor
+    def __init__(self, server, *, base_path: str = "") -> None:
+        self._server = server
         self.base_path = _normalise_base_path(base_path)
         # One pooled HTTP client for the proxy's lifetime: keep-alive
         # connections to the loopback child instead of a fresh TCP handshake
@@ -84,9 +84,9 @@ class AblyProxy:
 
     @property
     def _upstream_host(self) -> str:
-        port = self._supervisor.port
+        port = self._server.port
         if port is None:
-            raise RuntimeError("supervisor has no port yet (not started?)")
+            raise RuntimeError("server has no port yet (not started?)")
         return f"127.0.0.1:{port}"
 
     async def aclose(self) -> None:
@@ -117,7 +117,7 @@ class AblyProxy:
 
     async def _passthrough_lifespan(self, scope, receive, send) -> None:
         # The proxy itself owns no startup/shutdown; the host app's lifespan
-        # drives the supervisor. Just complete the protocol so a standalone
+        # drives the embedded server. Just complete the protocol so a standalone
         # mount doesn't hang.
         while True:
             message = await receive()
@@ -318,6 +318,6 @@ class AblyProxy:
                     pass
 
 
-def make_proxy_app(supervisor, *, base_path: str = "") -> AblyProxy:
+def make_proxy_app(server, *, base_path: str = "") -> AblyProxy:
     """Build an ASGI app that reverse-proxies to the embedded server."""
-    return AblyProxy(supervisor, base_path=base_path)
+    return AblyProxy(server, base_path=base_path)

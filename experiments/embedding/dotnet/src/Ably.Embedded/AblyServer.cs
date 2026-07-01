@@ -8,17 +8,19 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Ably.Embedded;
 
 /// <summary>
-/// Supervises the prebuilt <c>ably-server</c> binary as a child process:
-/// resolves the binary, picks a free loopback TCP port, starts the server in
-/// <c>memory</c> mode bound to that port, polls <c>/readyz</c> until ready,
-/// restarts the child if it exits unexpectedly, and stops it (SIGTERM then
-/// Kill) on <see cref="DisposeAsync"/> — leaving no orphan process.
+/// The embedded server object: supervises the prebuilt <c>ably-server</c>
+/// binary as a child process. Resolves the binary, picks a free loopback TCP
+/// port, starts the server in <c>memory</c> mode bound to that port, polls
+/// <c>/readyz</c> until ready, restarts the child if it exits unexpectedly,
+/// and stops it (SIGTERM then Kill) on <see cref="DisposeAsync"/> — leaving no
+/// orphan process.
 ///
 /// This is the integration glue a .NET host-app developer consumes; the
-/// supervised port is then injected into a YARP cluster destination (see
-/// <see cref="AblyEmbeddedExtensions"/>).
+/// resolved port is then injected into a YARP cluster destination (see
+/// <see cref="AblyEmbeddedExtensions"/>). Normally you never touch this type
+/// directly — <c>AddAblyEmbedded</c> registers and drives it for you.
 /// </summary>
-public sealed class AblyServerSupervisor : IAsyncDisposable
+public sealed class AblyServer : IAsyncDisposable
 {
     private readonly AblyServerOptions _options;
     private readonly ILogger _logger;
@@ -43,7 +45,7 @@ public sealed class AblyServerSupervisor : IAsyncDisposable
     /// <summary>The resolved absolute path to the binary actually launched.</summary>
     public string ResolvedBinaryPath { get; }
 
-    public AblyServerSupervisor(AblyServerOptions options, ILogger<AblyServerSupervisor>? logger = null)
+    public AblyServer(AblyServerOptions options, ILogger<AblyServer>? logger = null)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _logger = (ILogger?)logger ?? NullLogger.Instance;

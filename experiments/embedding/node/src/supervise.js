@@ -1,4 +1,4 @@
-// Supervisor for an embedded ably-server child process.
+// AblyServer: supervises an embedded ably-server child process.
 //
 // Responsibilities (EMBEDDING-POC.md §5):
 //   1. Resolve the prebuilt per-platform binary path.
@@ -92,7 +92,8 @@ export async function waitForReady(port, opts = {}) {
 }
 
 /**
- * Supervises a single embedded ably-server child process.
+ * An AblyServer: the embedded server object a host holds. It supervises a
+ * single ably-server child process (spawn, /readyz gate, crash-restart, stop).
  *
  * Emits:
  *   'ready'   (port)            child is up and /readyz is green
@@ -146,7 +147,7 @@ export class AblyServer extends EventEmitter {
    * @returns {Promise<{ port: number, pid: number }>}
    */
   async start() {
-    if (this._started) throw new Error('supervisor already started');
+    if (this._started) throw new Error('AblyServer already started');
     this._started = true;
 
     if (!existsSync(this.binaryPath)) {

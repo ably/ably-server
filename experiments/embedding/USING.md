@@ -204,23 +204,24 @@ No platform matrix — the Go toolchain cross-compiles it with the app.
 ### Node — Express or Fastify middleware
 
 ```js
-import { startEmbeddedServer } from '@ably/embedded-server';
+import { AblyServer } from '@ably/embedded-server';
 import { mountAblyProxy } from '@ably/embedded-server/express';   // or /fastify
 
-const supervisor = await startEmbeddedServer({ apiKey: 'app.key:secret' });
+const server = new AblyServer({ apiKey: 'app.key:secret' });
+await server.start();                                       // spawn child + /readyz gate
 
 // Express
-const proxy = mountAblyProxy(app, { supervisor });          // root (dedicated port)
-const server = app.listen(8541);
-server.on('upgrade', proxy.upgrade);                        // wire WS upgrades
+const proxy = mountAblyProxy(app, { server });              // root (dedicated port)
+const httpServer = app.listen(8541);
+httpServer.on('upgrade', proxy.upgrade);                    // wire WS upgrades
 
 // Fastify
-await registerAblyProxy(fastify, { supervisor });           // WS handled by the plugin
+await registerAblyProxy(fastify, { server });               // WS handled by the plugin
 ```
 *Production:* the prebuilt binary ships via npm `optionalDependencies` keyed
 by `os`/`cpu` (the esbuild model), e.g. `@ably/embedded-server-darwin-arm64`;
-the supervisor resolves it from there instead of `./bin`. `npm install` pulls
-only the right platform binary; the host dev runs no Go.
+the embedded server resolves it from there instead of `./bin`. `npm install`
+pulls only the right platform binary; the host dev runs no Go.
 
 ### .NET — YARP, one call
 
@@ -232,7 +233,7 @@ app.Run();
 ```
 *Production:* ship the binary in a NuGet package under
 `runtimes/<rid>/native/ably-server` (e.g. `osx-arm64`, `linux-x64`,
-`win-x64`); the supervisor resolves the RID-matched binary at runtime.
+`win-x64`); the embedded server resolves the RID-matched binary at runtime.
 
 ### Python — FastAPI/Starlette (ASGI)
 
@@ -293,7 +294,7 @@ the tracks throw them away:
 | Track | Where the server's logs go | Turn up / redirect |
 |---|---|---|
 | **Go** (in-process) | the `*slog.Logger` you pass as `Options.Logger` (nil discards) | it's your app's own logger |
-| **Node** | child stdout/stderr forwarded to `process.stderr`, prefixed `[ably-server]` | pass `onChildLog: (line) => yourLogger(line)` to `startEmbeddedServer`, or `() => {}` to mute |
+| **Node** | child stdout/stderr forwarded to `process.stderr`, prefixed `[ably-server]` | pass `onChildLog: (line) => yourLogger(line)` to `new AblyServer({ … })`, or `() => {}` to mute |
 | **.NET** | child stdout at `Information`, stderr at `Warning`, category `Ably.Embedded` | standard ASP.NET logging filters |
 | **Python** | child stdout/stderr forwarded to the `ably_embedded.server` logger (stdout `INFO`, stderr `WARNING`) | standard `logging` config |
 

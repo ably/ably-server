@@ -59,11 +59,11 @@ loopback.
 | Dimension | Floor (standalone) | Go in-process (ceiling) | Node (Express / Fastify) | .NET (YARP) | Python (FastAPI) |
 |---|---|---|---|---|---|
 | **Dev efficiency** — steps to first message | run 1 binary | **3** (import → mount handler → point SDK) | **4** (`npm i` → binary → ~8 lines → point SDK) | **3** from prebuilt (`dotnet build` → run → point SDK); ~1.6 s warm | **4** (venv+pip → binary → ~20 lines → point SDK) |
-| **DX** — integration glue | n/a | **~3 lines** (`New` + mount `Handler` + `Close`) | **~8 lines** (supervisor + proxy + WS `upgrade` wiring) | **~20 lines** (host builder + YARP route + supervisor) | **~20 lines** (lifespan supervisor + `make_proxy_app` + ASGI fall-through) |
+| **DX** — integration glue | n/a | **~3 lines** (`New` + mount `Handler` + `Close`) | **~8 lines** (`AblyServer` + proxy + WS `upgrade` wiring) | **~20 lines** (host builder + YARP route + `AddAblyEmbedded`) | **~20 lines** (lifespan `AblyServer` + `make_proxy_app` + ASGI fall-through) |
 | **DX** — new concepts | n/a | ~1 (it's an `http.Handler`) | ~2 (child process; wire WS `upgrade`) | ~2 (child process; YARP cluster destination) | ~2 (child process; ASGI fall-through routing) |
 | **DX** — idiomatic fit | n/a | native `net/http` | Express middleware / Fastify plugin | ASP.NET + YARP config | FastAPI/Starlette ASGI (WSGI can't do WS) |
 | **Portability** — binary (decimal MB) | ~16.5 MB standalone | **+10.2 MB compiled into the host binary** (memory + disk), any Go target, no extra toolchain | ~16.5 MB prebuilt **per os/cpu**, no toolchain on user machine | ~16.5 MB prebuilt + **.NET runtime**; NuGet `runtimes/<rid>` | ~16.5 MB prebuilt + **Python runtime**; PyPI platform wheels |
-| **Ease of use** — auto free-port | — | host owns the port | **yes** (supervisor; proxy reads it live) | **yes** (supervisor; injected into YARP) | **yes** (supervisor; proxy reads it live) |
+| **Ease of use** — auto free-port | — | host owns the port | **yes** (`AblyServer`; proxy reads it live) | **yes** (`AblyServer`; injected into YARP) | **yes** (`AblyServer`; proxy reads it live) |
 | **Ease of use** — auto-shutdown with app | — | inherent (`defer Close`) | yes (SIGTERM handler) | yes (host lifetime) | yes (ASGI lifespan) |
 | **Reliability** — harness 6/6 | **PASS** | **PASS** | **PASS / PASS** | **PASS** | **PASS** |
 | **Reliability** — server crash → auto-restart | n/a | **N/A** (no child) | **yes** (kill -9 → respawn → harness passes) | **yes** (kill -9 → respawn → harness passes) | **yes** (kill -9 → respawn → harness passes) |
@@ -353,11 +353,18 @@ surprise later:
    ignores (hard kill, no drain); only .NET branches correctly. Nothing was
    run on Windows. *Close:* OS-branch the Node/Python stop (control-event /
    pipe) and run one Windows track. Today the docs label this precisely.
-5. **Naming + single-call convenience.** `.NET`/Go read as "start and attach";
-   Node/Python still wire supervisor + proxy + upgrade by hand. *Close:*
-   `attachAblyServer(app)` (Express) and an `mount_ably(app)` ASGI helper
-   (Python). Separately, decide the product naming (`@ably/server` vs the
-   inherited `@ably/embedded-server`).
+5. **Single-call convenience + package naming.** The public noun is now
+   unified: Node, Python and .NET all expose `AblyServer` as the object a
+   developer holds (`AblyServerSupervisor` remains a back-compat alias; the
+   Node/Python proxy adapters accept `{ server }` and still tolerate
+   `{ supervisor }`); Go intentionally has no noun (it's an `http.Handler`).
+   What's left is ergonomic, not naming: `.NET`/Go read as "start and attach",
+   while Node/Python still wire the server + proxy + `upgrade` by hand. *Close:*
+   `attachAblyServer(app)` (Express) and a `mount_ably(app)` ASGI helper
+   (Python). Separately, the class is `AblyServer` but the package is still
+   `@ably/embedded-server` / module `ably_embedded` — decide the final product
+   name (`@ably/server` vs the inherited `@ably/embedded-server`) so the class
+   and package tell one story.
 6. **Machine-readable ready-line.** Supervisors poll `/readyz` and pick a free
    port (small TOCTOU window). *Close:* emit a ready-line on stdout from
    `cmd/ably-server` after `net.Listen`; supervisors parse it (deferred per the

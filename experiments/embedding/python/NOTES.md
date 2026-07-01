@@ -118,8 +118,8 @@ builders need the host knobs threaded through consistently.
 - Steps from `pip install` to a working pub/sub round-trip following the
   README: **4** — (1) `pip install ably-embedded` (PoC: `pip install fastapi
   uvicorn websockets httpx`), (2) build/obtain the binary, (3) ~6 lines of
-  glue (supervisor in the lifespan + mount the proxy), (4) point the SDK at
-  the port (folding host:port — see finding #2).
+  glue (the embedded server in the lifespan + mount the proxy), (4) point the
+  SDK at the port (folding host:port — see finding #2).
 - The binary build (`go build`) is a one-time build input; in a real package
   the binary ships via **PyPI platform wheels** so the host dev never runs Go
   (the `ruff` precedent — see Portability).
@@ -130,8 +130,8 @@ builders need the host knobs threaded through consistently.
 ### Developer experience (DX)
 - **Integration glue the host-app dev writes (FastAPI): ~6 Ably-specific
   lines** inside an otherwise stock FastAPI app — construct
-  `AblyServer(...)`, `await supervisor.start()` /
-  `await supervisor.stop()` in the lifespan, `make_proxy_app(supervisor)`, and
+  `AblyServer(...)`, `await server.start()` /
+  `await server.stop()` in the lifespan, `make_proxy_app(server)`, and
   a 3-line fall-through that sends Ably paths to the proxy and everything else
   to FastAPI. `examples/fastapi_app.py` is **89 non-blank/non-comment lines**
   total including the demo route and the subpath variant.
@@ -144,7 +144,7 @@ builders need the host knobs threaded through consistently.
   fall-through wrapper — the one mildly non-obvious step, hidden from the
   dev in a productised middleware.
 - **Misconfiguration error quality (actual):** a missing binary fails fast on
-  `await supervisor.start()` with
+  `await server.start()` with
   `FileNotFoundError: ably-server binary not found at "<path>". Build it first
   (go build -o bin/ably-server ./cmd/ably-server) or set ABLY_SERVER_BINARY
   to its path.` — clear and actionable; no hang to the ready-timeout.
@@ -172,9 +172,9 @@ builders need the host knobs threaded through consistently.
 ### Ease of use
 | Ergonomic | This track |
 |---|---|
-| One-liner to start? | Yes — `await supervisor.start()` in the FastAPI lifespan; host runs with one `uvicorn` command (or `python examples/run_fastapi.py`). |
+| One-liner to start? | Yes — `await server.start()` in the FastAPI lifespan; host runs with one `uvicorn` command (or `python examples/run_fastapi.py`). |
 | Auto free-port for the child? | Yes — `pick_free_port()` binds an OS ephemeral loopback port; the dev never picks the internal port. Same bind-then-release TOCTOU as Node/.NET. |
-| Auto-shutdown with the app? | Yes — the ASGI **lifespan** `finally` calls `supervisor.stop()` (SIGTERM then SIGKILL on grace). Verified (C2). Flask needs an explicit signal handler (finding #1). |
+| Auto-shutdown with the app? | Yes — the ASGI **lifespan** `finally` calls `server.stop()` (SIGTERM then SIGKILL on grace). Verified (C2). Flask needs an explicit signal handler (finding #1). |
 | Restart on crash? | Yes — an asyncio **watchdog** task awaits the child and respawns on unexpected exit, same port, re-gated on `/readyz`. Verified (C1). |
 | Config surface | `AblyServer(api_key=, binary_path=, mode=, log_level=, shutdown_grace=, max_restarts=, ...)` + env `ABLY_SERVER_API_KEY` / `ABLY_SERVER_BINARY`. |
 
@@ -209,7 +209,7 @@ raised soak to ~1,093 msg/s — in the same ballpark as Express (1,005 msg/s).
   child, not the host, and the watchdog restarts it.
 - **Supervision burden:** owned by the package (spawn, ready-gate, watchdog
   restart, graceful stop). The host dev writes none of it.
-- **The async/sync seam is the Python-specific cost.** The supervisor is
+- **The async/sync seam is the Python-specific cost.** The `AblyServer` is
   async; in an ASGI host (FastAPI) it composes for free in the lifespan. In a
   **sync** host (Flask) the dev must run a private asyncio loop in a daemon
   thread and `run_coroutine_threadsafe` to drive it (see `flask_app.py`) — and

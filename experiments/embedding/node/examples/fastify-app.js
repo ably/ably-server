@@ -11,7 +11,7 @@ import path from 'node:path';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import Fastify from 'fastify';
-import { startEmbeddedServer } from '../src/index.js';
+import { AblyServer } from '../src/index.js';
 import { registerAblyProxy } from '../src/fastify.js';
 
 const PORT = Number(process.env.ABLY_PUBLIC_PORT ?? 8542);
@@ -19,13 +19,14 @@ const MOUNT = process.env.ABLY_MOUNT ?? '/';
 const DEMO_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'demo');
 const demoHtml = readFileSync(path.join(DEMO_DIR, 'index.html'), 'utf8');
 
-const supervisor = await startEmbeddedServer({
+const server = new AblyServer({
   apiKey: process.env.ABLY_SERVER_API_KEY ?? 'app.key:secret',
 });
-console.log(`[fastify-app] embedded ably-server ready on internal port ${supervisor.port} (pid ${supervisor.child.pid})`);
-supervisor.on('exit', ({ code, signal }) => console.log(`[fastify-app] embedded server exited (code=${code} signal=${signal})`));
-supervisor.on('restart', (n) => console.log(`[fastify-app] restarting embedded server (attempt ${n})`));
-supervisor.on('ready', (port) => console.log(`[fastify-app] embedded server (re)ready on internal port ${port} (pid ${supervisor.child?.pid})`));
+await server.start();
+console.log(`[fastify-app] embedded ably-server ready on internal port ${server.port} (pid ${server.child.pid})`);
+server.on('exit', ({ code, signal }) => console.log(`[fastify-app] embedded server exited (code=${code} signal=${signal})`));
+server.on('restart', (n) => console.log(`[fastify-app] restarting embedded server (attempt ${n})`));
+server.on('ready', (port) => console.log(`[fastify-app] embedded server (re)ready on internal port ${port} (pid ${server.child?.pid})`));
 
 // forceCloseConnections drops lingering keep-alive/WS sockets on close() so
 // a SIGTERM shutdown completes promptly instead of hanging on open sockets.
@@ -37,7 +38,7 @@ fastify.get('/demo/', (_req, reply) => reply.type('text/html').send(demoHtml));
 if (MOUNT !== '/') {
   fastify.get('/', (_req, reply) => reply.type('text/plain').send(`host app home — Ably is embedded under ${MOUNT}/`));
 }
-await registerAblyProxy(fastify, { supervisor, mountPath: MOUNT });
+await registerAblyProxy(fastify, { server, mountPath: MOUNT });
 
 await fastify.listen({ port: PORT, host: '0.0.0.0' });
 console.log(`[fastify-app] listening on http://127.0.0.1:${PORT} — Ably under ${MOUNT}, demo at /demo/`);
@@ -49,7 +50,7 @@ async function shutdown(sig) {
   shuttingDown = true;
   console.log(`[fastify-app] received ${sig}, shutting down...`);
   await fastify.close();
-  await supervisor.stop();
+  await server.stop();
   console.log('[fastify-app] clean shutdown complete');
   process.exit(0);
 }

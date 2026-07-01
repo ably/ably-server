@@ -53,15 +53,16 @@ API, assertions unchanged) — `go test ./...` is green.
 ### Developer efficiency (time-to-first-message)
 - Steps from `npm install` to a working pub/sub round-trip following the
   README: **4** — (1) `npm install`, (2) build/obtain the binary, (3) ~8
-  lines of glue (supervisor + proxy), (4) point ably-js at the port.
+  lines of glue (server + proxy), (4) point ably-js at the port.
 - The binary build (`go build`) is a one-time input; in a real package the
   binary ships via npm `optionalDependencies` per os/cpu (esbuild precedent)
   so the host dev never runs Go.
 
 ### Developer experience (DX)
-- **Integration glue ≈ 8 lines** for the host dev: `startEmbeddedServer()`,
-  `mountAblyProxy(app, {supervisor})` (or `registerAblyProxy` for Fastify),
-  `app.listen`, and `server.on('upgrade', proxy.upgrade)` for Express.
+- **Integration glue ≈ 8 lines** for the host dev: `new AblyServer()` +
+  `await server.start()`, `mountAblyProxy(app, { server })` (or
+  `registerAblyProxy` for Fastify), `app.listen`, and
+  `httpServer.on('upgrade', proxy.upgrade)` for Express.
 - New concepts: ~2 (a supervised child, and wiring the WS `upgrade` event —
   the one non-obvious Express step; Fastify hides it inside the plugin).
 - Fits idiomatic patterns: yes — Express middleware and a Fastify plugin.
@@ -77,16 +78,17 @@ API, assertions unchanged) — `go test ./...` is green.
   productisation costs (out of PoC scope; on the cost ledger).
 
 ### Ease of use
-- One-liner to start: `await startEmbeddedServer()` then mount the proxy.
-- Auto free-port: yes (supervisor picks one; the proxy reads it live, so it
-  still works after a restart onto a new port).
+- One-liner to start: `new AblyServer()` + `await server.start()` (or the
+  `await startEmbeddedServer()` convenience), then mount the proxy.
+- Auto free-port: yes (the embedded server picks one; the proxy reads it live,
+  so it still works after a restart onto a new port).
 - Auto-shutdown with app: yes (wired in the example's SIGTERM/SIGINT handler).
 - Config surface: `{ apiKey, mode, binaryPath, maxRestarts, ... }` + the
   `ABLY_SERVER_BINARY` / `ABLY_SERVER_API_KEY` env vars.
 
 ### Reliability (measured)
 - Harness incl. resume + 200-msg zero-loss soak: PASS through both proxies.
-- **Restart-on-crash:** `kill -9` the embedded child → supervisor logs
+- **Restart-on-crash:** `kill -9` the embedded child → the embedded server logs
   `restart attempt 1` → re-ready on the same port → a fresh harness
   (connect, pubsub) PASSES. Verified with exact-PID tracking (child
   86591 → SIGKILL → respawn 86615 → harness PASS).
@@ -105,8 +107,8 @@ API, assertions unchanged) — `go test ./...` is green.
 - Packaging: per-os/cpu binary packages (esbuild model) — more complex than
   Go's "just a dependency", simpler than a native addon.
 - Failure blast radius: **isolated** — a server crash does not take the host
-  app down (the supervisor restarts it). This is the main advantage over the
-  Go in-process ceiling.
+  app down (the embedded server restarts the child). This is the main advantage
+  over the Go in-process ceiling.
 
 ## How to reproduce
 

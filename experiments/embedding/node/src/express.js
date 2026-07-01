@@ -14,13 +14,14 @@ import { createProxyMiddleware } from 'http-proxy-middleware';
  * server. WebSocket upgrades are not seen by Express's normal middleware
  * stack, so the returned `upgrade` handler MUST be wired to the HTTP server:
  *
- *   const proxy = mountAblyProxy(app, { supervisor });
- *   const server = app.listen(PORT);
- *   server.on('upgrade', proxy.upgrade);
+ *   const proxy = mountAblyProxy(app, { server });
+ *   const httpServer = app.listen(PORT);
+ *   httpServer.on('upgrade', proxy.upgrade);
  *
  * @param {import('express').Express} app
  * @param {object} opts
- * @param {{ port: number }} opts.supervisor  the started supervisor (reads .port live)
+ * @param {{ port: number }} opts.server  the started AblyServer (reads .port live)
+ * @param {{ port: number }} [opts.supervisor]  deprecated alias for opts.server
  * @param {string} [opts.mountPath]  subpath to expose Ably under (default '/').
  *   When set (e.g. '/ably'), only that prefix is proxied and it is stripped
  *   before reaching the child, so the host app keeps the rest of its routes.
@@ -28,16 +29,16 @@ import { createProxyMiddleware } from 'http-proxy-middleware';
  * @returns {{ middleware: import('express').RequestHandler, upgrade: Function }}
  */
 export function mountAblyProxy(app, opts) {
-  const { supervisor } = opts;
-  if (!supervisor) throw new Error('mountAblyProxy: opts.supervisor is required');
+  const server = opts.server ?? opts.supervisor;
+  if (!server) throw new Error('mountAblyProxy: opts.server is required');
 
   const mountPath = (opts.mountPath || '/').replace(/\/$/, '') || '/';
   const subpath = mountPath !== '/';
 
-  // router() is re-evaluated per request, so if the supervisor restarts the
+  // router() is re-evaluated per request, so if the server restarts the
   // child on a *new* port we still proxy to the live one.
   const proxy = createProxyMiddleware({
-    router: () => `http://127.0.0.1:${supervisor.port}`,
+    router: () => `http://127.0.0.1:${server.port}`,
     changeOrigin: true,
     ws: true,
     // Faithfully forward; do not buffer the (streamed) WS frames.

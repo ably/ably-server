@@ -25,14 +25,15 @@ Ably SDK points at that port. Node and Python below; the others (Go in-process,
 
 ```js
 import express from 'express';
-import { startEmbeddedServer } from '@ably/embedded-server';
+import { AblyServer } from '@ably/embedded-server';
 import { mountAblyProxy } from '@ably/embedded-server/express';
 
-const supervisor = await startEmbeddedServer({ apiKey: 'app.key:secret' });
+const server = new AblyServer({ apiKey: 'app.key:secret' });
+await server.start();                                 // spawn the child, wait for /readyz
 const app = express();
-const proxy = mountAblyProxy(app, { supervisor });   // Ably on this app's port
-const server = app.listen(8541);
-server.on('upgrade', proxy.upgrade);                  // forward WebSocket upgrades
+const proxy = mountAblyProxy(app, { server });        // Ably on this app's port
+const httpServer = app.listen(8541);
+httpServer.on('upgrade', proxy.upgrade);              // forward WebSocket upgrades
 ```
 
 Use it, with an unmodified ably-js (browser or Node):

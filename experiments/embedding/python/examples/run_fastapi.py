@@ -44,7 +44,7 @@ async def _serve(server: uvicorn.Server) -> None:
         loop.add_signal_handler(sig, _request_exit)
 
     # _serve() runs startup -> main_loop (until should_exit) -> shutdown,
-    # which executes the FastAPI lifespan's shutdown (supervisor.stop()).
+    # which executes the FastAPI lifespan's shutdown (the AblyServer's stop()).
     await server._serve()
 
 

@@ -16,12 +16,12 @@ namespace Ably.Embedded;
 public static class AblyEmbeddedExtensions
 {
     /// <summary>
-    /// Registers the supervisor (as a singleton + hosted service so it starts
-    /// with the app and stops with it) and a YARP reverse proxy whose single
-    /// catch-all route forwards every path — including the WebSocket upgrade
-    /// at <c>/</c> — to the embedded server's chosen loopback port.
+    /// Registers the embedded server (as a singleton + hosted service so it
+    /// starts with the app and stops with it) and a YARP reverse proxy whose
+    /// single catch-all route forwards every path — including the WebSocket
+    /// upgrade at <c>/</c> — to the embedded server's chosen loopback port.
     ///
-    /// The destination address is resolved lazily from the running supervisor
+    /// The destination address is resolved lazily from the running server
     /// via an <see cref="InMemoryConfigProvider"/>, so the OS-assigned child
     /// port is injected without the developer hard-coding anything.
     /// </summary>
@@ -32,7 +32,7 @@ public static class AblyEmbeddedExtensions
         var options = new AblyServerOptions();
         configure?.Invoke(options);
         services.AddSingleton(options);
-        services.AddSingleton<AblyServerSupervisor>();
+        services.AddSingleton<AblyServer>();
 
         // Hosted service: StartAsync spins up the child + readiness gate before
         // the app reports started; StopAsync disposes it (SIGTERM, no orphan).
@@ -112,32 +112,32 @@ public static class AblyEmbeddedExtensions
     ];
 
     /// <summary>
-    /// Rewrites the YARP cluster destination to the supervisor's actual
+    /// Rewrites the YARP cluster destination to the embedded server's actual
     /// loopback address. Called once the child port is known.
     /// </summary>
     internal static void PointAt(this InMemoryConfigProvider provider, Uri baseAddress, string mountPath) =>
         provider.Update(BuildRoutes(mountPath), BuildClusters(baseAddress.ToString()));
 
     /// <summary>
-    /// Bridges the supervisor lifecycle into the host's hosted-service
+    /// Bridges the embedded server's lifecycle into the host's hosted-service
     /// lifecycle and injects the resolved port into YARP before ready.
     /// </summary>
     private sealed class AblyEmbeddedHostedService(
-        AblyServerSupervisor supervisor,
+        AblyServer server,
         InMemoryConfigProvider proxyConfig,
         AblyServerOptions options,
         ILogger<AblyEmbeddedHostedService> logger) : IHostedService
     {
         public async Task StartAsync(CancellationToken cancellationToken)
         {
-            await supervisor.StartAsync(cancellationToken).ConfigureAwait(false);
-            proxyConfig.PointAt(supervisor.BaseAddress, options.MountPath);
-            logger.LogInformation("YARP now proxying to embedded ably-server at {Addr} (mount {Mount})", supervisor.BaseAddress, options.MountPath);
+            await server.StartAsync(cancellationToken).ConfigureAwait(false);
+            proxyConfig.PointAt(server.BaseAddress, options.MountPath);
+            logger.LogInformation("YARP now proxying to embedded ably-server at {Addr} (mount {Mount})", server.BaseAddress, options.MountPath);
         }
 
         public async Task StopAsync(CancellationToken cancellationToken)
         {
-            await supervisor.DisposeAsync().ConfigureAwait(false);
+            await server.DisposeAsync().ConfigureAwait(false);
         }
     }
 }

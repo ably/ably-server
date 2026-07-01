@@ -61,9 +61,9 @@ from ably_embedded import AblyServer  # noqa: E402
 
 PORT = int(os.environ.get("ABLY_PUBLIC_PORT", "8588"))
 
-# --- Supervisor lifecycle on a dedicated background asyncio loop -----------
-# The supervisor is async; Flask/WSGI is sync. Run a private event loop in a
-# daemon thread and drive the supervisor on it. This is the WSGI-world cost of
+# --- Embedded-server lifecycle on a dedicated background asyncio loop -------
+# The AblyServer is async; Flask/WSGI is sync. Run a private event loop in a
+# daemon thread and drive the server on it. This is the WSGI-world cost of
 # embedding an async-supervised child: you manage the loop yourself.
 _loop = asyncio.new_event_loop()
 _loop_thread = threading.Thread(target=_loop.run_forever, daemon=True)
@@ -74,16 +74,16 @@ def _run(coro):
     return asyncio.run_coroutine_threadsafe(coro, _loop).result()
 
 
-supervisor = AblyServer(
+server = AblyServer(
     api_key=os.environ.get("ABLY_SERVER_API_KEY", "app.key:secret"),
     on_event=lambda event, payload: print(
         f"[flask-app] embedded server: {event} {payload}", flush=True
     ),
 )
-_run(supervisor.start())
+_run(server.start())
 print(
-    f"[flask-app] embedded ably-server ready on internal port {supervisor.port} "
-    f"(pid {supervisor.pid})",
+    f"[flask-app] embedded ably-server ready on internal port {server.port} "
+    f"(pid {server.pid})",
     flush=True,
 )
 
@@ -96,7 +96,7 @@ def _shutdown() -> None:
         return
     _stopped.set()
     try:
-        _run(supervisor.stop())
+        _run(server.stop())
         print("[flask-app] embedded ably-server stopped", flush=True)
     except Exception:
         pass
@@ -158,7 +158,7 @@ def proxy(subpath: str):
             mimetype="text/plain",
         )
 
-    url = f"http://127.0.0.1:{supervisor.port}/{subpath}"
+    url = f"http://127.0.0.1:{server.port}/{subpath}"
     fwd_headers = {
         k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP
     }

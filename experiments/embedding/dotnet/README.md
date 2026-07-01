@@ -14,7 +14,7 @@ REST traffic to it on a **dedicated port** using
 dotnet/
   AblyEmbedded.slnx
   src/Ably.Embedded/        # the reusable glue (NuGet-shaped library)
-    AblyServerSupervisor.cs   - resolve binary, free port, spawn, /readyz gate,
+    AblyServer.cs             - resolve binary, free port, spawn, /readyz gate,
                                 restart-on-crash, SIGTERM shutdown (no orphan)
     AblyEmbeddedExtensions.cs - AddAblyEmbedded() + MapAblyEmbedded() (YARP wiring)
     AblyServerOptions.cs      - config surface
@@ -120,7 +120,7 @@ All three scripts live in `scripts/` and are self-contained:
 ./scripts/run-sdk-smoke.sh 8562
 
 # C. Fault injection:
-#    C1 kill -9 the child  -> supervisor respawns it, fresh harness passes.
+#    C1 kill -9 the child  -> the embedded server respawns it, fresh harness passes.
 #    C2 SIGTERM the app    -> clean exit (0), no orphan child.
 ./scripts/run-fault-injection.sh 8563
 ```
@@ -133,8 +133,10 @@ Use ports in the **8560–8579** range (a sibling Node track runs on 8540+).
 |---|---|---|
 | `ApiKey` | `$ABLY_SERVER_API_KEY` → `app.key:secret` | `appId.keyId:keySecret` |
 | `BinaryPath` | `<app>/bin/ably-server` (+ fallbacks) | absolute path to the binary |
-| `Mode` | `memory` | server `--mode` |
-| `LogLevel` | `error` | server `--log-level` |
+| `Mode` | `memory` | server `--mode`: `memory` (default), `disk` (needs `DataDir`), `cluster` (needs `DbDsn`) |
+| `DataDir` | — | `--data-dir` for `disk` mode |
+| `DbDsn` | — | `--db-dsn` for `cluster` mode |
+| `LogLevel` | `info` | server `--log-level` (child logs forwarded to the host logger) |
 | `ShutdownGrace` | `10s` | `--shutdown-grace` + stop wait before Kill |
 | `ReadyTimeout` | `15s` | how long to poll `/readyz` on startup |
 | `RestartOnExit` | `true` | respawn the child if it dies unexpectedly |

@@ -44,8 +44,8 @@ DEMO_HTML = (
     Path(__file__).resolve().parent.parent.parent / "demo" / "index.html"
 )
 
-# A single supervisor for the app's lifetime.
-supervisor = AblyServer(
+# A single embedded server for the app's lifetime.
+server = AblyServer(
     api_key=os.environ.get("ABLY_SERVER_API_KEY", "app.key:secret"),
     on_event=lambda event, payload: print(
         f"[fastapi-app] embedded server: {event} {payload}", flush=True
@@ -55,10 +55,10 @@ supervisor = AblyServer(
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    port = await supervisor.start()
+    port = await server.start()
     print(
         f"[fastapi-app] embedded ably-server ready on internal port {port} "
-        f"(pid {supervisor.pid}); base_path={BASE_PATH or '/'}",
+        f"(pid {server.pid}); base_path={BASE_PATH or '/'}",
         flush=True,
     )
     try:
@@ -66,7 +66,7 @@ async def lifespan(_app: FastAPI):
     finally:
         # Stop the child cleanly on app shutdown so there is no orphan, then
         # release the proxy's pooled HTTP connections.
-        await supervisor.stop()
+        await server.stop()
         await _proxy.aclose()
         print("[fastapi-app] embedded ably-server stopped", flush=True)
 
@@ -84,7 +84,7 @@ async def demo() -> FileResponse:
 # The ASGI reverse-proxy to the embedded server. Mounting it via `app.mount`
 # would consume the path prefix and hide the WS/lifespan scopes from our
 # proxy, so we install it as a fall-through ASGI app instead (below).
-_proxy = make_proxy_app(supervisor, base_path=BASE_PATH)
+_proxy = make_proxy_app(server, base_path=BASE_PATH)
 
 
 if BASE_PATH:
@@ -106,7 +106,7 @@ if BASE_PATH:
 
         async def __call__(self, scope, receive, send):
             if scope["type"] == "lifespan":
-                # The FastAPI app owns the lifespan (it starts the supervisor).
+                # The FastAPI app owns the lifespan (it starts the server).
                 await _fastapi_app(scope, receive, send)
                 return
             path = scope.get("path", "")
