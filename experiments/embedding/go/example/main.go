@@ -25,11 +25,13 @@ import (
 func main() {
 	listen := flag.String("listen", "127.0.0.1:8500", "dedicated port for the embedded Ably endpoint")
 	key := flag.String("api-key", env("ABLY_SERVER_API_KEY", "app.key:secret"), "API key appId.keyId:keySecret")
+	mode := flag.String("mode", "memory", "storage backend: memory (ephemeral) or disk (durable, needs --data-dir)")
+	dataDir := flag.String("data-dir", "", "data directory for disk mode (holds the bbolt file)")
 	demoDir := flag.String("demo-dir", "", "if set, serve the browser demo from this dir at /demo/")
 	flag.Parse()
 
 	// --- the glue: embed ably-server in-process ---
-	embedded, err := ablyembed.New(ablyembed.Options{APIKey: *key})
+	embedded, err := ablyembed.New(ablyembed.Options{APIKey: *key, Mode: *mode, DataDir: *dataDir})
 	if err != nil {
 		log.Fatalf("embed ably-server: %v", err)
 	}

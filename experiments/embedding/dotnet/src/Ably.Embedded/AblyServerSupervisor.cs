@@ -90,11 +90,23 @@ public sealed class AblyServerSupervisor : IAsyncDisposable
         psi.ArgumentList.Add(_options.LogLevel);
         psi.ArgumentList.Add("--shutdown-grace");
         psi.ArgumentList.Add($"{(int)_options.ShutdownGrace.TotalSeconds}s");
+        if (!string.IsNullOrEmpty(_options.DataDir))
+        {
+            psi.ArgumentList.Add("--data-dir");
+            psi.ArgumentList.Add(_options.DataDir);
+        }
+        if (!string.IsNullOrEmpty(_options.DbDsn))
+        {
+            psi.ArgumentList.Add("--db-dsn");
+            psi.ArgumentList.Add(_options.DbDsn);
+        }
         psi.Environment["ABLY_SERVER_API_KEY"] = ApiKey;
 
         var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
-        process.OutputDataReceived += (_, e) => { if (e.Data is not null) _logger.LogDebug("[ably-server] {Line}", e.Data); };
-        process.ErrorDataReceived += (_, e) => { if (e.Data is not null) _logger.LogDebug("[ably-server] {Line}", e.Data); };
+        // Forward the child's logs at a visible level so the embedded server
+        // is not silent under the host's default (Information/Warning) filter.
+        process.OutputDataReceived += (_, e) => { if (e.Data is not null) _logger.LogInformation("[ably-server] {Line}", e.Data); };
+        process.ErrorDataReceived += (_, e) => { if (e.Data is not null) _logger.LogWarning("[ably-server] {Line}", e.Data); };
 
         if (!process.Start())
             throw new InvalidOperationException($"failed to start ably-server at {ResolvedBinaryPath}");

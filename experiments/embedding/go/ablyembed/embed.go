@@ -12,9 +12,12 @@
 package ablyembed
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/ably/ably-server/internal/auth"
@@ -22,6 +25,7 @@ import (
 	"github.com/ably/ably-server/internal/realtime"
 	"github.com/ably/ably-server/internal/rest"
 	"github.com/ably/ably-server/internal/storage"
+	"github.com/ably/ably-server/internal/storage/bbolt"
 	"github.com/ably/ably-server/internal/storage/memory"
 )
 
@@ -30,6 +34,18 @@ type Options struct {
 	// APIKey is the credential in appId.keyId:keySecret form, e.g.
 	// "app.key:secret". SDKs and REST clients present it back.
 	APIKey string
+
+	// Mode selects the storage backend: "memory" (default, ephemeral) or
+	// "disk" (bbolt file under DataDir — durable across restarts, single
+	// node). Cluster mode (shared Postgres) is intentionally not supported
+	// in-process: it needs a DSN and would pull the Postgres driver into the
+	// host binary. Run a child-process track or the standalone binary with
+	// --mode cluster for shared-state scale.
+	Mode string
+
+	// DataDir is the directory for disk mode's bbolt file (created if
+	// absent). Required when Mode is "disk".
+	DataDir string
 
 	// HeartbeatInterval is the server-driven HEARTBEAT cadence. Zero uses
 	// realtime.DefaultHeartbeatInterval.
@@ -51,8 +67,10 @@ type Embedded struct {
 	store storage.Storage
 }
 
-// New builds an in-process ably-server in memory mode (the PoC's
-// zero-dependency mode) and returns it mounted as an http.Handler.
+// New builds an in-process ably-server and returns it mounted as an
+// http.Handler. Storage is memory mode by default, or disk (bbolt) when
+// Options.Mode is "disk" — disk mode survives a host restart, which is what
+// makes single-node durable sessions possible without a separate service.
 func New(opts Options) (*Embedded, error) {
 	key, err := auth.ParseAPIKey(opts.APIKey)
 	if err != nil {
@@ -68,7 +86,10 @@ func New(opts Options) (*Embedded, error) {
 		hb = realtime.DefaultHeartbeatInterval
 	}
 
-	store := memory.New(memory.Options{})
+	store, err := openStore(opts.Mode, opts.DataDir)
+	if err != nil {
+		return nil, err
+	}
 	manager := core.NewManager(store)
 	rt := realtime.NewServer(key, manager, hb, logger)
 	rs := rest.NewServer(key, manager, logger)
@@ -79,6 +100,29 @@ func New(opts Options) (*Embedded, error) {
 // Close releases the embedded server's storage.
 func (e *Embedded) Close() error {
 	return e.store.Close()
+}
+
+// openStore builds the storage backend for the embed: memory (default,
+// ephemeral) or disk (bbolt file, durable across restarts). Cluster mode is
+// deliberately unsupported in-process (it needs a DSN and pulls in the
+// Postgres driver) — use a child-process track or the standalone binary.
+func openStore(mode, dataDir string) (storage.Storage, error) {
+	switch mode {
+	case "", "memory":
+		return memory.New(memory.Options{}), nil
+	case "disk":
+		if dataDir == "" {
+			return nil, fmt.Errorf(`ablyembed: DataDir is required when Mode is "disk"`)
+		}
+		if err := os.MkdirAll(dataDir, 0o755); err != nil {
+			return nil, fmt.Errorf("ablyembed: create DataDir %q: %w", dataDir, err)
+		}
+		return bbolt.Open(bbolt.Options{Path: filepath.Join(dataDir, "ably.db")})
+	case "cluster":
+		return nil, fmt.Errorf("ablyembed: cluster mode is not supported in-process; run a child-process track or the standalone binary with --mode cluster --db-dsn")
+	default:
+		return nil, fmt.Errorf("ablyembed: unknown Mode %q (valid: memory, disk)", mode)
+	}
 }
 
 // newMux mirrors cmd/ably-server/main.go's routing table so the embedded

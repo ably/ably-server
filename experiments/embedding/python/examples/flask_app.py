@@ -57,7 +57,7 @@ from flask import Flask, Response, request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ably_embedded import AblyServerSupervisor  # noqa: E402
+from ably_embedded import AblyServer  # noqa: E402
 
 PORT = int(os.environ.get("ABLY_PUBLIC_PORT", "8588"))
 
@@ -74,7 +74,7 @@ def _run(coro):
     return asyncio.run_coroutine_threadsafe(coro, _loop).result()
 
 
-supervisor = AblyServerSupervisor(
+supervisor = AblyServer(
     api_key=os.environ.get("ABLY_SERVER_API_KEY", "app.key:secret"),
     on_event=lambda event, payload: print(
         f"[flask-app] embedded server: {event} {payload}", flush=True

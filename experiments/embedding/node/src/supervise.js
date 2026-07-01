@@ -101,18 +101,20 @@ export async function waitForReady(port, opts = {}) {
  *   'restart' (attempt)         a restart is being attempted after a crash
  *   'error'   (err)             a fatal supervision error (e.g. can't start)
  */
-export class AblyServerSupervisor extends EventEmitter {
+export class AblyServer extends EventEmitter {
   /**
    * @param {object} [opts]
    * @param {string} [opts.apiKey]        API key appId.keyId:keySecret (default app.key:secret or $ABLY_SERVER_API_KEY)
    * @param {string} [opts.binaryPath]    override binary path (default resolveBinaryPath())
    * @param {number} [opts.port]          fixed internal port (default: OS-assigned free port)
-   * @param {string} [opts.mode]          server mode (default 'memory')
-   * @param {string} [opts.logLevel]      server log level (default 'error')
+   * @param {string} [opts.mode]          storage mode: 'memory' (default), 'disk' (needs dataDir), 'cluster' (needs dbDsn)
+   * @param {string} [opts.dataDir]       data dir for disk mode (passed as --data-dir)
+   * @param {string} [opts.dbDsn]         Postgres DSN for cluster mode (passed as --db-dsn)
+   * @param {string} [opts.logLevel]      server log level (default 'info')
    * @param {string} [opts.shutdownGrace] graceful-shutdown window passed to the child (default '10s')
    * @param {number} [opts.readyTimeoutMs] ready poll timeout (default 10000)
    * @param {number} [opts.maxRestarts]   max consecutive crash-restarts before giving up (default 5)
-   * @param {(line:string)=>void} [opts.onChildLog] receive child stderr/stdout lines
+   * @param {(line:string)=>void} [opts.onChildLog] receive child stdout/stderr lines (default: write to process.stderr; pass () => {} to mute)
    */
   constructor(opts = {}) {
     super();
@@ -120,11 +122,15 @@ export class AblyServerSupervisor extends EventEmitter {
     this.binaryPath = opts.binaryPath ?? resolveBinaryPath();
     this.fixedPort = opts.port ?? null;
     this.mode = opts.mode ?? 'memory';
-    this.logLevel = opts.logLevel ?? 'error';
+    this.dataDir = opts.dataDir ?? null;
+    this.dbDsn = opts.dbDsn ?? null;
+    this.logLevel = opts.logLevel ?? 'info';
     this.shutdownGrace = opts.shutdownGrace ?? '10s';
     this.readyTimeoutMs = opts.readyTimeoutMs ?? 10_000;
     this.maxRestarts = opts.maxRestarts ?? 5;
-    this.onChildLog = opts.onChildLog ?? null;
+    // Forward the child's logs so the embedded server is not silent by
+    // default; pass a custom function to redirect, or () => {} to mute.
+    this.onChildLog = opts.onChildLog ?? ((line) => process.stderr.write(`[ably-server] ${line}\n`));
 
     /** @type {import('node:child_process').ChildProcess | null} */
     this.child = null;
@@ -168,6 +174,8 @@ export class AblyServerSupervisor extends EventEmitter {
       '--log-level', this.logLevel,
       '--shutdown-grace', this.shutdownGrace,
     ];
+    if (this.dataDir) args.push('--data-dir', this.dataDir);
+    if (this.dbDsn) args.push('--db-dsn', this.dbDsn);
     const child = spawn(this.binaryPath, args, {
       env: { ...process.env, ABLY_SERVER_API_KEY: this.apiKey },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -268,12 +276,16 @@ export class AblyServerSupervisor extends EventEmitter {
 }
 
 /**
- * Convenience: construct + start a supervisor in one call.
- * @param {ConstructorParameters<typeof AblyServerSupervisor>[0]} [opts]
- * @returns {Promise<AblyServerSupervisor>}
+ * Convenience: construct + start an AblyServer in one call.
+ * @param {ConstructorParameters<typeof AblyServer>[0]} [opts]
+ * @returns {Promise<AblyServer>}
  */
 export async function startEmbeddedServer(opts) {
-  const sup = new AblyServerSupervisor(opts);
-  await sup.start();
-  return sup;
+  const server = new AblyServer(opts);
+  await server.start();
+  return server;
 }
+
+// Back-compat alias. AblyServer is the name a developer holds; "supervisor"
+// is the internal role, not the public noun.
+export const AblyServerSupervisor = AblyServer;

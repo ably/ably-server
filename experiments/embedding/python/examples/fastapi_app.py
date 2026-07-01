@@ -35,7 +35,7 @@ from fastapi.responses import FileResponse, JSONResponse
 # Allow `uvicorn examples.fastapi_app:app` from the python/ dir.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ably_embedded import AblyServerSupervisor, make_proxy_app  # noqa: E402
+from ably_embedded import AblyServer, make_proxy_app  # noqa: E402
 
 # Where the embedded server is mounted. "" = root catch-all (stock SDK).
 # "/ably" = subpath alongside the app's own routes.
@@ -45,7 +45,7 @@ DEMO_HTML = (
 )
 
 # A single supervisor for the app's lifetime.
-supervisor = AblyServerSupervisor(
+supervisor = AblyServer(
     api_key=os.environ.get("ABLY_SERVER_API_KEY", "app.key:secret"),
     on_event=lambda event, payload: print(
         f"[fastapi-app] embedded server: {event} {payload}", flush=True

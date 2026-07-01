@@ -52,6 +52,12 @@
   <p class="sub">This page is served by an ordinary web server (Go, Node, .NET or Python). That <em>same</em> server is also answering Ably SDK traffic — so the messages below are flowing through a realtime endpoint your app hosts itself. No separate server, no extra infrastructure to install.</p>
 </header>
 
+<div style="max-width: 980px; margin: 0 auto; padding: 0 24px 4px;">
+  <div style="background:#3a2a12;border:1px solid #6b4a1a;color:#f1c40f;border-radius:10px;padding:10px 14px;font-size:13px;">
+    <b>Dev only.</b> The API key <code style="color:#f1c40f">app.key:secret</code> is visible in this page's source. That's fine for a throwaway local dev key, but in production you never ship a key to the browser: mint short-lived tokens server-side and use ably-js <code style="color:#f1c40f">authUrl</code>. The embedded endpoint issues tokens at <code style="color:#f1c40f">POST /keys/{keyName}/requestToken</code>.
+  </div>
+</div>
+
 <div class="wrap">
   <div class="card">
     <h2>Live feed <span id="status" class="pill" style="float:right"><span class="dot" id="dot"></span><span id="state">connecting…</span></span></h2>

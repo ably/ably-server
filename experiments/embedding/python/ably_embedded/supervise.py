@@ -17,6 +17,7 @@ beyond the standard library + httpx (already a proxy dependency).
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import platform
 import signal
@@ -92,19 +93,27 @@ async def wait_for_ready(
     )
 
 
-class AblyServerSupervisor:
-    """Supervises a single embedded ably-server child process.
+# Child ably-server logs (stdout/stderr) are forwarded here so an embedded
+# server is not a silent black box. The host app configures Python logging as
+# usual; raise this logger to see the server's output.
+_log = logging.getLogger("ably_embedded.server")
+
+
+class AblyServer:
+    """An embedded ably-server child process you start, use, and stop.
 
     Lifecycle is async so it slots into an ASGI lifespan:
 
-        sup = AblyServerSupervisor(api_key=...)
-        await sup.start()        # spawn + wait for /readyz
-        ...                      # proxy to sup.port
-        await sup.stop()         # SIGTERM, then SIGKILL on grace timeout
+        server = AblyServer(api_key=...)
+        await server.start()     # spawn + wait for /readyz
+        ...                      # proxy to server.port
+        await server.stop()      # SIGTERM, then SIGKILL on grace timeout
 
     On unexpected child exit the watchdog respawns it (capped, with backoff)
-    on the SAME port — so a proxy that captured ``supervisor.port`` once stays
-    valid across a crash-restart.
+    on the SAME port — so a proxy that captured ``server.port`` once stays
+    valid across a crash-restart. Storage is memory mode by default; pass
+    mode="disk" with data_dir=... for durability, or mode="cluster" with
+    db_dsn=... for shared state across instances.
     """
 
     def __init__(
@@ -114,7 +123,9 @@ class AblyServerSupervisor:
         binary_path: Optional[str] = None,
         port: Optional[int] = None,
         mode: str = "memory",
-        log_level: str = "error",
+        data_dir: Optional[str] = None,
+        db_dsn: Optional[str] = None,
+        log_level: str = "info",
         shutdown_grace: str = "10s",
         ready_timeout_s: float = 10.0,
         max_restarts: int = 5,
@@ -126,6 +137,8 @@ class AblyServerSupervisor:
         self.binary_path = binary_path or resolve_binary_path()
         self._fixed_port = port
         self.mode = mode
+        self.data_dir = data_dir
+        self.db_dsn = db_dsn
         self.log_level = log_level
         self.shutdown_grace = shutdown_grace
         self.ready_timeout_s = ready_timeout_s
@@ -190,14 +203,23 @@ class AblyServerSupervisor:
             "--log-level", self.log_level,
             "--shutdown-grace", self.shutdown_grace,
         ]
+        if self.data_dir:
+            args += ["--data-dir", self.data_dir]
+        if self.db_dsn:
+            args += ["--db-dsn", self.db_dsn]
         env = {**os.environ, "ABLY_SERVER_API_KEY": self.api_key}
+        # Capture the child's stdout/stderr and forward it to the
+        # "ably_embedded.server" logger, so the embedded server's logs are
+        # visible to the host app instead of being discarded.
         self.proc = await asyncio.create_subprocess_exec(
             self.binary_path,
             *args,
             env=env,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+        asyncio.create_task(self._pump_logs(self.proc.stdout, logging.INFO))
+        asyncio.create_task(self._pump_logs(self.proc.stderr, logging.WARNING))
         # If stop() raced in between the _stopping check and now, undo: kill the
         # child we just spawned so it cannot outlive stop().
         if self._stopping:
@@ -208,6 +230,20 @@ class AblyServerSupervisor:
             return
         self._emit("spawn", self.proc.pid)
         self._watchdog = asyncio.create_task(self._watch(self.proc))
+
+    async def _pump_logs(self, stream, level: int) -> None:
+        """Forward one of the child's output streams to the logger, line by
+        line, until EOF. Log pumping must never crash supervision."""
+        if stream is None:
+            return
+        try:
+            while True:
+                line = await stream.readline()
+                if not line:
+                    return
+                _log.log(level, "[ably-server] %s", line.decode(errors="replace").rstrip())
+        except Exception:
+            return
 
     async def _watch(self, proc: asyncio.subprocess.Process) -> None:
         """Await the child's exit; respawn it if it died unexpectedly."""
@@ -281,8 +317,13 @@ class AblyServerSupervisor:
         self.proc = None
 
 
-async def start_embedded_server(**kwargs) -> AblyServerSupervisor:
-    """Convenience: construct + start a supervisor in one call."""
-    sup = AblyServerSupervisor(**kwargs)
-    await sup.start()
-    return sup
+async def start_embedded_server(**kwargs) -> AblyServer:
+    """Convenience: construct + start an AblyServer in one call."""
+    server = AblyServer(**kwargs)
+    await server.start()
+    return server
+
+
+# Back-compat alias. AblyServer is the name a developer holds; "supervisor"
+# is the internal role, not the public noun.
+AblyServerSupervisor = AblyServer

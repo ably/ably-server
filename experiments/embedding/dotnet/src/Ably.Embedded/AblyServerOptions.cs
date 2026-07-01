@@ -22,11 +22,20 @@ public sealed class AblyServerOptions
     /// </summary>
     public string? BinaryPath { get; set; }
 
-    /// <summary>Storage mode passed as <c>--mode</c>. Defaults to <c>memory</c>.</summary>
+    /// <summary>Storage mode passed as <c>--mode</c>: <c>memory</c> (default,
+    /// ephemeral), <c>disk</c> (durable, needs <see cref="DataDir"/>), or
+    /// <c>cluster</c> (shared state, needs <see cref="DbDsn"/>).</summary>
     public string Mode { get; set; } = "memory";
 
-    /// <summary>Server log level passed as <c>--log-level</c>.</summary>
-    public string LogLevel { get; set; } = "error";
+    /// <summary>Data directory passed as <c>--data-dir</c> for disk mode.</summary>
+    public string? DataDir { get; set; }
+
+    /// <summary>Postgres DSN passed as <c>--db-dsn</c> for cluster mode.</summary>
+    public string? DbDsn { get; set; }
+
+    /// <summary>Server log level passed as <c>--log-level</c>. Child logs are
+    /// forwarded to the host logger (stdout at Information, stderr at Warning).</summary>
+    public string LogLevel { get; set; } = "info";
 
     /// <summary>
     /// Graceful-shutdown window passed as <c>--shutdown-grace</c>. The

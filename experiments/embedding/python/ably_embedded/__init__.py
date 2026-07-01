@@ -2,17 +2,18 @@
 
 Public surface:
 
-    from ably_embedded import AblyServerSupervisor, start_embedded_server
-    from ably_embedded import AblyProxy, make_proxy_app
+    from ably_embedded import AblyServer, start_embedded_server
+    from ably_embedded import make_proxy_app
 
-The supervisor spawns + supervises the prebuilt ably-server binary on a free
-loopback port; the proxy is a catch-all ASGI app that reverse-proxies HTTP +
-WebSocket traffic to it (EMBEDDING-POC.md §5/§6).
+AblyServer spawns + supervises the prebuilt ably-server binary on a free
+loopback port; make_proxy_app returns a catch-all ASGI app that
+reverse-proxies HTTP + WebSocket traffic to it (EMBEDDING-POC.md §5/§6).
 """
 
 from .proxy import AblyProxy, make_proxy_app
 from .supervise import (
-    AblyServerSupervisor,
+    AblyServer,
+    AblyServerSupervisor,  # back-compat alias for AblyServer
     pick_free_port,
     resolve_binary_path,
     start_embedded_server,
@@ -20,6 +21,7 @@ from .supervise import (
 )
 
 __all__ = [
+    "AblyServer",
     "AblyServerSupervisor",
     "start_embedded_server",
     "resolve_binary_path",

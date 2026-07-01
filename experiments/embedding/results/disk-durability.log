@@ -1,0 +1,10 @@
+== disk-mode durability: publish, kill -9, restart on same data-dir, history survives ==
+data-dir: /var/folders/4g/gft5vxg5477b41tlsb9ycm800000gn/T/tmp.WooUkrMIGz ; port: 8600 ; Wed Jul  1 15:08:32 CEST 2026
+-- run 1 (pid 78115): publish 3 messages via REST --
+   history before crash: 3 messages
+-- kill -9 78115 (hard crash, no graceful shutdown) --
+-- run 2: restart on the SAME data-dir --
+   history after kill -9 + restart: 3 messages
+   RESULT: PASS — all 3 messages survived the crash (durable)
+-- contrast: memory mode does NOT persist (fresh server, empty history) --
+   memory-mode history for same channel: 0 (expected 0 — ephemeral)
