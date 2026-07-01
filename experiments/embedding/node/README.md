@@ -113,7 +113,7 @@ ABLY_PUBLIC_PORT=8541 npm run smoke
 | Export | From | Purpose |
 |---|---|---|
 | `startEmbeddedServer(opts)` | `@ably/embedded-server` | construct + start a supervisor; resolves once `/readyz` is green |
-| `AblyServerSupervisor` | `@ably/embedded-server` | the supervisor class (events: `ready`, `spawn`, `exit`, `restart`, `error`) |
+| `AblyServer` | `@ably/embedded-server` | the supervisor class (events: `ready`, `spawn`, `exit`, `restart`, `error`) |
 | `mountAblyProxy(app, { supervisor })` | `@ably/embedded-server/express` | returns `{ middleware, upgrade }`; wire `upgrade` to `server.on('upgrade', …)` |
 | `registerAblyProxy(fastify, { supervisor })` | `@ably/embedded-server/fastify` | registers `@fastify/http-proxy` with `websocket: true` |
 

@@ -37,10 +37,11 @@ same way `cmd/ably-server/main.go` wires them — no change to ably-server.
 - Covers every platform the Go toolchain targets (the host app compiles
   ably-server in). No prebuilt-binary matrix, no extraction, no toolchain
   beyond the Go compiler the host already uses.
-- **Binary size: host app = 9.1 MB** with ably-server compiled in (memory
-  mode only). Smaller than the **15.5 MB** standalone binary because the
-  in-process embed imports only `storage/memory`, not the Postgres (pgx)
-  and bbolt backends. Embedding adds single-digit MB to a Go app.
+- **Binary size: host app ≈ 10.2 MB** (decimal MB) with ably-server compiled
+  in (memory + disk storage). Smaller than the **≈16.5 MB** standalone binary
+  because the in-process embed imports only `storage/memory` and
+  `storage/bbolt`, not the Postgres (pgx) cluster backend. Embedding adds
+  ~10 MB to a Go app.
 
 ### Ease of use
 - One-liner to start: yes (`srv.ListenAndServe()` after `New`).

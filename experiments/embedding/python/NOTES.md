@@ -130,7 +130,7 @@ builders need the host knobs threaded through consistently.
 ### Developer experience (DX)
 - **Integration glue the host-app dev writes (FastAPI): ~6 Ably-specific
   lines** inside an otherwise stock FastAPI app — construct
-  `AblyServerSupervisor(...)`, `await supervisor.start()` /
+  `AblyServer(...)`, `await supervisor.start()` /
   `await supervisor.stop()` in the lifespan, `make_proxy_app(supervisor)`, and
   a 3-line fall-through that sends Ably paths to the proxy and everything else
   to FastAPI. `examples/fastapi_app.py` is **89 non-blank/non-comment lines**
@@ -176,7 +176,7 @@ builders need the host knobs threaded through consistently.
 | Auto free-port for the child? | Yes — `pick_free_port()` binds an OS ephemeral loopback port; the dev never picks the internal port. Same bind-then-release TOCTOU as Node/.NET. |
 | Auto-shutdown with the app? | Yes — the ASGI **lifespan** `finally` calls `supervisor.stop()` (SIGTERM then SIGKILL on grace). Verified (C2). Flask needs an explicit signal handler (finding #1). |
 | Restart on crash? | Yes — an asyncio **watchdog** task awaits the child and respawns on unexpected exit, same port, re-gated on `/readyz`. Verified (C1). |
-| Config surface | `AblyServerSupervisor(api_key=, binary_path=, mode=, log_level=, shutdown_grace=, max_restarts=, ...)` + env `ABLY_SERVER_API_KEY` / `ABLY_SERVER_BINARY`. |
+| Config surface | `AblyServer(api_key=, binary_path=, mode=, log_level=, shutdown_grace=, max_restarts=, ...)` + env `ABLY_SERVER_API_KEY` / `ABLY_SERVER_BINARY`. |
 
 ### Reliability (measured)
 **Conformance (through FastAPI/Starlette):** PASS — root 6/6 incl. **resume**

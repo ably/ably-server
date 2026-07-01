@@ -50,7 +50,8 @@ SDK works through the proxy.
 
 Environment: macOS 15 (Darwin 25.5.0) arm64, Go 1.25.11, Node v24.11.0,
 .NET SDK 10.0.301, Python 3.14.5, ably-go v1.4.0, ably-js 2.x, IO.Ably
-1.2.18, ably-python 3.1.2. `memory` mode (zero external dependencies). All
+1.2.18, ably-python 3.1.2. `memory` mode by default, with `disk` mode also
+exercised for durability (see Reliability); zero external dependencies. All
 loopback.
 
 ## The trade-off matrix (§7)
@@ -61,7 +62,7 @@ loopback.
 | **DX** — integration glue | n/a | **~3 lines** (`New` + mount `Handler` + `Close`) | **~8 lines** (supervisor + proxy + WS `upgrade` wiring) | **~20 lines** (host builder + YARP route + supervisor) | **~20 lines** (lifespan supervisor + `make_proxy_app` + ASGI fall-through) |
 | **DX** — new concepts | n/a | ~1 (it's an `http.Handler`) | ~2 (child process; wire WS `upgrade`) | ~2 (child process; YARP cluster destination) | ~2 (child process; ASGI fall-through routing) |
 | **DX** — idiomatic fit | n/a | native `net/http` | Express middleware / Fastify plugin | ASP.NET + YARP config | FastAPI/Starlette ASGI (WSGI can't do WS) |
-| **Portability** — binary | 15.5 MB standalone | **+9.1 MB compiled into the host binary**, any Go target, no extra toolchain | 15.5 MB prebuilt **per os/cpu**, no toolchain on user machine | 15.5 MB prebuilt + **.NET runtime**; NuGet `runtimes/<rid>` | 15.5 MB prebuilt + **Python runtime**; PyPI platform wheels |
+| **Portability** — binary (decimal MB) | ~16.5 MB standalone | **+10.2 MB compiled into the host binary** (memory + disk), any Go target, no extra toolchain | ~16.5 MB prebuilt **per os/cpu**, no toolchain on user machine | ~16.5 MB prebuilt + **.NET runtime**; NuGet `runtimes/<rid>` | ~16.5 MB prebuilt + **Python runtime**; PyPI platform wheels |
 | **Ease of use** — auto free-port | — | host owns the port | **yes** (supervisor; proxy reads it live) | **yes** (supervisor; injected into YARP) | **yes** (supervisor; proxy reads it live) |
 | **Ease of use** — auto-shutdown with app | — | inherent (`defer Close`) | yes (SIGTERM handler) | yes (host lifetime) | yes (ASGI lifespan) |
 | **Reliability** — harness 6/6 | **PASS** | **PASS** | **PASS / PASS** | **PASS** | **PASS** |
@@ -73,20 +74,26 @@ loopback.
 
 ### Measured conformance (all tracks, same harness)
 
+One committed run, regenerated directly from `results/*.json` (all six
+measured in a single batch on macOS arm64). **Latency figures are indicative
+single-run numbers, not benchmarks** — throughput in particular varies run to
+run (a second run moved soak by 10–30%); treat orders of magnitude, not
+exact values.
+
 | Scenario | Floor | Go in-proc | Node Express | Node Fastify | .NET YARP | Python FastAPI |
 |---|---|---|---|---|---|---|
-| connect (ms) | 1.98 | 1.63 | 4.17 | 4.20 | 4.98–10.2 | 7.34 |
-| pubsub mean / p99 (ms) | 0.14 / 0.18 | 0.11 / 0.16 | 0.15 / 0.18 | 0.19 / 0.28 | 0.16–0.26 / 0.27–0.42 | 0.37 / 0.47 |
-| restpubsub mean (ms) | 0.32 | 0.29 | 0.67 | 1.97 | 0.47–0.64 | 1.96 |
+| connect (ms) | 2.6 | 1.2 | 1.7 | 3.7 | 5.6 | 4.5 |
+| pubsub mean / p99 (ms) | 0.10 / 0.23 | 0.11 / 0.31 | 0.10 / 0.19 | 0.19 / 0.31 | 0.18 / 0.22 | 0.32 / 0.36 |
+| restpubsub mean (ms) | 0.21 | 0.23 | 0.71 | 3.12 | 0.49 | 1.47 |
 | history (10, ordered) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | resume (RESUMED, lossless) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | soak (200 msgs, loss / dupes) | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
-| soak throughput (msg/s) | ~2037 | ~2247 | ~1005 | ~542 | ~1800–2150 | ~1114 |
+| soak throughput (msg/s, single run) | ~1980 | ~1935 | ~720 | ~515 | ~1485 | ~990 |
 
-Reading the numbers: the embedding **proxy overhead is small** — single-digit
-millisecond connects and sub-millisecond pub/sub round-trips even through a
-reverse proxy. The in-process ceiling is the fastest (no socket hop on the
-host side); Node Fastify's REST path is the slowest because `@fastify/http-proxy`
+Reading the numbers: the embedding **proxy overhead is small** — low
+single-digit millisecond connects and sub-millisecond pub/sub round-trips even
+through a reverse proxy, and zero message loss everywhere. Node Fastify's REST
+path is the slowest because `@fastify/http-proxy`
 re-frames each request (`reply-from`) where Express's `http-proxy-middleware`
 streams it. None of this is a correctness or scale concern for the PoC's
 purpose; it is the cost of a local proxy hop, and it is low.
@@ -163,12 +170,19 @@ Realtime is unaffected on all SDKs; this is a REST-over-plain-HTTP concern.
 
 ## Reliability / fault-injection (run, not described)
 
-| Case | Go in-proc | Node (Express & Fastify) | .NET (YARP) |
-|---|---|---|---|
-| `kill -9` embedded child → auto-restart, harness passes | N/A (no child) | **PASS** (restart logged, re-ready, harness passes) | **PASS** |
-| SIGTERM host app → clean exit, no orphan child | **PASS** (exit 0) | **PASS** (exit 0, ~0.1 s, no orphan) | **PASS** (exit 0, no orphan) |
-| resume-after-drop through the host | **PASS** | **PASS** | **PASS** |
-| soak: 200 msgs, zero loss | **PASS** | **PASS** | **PASS** |
+| Case | Go in-proc | Node (Express & Fastify) | .NET (YARP) | Python (FastAPI) |
+|---|---|---|---|---|
+| `kill -9` embedded child → auto-restart, harness passes | N/A (no child) | **PASS** (restart logged, re-ready, harness passes) | **PASS** | **PASS** |
+| SIGTERM host app → clean exit, no orphan child | **PASS** (exit 0) | **PASS** (exit 0, ~0.1 s, no orphan) | **PASS** (exit 0, no orphan) | **PASS** (exit 0, no orphan) |
+| resume-after-drop through the host | **PASS** | **PASS** | **PASS** | **PASS** |
+| soak: 200 msgs, zero loss | **PASS** | **PASS** | **PASS** | **PASS** |
+
+**Durability (disk mode).** In disk mode the state is a bbolt file, so it
+survives a restart. Verified end to end: publish 3 messages, `kill -9` the
+server, restart on the same data dir, all 3 are still in history (memory mode
+shows 0). Proof: `results/disk-durability.log`, via the Go embed's
+`Mode: "disk"`. The child-process tracks (Node/.NET/Python) pass `mode` +
+`data-dir` through to the same storage layer.
 
 The in-process ceiling has **no child to restart** — its trade-off is a
 **shared blast radius** (a server panic takes the host app down). The
@@ -309,6 +323,53 @@ ephemeral; Go in-process shares the host's crash blast radius.
 **Sweet spot:** local dev, CI, single-tenant / self-hosted single-instance
 apps, desktop/CLI bundling realtime, demos, on-prem single box. Full
 per-language fit + friction detail in [USING.md](USING.md#when-it-fits--and-when-not-to-embed).
+
+## What we haven't addressed (and how to close it)
+
+Deliberately out of scope for the PoC, in rough priority order. Each is a
+labelled follow-up with the concrete path to close it, so nothing here is a
+surprise later:
+
+1. **Observability / a control-plane API.** There is no `/metrics`, pprof,
+   OTEL, or stats/admin/live-view endpoint today (only `/healthz` + `/readyz`).
+   *Close:* a read-only `GET /stats` (active connections, attached channels,
+   message counters) as the cheap DX win first; then Prometheus `/metrics`
+   (TASK-27), pprof behind `--debug-listen` (TASK-40), OTEL via `OTEL_*`
+   (TASK-41). Comparable tools ship this (Socket.IO Admin UI, Centrifugo,
+   Temporal dev UI).
+2. **Cross-compile matrix + real packaging.** Cross-compilation works (pure
+   Go, static `CGO_ENABLED=0`) but every build here is host-arch and packaging
+   is described, not implemented. *Close:* a `build-matrix.sh` over the six
+   GOOS/GOARCH pairs; one conformance run against a linux/amd64 (and Alpine/
+   musl) container; then per-registry packaging (npm `optionalDependencies`,
+   NuGet `runtimes/<rid>`, PyPI wheels) with a thin end-to-end proof; then
+   macOS notarisation / Windows signing.
+3. **Cluster (Postgres) shared-state, run for real.** Disk-mode single-node
+   durability is now proven (`results/disk-durability.log`); cluster mode is
+   not exercised. *Close:* docker-compose Postgres + two host instances on the
+   shared DSN, harness cross-instance fan-out (the server already has cluster
+   integration tests to lean on).
+4. **Windows graceful stop.** Node and Python send SIGTERM, which Windows
+   ignores (hard kill, no drain); only .NET branches correctly. Nothing was
+   run on Windows. *Close:* OS-branch the Node/Python stop (control-event /
+   pipe) and run one Windows track. Today the docs label this precisely.
+5. **Naming + single-call convenience.** `.NET`/Go read as "start and attach";
+   Node/Python still wire supervisor + proxy + upgrade by hand. *Close:*
+   `attachAblyServer(app)` (Express) and an `mount_ably(app)` ASGI helper
+   (Python). Separately, decide the product naming (`@ably/server` vs the
+   inherited `@ably/embedded-server`).
+6. **Machine-readable ready-line.** Supervisors poll `/readyz` and pick a free
+   port (small TOCTOU window). *Close:* emit a ready-line on stdout from
+   `cmd/ably-server` after `net.Listen`; supervisors parse it (deferred per the
+   brief).
+7. **Test-harness robustness.** The fault-injection scripts identify the child
+   via a machine-wide `pgrep`, which false-positives under concurrency (it did
+   in a batch run; each case passes in isolation). *Close:* scope the match to
+   the track's binary path / port.
+8. **Security hardening.** Embedding co-hosts a token-issuing, publish-capable
+   endpoint on your origin. The demo now carries a dev-only key banner; a
+   production guide (token auth via `authUrl`, TLS off loopback, treat as a
+   mounted admin surface) is still to write.
 
 ## Reproduce
 

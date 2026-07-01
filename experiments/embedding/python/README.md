@@ -118,12 +118,12 @@ cd experiments/embedding/python
 
 | Setting | Where | Default |
 |---|---|---|
-| API key | `AblyServerSupervisor(api_key=)` / env `ABLY_SERVER_API_KEY` | `app.key:secret` |
-| Binary path | `AblyServerSupervisor(binary_path=)` / env `ABLY_SERVER_BINARY` | `<pkg>/../bin/ably-server` |
-| Server mode | `AblyServerSupervisor(mode=)` | `memory` |
-| Internal port | `AblyServerSupervisor(port=)` | OS-assigned free port |
-| Shutdown grace | `AblyServerSupervisor(shutdown_grace=)` | `10s` |
-| Max crash-restarts | `AblyServerSupervisor(max_restarts=)` | `5` |
+| API key | `AblyServer(api_key=)` / env `ABLY_SERVER_API_KEY` | `app.key:secret` |
+| Binary path | `AblyServer(binary_path=)` / env `ABLY_SERVER_BINARY` | `<pkg>/../bin/ably-server` |
+| Server mode | `AblyServer(mode=)` | `memory` |
+| Internal port | `AblyServer(port=)` | OS-assigned free port |
+| Shutdown grace | `AblyServer(shutdown_grace=)` | `10s` |
+| Max crash-restarts | `AblyServer(max_restarts=)` | `5` |
 | Public port (example) | env `ABLY_PUBLIC_PORT` | 8581/8585/8588 |
 | Subpath (example) | env `ABLY_BASE_PATH` | `""` (root) |
 

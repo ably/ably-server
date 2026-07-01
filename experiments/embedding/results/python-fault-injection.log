@@ -1,25 +1,25 @@
 == Python embedding fault injection ==
-date: 2026-06-30T21:30:35Z  publicPort: 8595
+date: 2026-07-01T13:22:10Z  publicPort: 8585
 
-app (uvicorn) pid: 69087
+app (uvicorn) pid: 4429
 app /readyz green via proxy
 
 -- C1: kill -9 the embedded ably-server child --
-embedded child pid (before): 69091
-sent SIGKILL to 69091
-respawned child pid (after): 69122  (old 69091 dead, /readyz green)
+embedded child pid (before): 4389
+sent SIGKILL to 4389
+respawned child pid (after): 4435  (old 4389 dead, /readyz green)
 running harness --scenarios connect,pubsub through the proxy after respawn:
-== harness [python-postkill] against 127.0.0.1:8595 (protocol=json) ==
-  ok   connect          5ms  connectMs=4.89
-  ok   pubsub           8ms  maxMs=0.41 meanMs=0.31 minMs=0.28 p50Ms=0.3 p99Ms=0.41 samples=20
+== harness [python-postkill] against 127.0.0.1:8585 (protocol=json) ==
+  ok   connect          5ms  connectMs=4.86
+  ok   pubsub           8ms  maxMs=0.33 meanMs=0.27 minMs=0.22 p50Ms=0.28 p99Ms=0.33 samples=20
 == PASS [python-postkill] (13ms wall) ==
 C1 harness exit: 0
 C1 PASS: respawn + connect,pubsub OK
 
 -- C2: SIGTERM the host app --
-embedded child pid (before SIGTERM): 69122
+embedded child pid (before SIGTERM): 4435
 app exit code: 0
-embedded child 69122 gone — no orphan
+embedded child 4435 gone — no orphan
 C2 PASS: clean shutdown (exit 0), child reaped
 
 == FAULT INJECTION PASS (C1 + C2) ==

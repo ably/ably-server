@@ -53,18 +53,18 @@ await channel.publish('msg', 'hello from an embedded Ably');
 ```python
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from ably_embedded import AblyServerSupervisor, make_proxy_app
+from ably_embedded import AblyServer, make_proxy_app
 
-supervisor = AblyServerSupervisor(api_key="app.key:secret")
+server = AblyServer(api_key="app.key:secret")   # mode="disk", data_dir=... for durability
 
 @asynccontextmanager
 async def lifespan(app):
-    await supervisor.start()        # spawn the child, wait for /readyz
+    await server.start()            # spawn the child, wait for /readyz
     yield
-    await supervisor.stop()         # stop it with the app, no orphan
+    await server.stop()             # stop it with the app, no orphan
 
 app = FastAPI(lifespan=lifespan)
-proxy = make_proxy_app(supervisor)  # catch-all ASGI reverse-proxy (WS + REST)
+proxy = make_proxy_app(server)      # catch-all ASGI reverse-proxy (WS + REST)
 # your own routes live on `app`; Ably traffic falls through to `proxy`
 # (see examples/fastapi_app.py for the ASGI fall-through wiring)
 ```
@@ -111,14 +111,17 @@ protocol and every Ably SDK, not a bespoke socket library you'll outgrow.
 ## Where it gets interesting: AI
 
 This is the part I care about most. If you're building an AI application, an
-embedded ably-server, backed by your own Postgres, gives you durable sessions,
-resumable streams and the AI Transport semantics, running locally inside your
-app. That's genuinely capable, and Socket.IO has nothing like it. It doesn't
-scale the way the cloud does and it misses features you'd get from the managed
-service, but as a starting point it lets people build realtime AI apps in a
-better way than they do today, without installing any extra services. Open
-source, protocol-compatible, with a clean upgrade path to Ably cloud when they
-outgrow it. That's a strong on-ramp.
+embedded ably-server gives you resumable streams and the AI Transport
+semantics running locally inside your app. And it can be durable: in disk mode
+the state is a local file, so sessions and history survive a restart. We
+proved that end to end (publish, `kill -9`, restart on the same data dir, all
+messages still there, see `results/disk-durability.log`), and the Go embed API
+takes `Mode: "disk"` for it. Socket.IO has nothing like this. It doesn't scale
+the way the cloud does, and shared state across instances still needs cluster
+mode (Postgres), but as a starting point it lets people build realtime AI apps
+in a better way than they do today, without installing any extra services.
+Open source, protocol-compatible, with a clean upgrade path to Ably cloud when
+they outgrow it. That's a strong on-ramp.
 
 ## What it is, and what it isn't
 

@@ -237,16 +237,16 @@ app.Run();
 ### Python — FastAPI/Starlette (ASGI)
 
 ```python
-from ably_embedded import AblyServerSupervisor, make_proxy_app
+from ably_embedded import AblyServer, make_proxy_app
 
-supervisor = AblyServerSupervisor(api_key="app.key:secret")
-proxy = make_proxy_app(supervisor, base_path="")     # catch-all ASGI reverse-proxy
+server = AblyServer(api_key="app.key:secret")        # mode="disk", data_dir=... for durability
+proxy = make_proxy_app(server, base_path="")         # catch-all ASGI reverse-proxy
 
 @asynccontextmanager
 async def lifespan(app):
-    await supervisor.start()                          # spawn child + /readyz gate
+    await server.start()                              # spawn child + /readyz gate
     yield
-    await supervisor.stop()                           # SIGTERM the child, no orphan
+    await server.stop()                               # SIGTERM the child, no orphan
 
 # FastAPI serves your routes (and /demo/); `proxy` is the fall-through ASGI app
 # for Ably traffic (WS + REST). See examples/fastapi_app.py for the ~20-line wiring.
@@ -283,6 +283,24 @@ client can't target `/ably` today — only raw clients and the harness can. The
 deferred SDK change is a small additive `basePath` option threaded through the
 SDK's URL builders ([EMBEDDING-POC.md §6](../../EMBEDDING-POC.md)); once it
 lands, the browser demo would point at `/ably` too.
+
+## Logging and diagnostics
+
+The embedded server logs at `info` by default (startup, storage, listen,
+connection lifecycle). Where those logs go depends on the track, and none of
+the tracks throw them away:
+
+| Track | Where the server's logs go | Turn up / redirect |
+|---|---|---|
+| **Go** (in-process) | the `*slog.Logger` you pass as `Options.Logger` (nil discards) | it's your app's own logger |
+| **Node** | child stdout/stderr forwarded to `process.stderr`, prefixed `[ably-server]` | pass `onChildLog: (line) => yourLogger(line)` to `startEmbeddedServer`, or `() => {}` to mute |
+| **.NET** | child stdout at `Information`, stderr at `Warning`, category `Ably.Embedded` | standard ASP.NET logging filters |
+| **Python** | child stdout/stderr forwarded to the `ably_embedded.server` logger (stdout `INFO`, stderr `WARNING`) | standard `logging` config |
+
+Health checks are `GET /healthz` and `GET /readyz`. There is **no metrics,
+stats, or admin API yet** (no `/metrics`, pprof, or live-view) — see
+[RESULTS.md](RESULTS.md#what-we-havent-addressed-and-how-to-close-it) for the
+plan (a read-only `GET /stats` is the intended first step).
 
 ## A note on auth over plain HTTP
 
