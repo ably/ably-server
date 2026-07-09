@@ -171,6 +171,44 @@ func TestPublishJSONArrayBody(t *testing.T) {
 	}
 }
 
+func TestPublishMsgpackArrayBody(t *testing.T) {
+	srv, manager := newTestServer(t)
+	stream := attachStream(t, manager, "foo")
+
+	msgs := []*protocol.Message{
+		{Name: "a", Data: "1"},
+		{Name: "b", Data: "2"},
+		{Name: "c", Data: "3"},
+	}
+	body, err := msgpack.Marshal(msgs)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	resp := request(t, srv, http.MethodPost, "/channels/foo/messages", "application/x-msgpack", body, true)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+
+	// A msgpack array body is one atomic publish: it lands as a single
+	// ChannelMessage carrying every message, matching a WS MESSAGE frame's
+	// messages[] (RSL1).
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	cm, err := stream.Next(ctx)
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if len(cm.Messages) != len(msgs) {
+		t.Fatalf("Messages length = %d, want %d (array must land as one ChannelMessage)", len(cm.Messages), len(msgs))
+	}
+	for i, want := range msgs {
+		got := cm.Messages[i]
+		if got.Name != want.Name || got.Data != want.Data {
+			t.Errorf("msg %d = %+v, want %+v", i, got, want)
+		}
+	}
+}
+
 func TestPublishMsgpack(t *testing.T) {
 	srv, manager := newTestServer(t)
 	stream := attachStream(t, manager, "foo")
