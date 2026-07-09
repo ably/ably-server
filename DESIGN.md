@@ -1337,4 +1337,4 @@ compatibility.
 
 - License: **Apache 2.0** (matches ably-go).
 - Module: `github.com/ably/ably-server`.
-- Go version floor: **1.25**.
+- Go version floor: **1.26**.

@@ -1,7 +1,4 @@
 // Command ably-server is the open-source Ably-compatible server.
-//
-// At this stage it terminates WebSocket connections at `/`, sends a
-// CONNECTED frame on connect, and emits periodic HEARTBEAT frames.
 package main
 
 import (

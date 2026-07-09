@@ -53,7 +53,7 @@ LiveObjects, and the rest of the cloud-only product surface.
 
 ## Quickstart
 
-Requires Go 1.25+.
+Requires Go 1.26+.
 
 ```sh
 # Pick any key in the Ably format: <appId>.<keyId>:<secret>
