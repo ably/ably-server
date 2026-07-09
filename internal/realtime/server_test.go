@@ -337,23 +337,23 @@ func TestAttachForwardsPublishedMessages(t *testing.T) {
 	}
 }
 
-func TestAttachIsIdempotentPerChannel(t *testing.T) {
+func TestRepeatAttachReattachesWithoutDuplicating(t *testing.T) {
 	srv, h := newTestServer(t, time.Hour)
 	ws := dial(t, srv, "")
 	drainConnected(t, ws)
 
-	// Two ATTACHes for the same channel should not start two attachments;
-	// only one ATTACHED is expected, and a subsequent publish produces one
-	// MESSAGE.
+	// A repeat ATTACH for the same channel is a re-attach (RTL4, DESIGN.md
+	// §4.1): each ATTACH gets its own ATTACHED, so the SDK never blocks. But
+	// the earlier attachment is torn down, so only one live attachment
+	// remains and a subsequent publish produces exactly one MESSAGE.
 	for range 2 {
 		sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 			Action:  protocol.ActionAttach,
 			Channel: "foo",
 		})
-	}
-
-	if msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); msg.Action != protocol.ActionAttached {
-		t.Fatalf("expected ATTACHED, got %v", msg.Action)
+		if msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); msg.Action != protocol.ActionAttached {
+			t.Fatalf("expected ATTACHED, got %v", msg.Action)
+		}
 	}
 
 	h.publish(t, "foo", &protocol.Message{ID: "m1"})
@@ -363,12 +363,13 @@ func TestAttachIsIdempotentPerChannel(t *testing.T) {
 		t.Fatalf("Action = %v, want MESSAGE", msg.Action)
 	}
 
-	// No further frames should arrive within a short window.
+	// No further frames should arrive within a short window — the re-attach
+	// must not leave a second live attachment delivering duplicates.
 	if err := ws.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
 		t.Fatalf("SetReadDeadline: %v", err)
 	}
 	if _, _, err := ws.ReadMessage(); err == nil {
-		t.Fatal("received an unexpected extra frame; idempotent attach produced duplicates")
+		t.Fatal("received an unexpected extra frame; re-attach produced duplicates")
 	}
 }
 

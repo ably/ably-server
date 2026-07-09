@@ -93,6 +93,26 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	connID := id.NewConnectionID()
+
+	// A resume/recover attempt with a malformed connection key is declined
+	// per protocol (DESIGN.md §4.3): the connection still succeeds with a
+	// fresh connectionId, but the CONNECTED carries error 80018 so the SDK
+	// treats the resume/recover as failed (RTN15c7, RTN16e). A well-formed
+	// key is left un-errored — connection-state resume is a non-goal, so the
+	// SDK recovers message flow via per-channel re-attach instead.
+	resumeKey := r.URL.Query().Get("resume")
+	if resumeKey == "" {
+		resumeKey = r.URL.Query().Get("recover")
+	}
+	var resumeError *protocol.ErrorInfo
+	if resumeKey != "" && !id.ValidConnectionID(resumeKey) {
+		resumeError = &protocol.ErrorInfo{
+			Code:       80018,
+			StatusCode: 400,
+			Message:    "invalid connection key; resume/recover could not be satisfied",
+		}
+	}
+
 	conn := &connection{
 		ws:                ws,
 		format:            format,
@@ -113,6 +133,7 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		entered:           make(map[string]map[string]struct{}),
 		publishQ:          make(chan func(), 16),
 		reauth:            make(chan time.Time, 1),
+		resumeError:       resumeError,
 	}
 
 	// The upgrade succeeded: count the connection and time its lifetime,

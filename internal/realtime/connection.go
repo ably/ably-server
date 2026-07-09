@@ -72,6 +72,15 @@ type connection struct {
 	// successful inband re-auth, so it reschedules its prompt/expiry
 	// timers. Buffered (cap 1) so the read goroutine never blocks on it.
 	reauth chan time.Time
+
+	// resumeError, when non-nil, is carried on the initial CONNECTED frame
+	// to decline a resume/recover the server cannot honour (DESIGN.md §4.3):
+	// a malformed resume/recover key. The fresh connectionId plus this error
+	// tell the SDK the resume failed so it resets msgSerial and re-attaches
+	// (RTN15c7, RTN16e). A well-formed key is left un-errored — the server
+	// still starts a fresh connection (connection-state resume is a non-goal)
+	// but the SDK recovers message flow via per-channel re-attach.
+	resumeError *protocol.ErrorInfo
 }
 
 // Connection limits advertised in ConnectionDetails on CONNECTED
@@ -110,10 +119,13 @@ func (c *connection) run(ctx context.Context) {
 	}
 
 	// CONNECTED is the first frame we emit; buffer is empty here.
+	// resumeError (a declined resume/recover, DESIGN.md §4.3) rides along
+	// so the SDK sees the fresh connectionId as a resume failure.
 	if !c.queue(ctx, &protocol.ProtocolMessage{
 		Action:            protocol.ActionConnected,
 		ConnectionID:      c.id,
 		ConnectionDetails: c.connectionDetails(),
+		Error:             c.resumeError,
 	}) {
 		return
 	}

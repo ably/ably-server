@@ -407,7 +407,25 @@ Once attached, modes gate frame flow:
 The v2 protocol holds **no per-connection server state across disconnects**.
 There is no recovery TTL, no retained outbox, no resume buffer. Connection-
 level `recover` / `resume` parameters are accepted on the upgrade URL for
-SDK compatibility but are no-ops.
+SDK compatibility but never resume connection state: a reconnect always
+gets a **fresh `connectionId`**, so connection-state resume/recovery is an
+accepted incompatibility (the SDK's connectionId-continuity checks —
+ably-go RTN15c6, RTN16f — do not hold against this server).
+
+The server still declines a resume/recover *per protocol* so the SDK reacts
+cleanly rather than silently mis-accounting a phantom resume:
+
+- A **malformed** `resume` / `recover` key (not a well-formed connectionId
+  this server could have issued) yields `CONNECTED` with the fresh
+  `connectionId` **plus an error** (`80018`, status `400`). Because the
+  connectionId differs *and* an error is present, the SDK treats the resume
+  as failed: it resets its `msgSerial`, resends pending publishes, and
+  re-attaches its channels (RTN15c7, RTN16e).
+- A **well-formed** key is left un-errored. The server cannot truly resume
+  it (it holds no connection state) but does not know it from a genuine
+  resume, so it starts a fresh connection without signalling failure; the
+  SDK recovers message flow through per-channel re-attach (below) rather
+  than connection resume.
 
 Continuity instead lives at the attachment level, driven by the client:
 
