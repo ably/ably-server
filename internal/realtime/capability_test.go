@@ -127,14 +127,17 @@ func TestInboundMessageCapability(t *testing.T) {
 	}
 }
 
-// sendUpdate sends an update mutation targeting serial and returns the
-// resulting ACK/NACK frame.
-func sendUpdate(t *testing.T, ws *websocket.Conn, channel, serial string) *protocol.ProtocolMessage {
+// sendUpdate sends an update mutation targeting serial with the given
+// publish msgSerial and returns the resulting ACK/NACK frame. msgSerial must
+// be monotonic per connection (the server drops a repeated/backward serial,
+// see acceptMsgSerial), so a connection that already published must pass a
+// higher value than its previous frame.
+func sendUpdate(t *testing.T, ws *websocket.Conn, channel, serial string, msgSerial int64) *protocol.ProtocolMessage {
 	t.Helper()
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   channel,
-		MsgSerial: 1,
+		MsgSerial: msgSerial,
 		Messages:  []*protocol.Message{{Action: protocol.MessageUpdate, Serial: serial, Data: "edited"}},
 	})
 	return readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
@@ -160,28 +163,28 @@ func TestWSMutationOwnership(t *testing.T) {
 	serial := ack.Res[0].Serials[0]
 
 	// own-allowed: alice updates her own message.
-	if f := sendUpdate(t, alice, channel, serial); f.Action != protocol.ActionAck {
+	if f := sendUpdate(t, alice, channel, serial, 2); f.Action != protocol.ActionAck {
 		t.Errorf("alice update (own-allowed) = %+v, want ACK", f)
 	}
 
 	// own-denied: bob has message-update-own but is not the creator.
 	bob := dialTokenClientID(t, srv, `{"chat:*":["message-update-own"]}`, "bob")
 	drainConnected(t, bob)
-	if f := sendUpdate(t, bob, channel, serial); f.Action != protocol.ActionNack || f.Error == nil || f.Error.Code != 40160 {
+	if f := sendUpdate(t, bob, channel, serial, 1); f.Action != protocol.ActionNack || f.Error == nil || f.Error.Code != 40160 {
 		t.Errorf("bob update (own-denied) = %+v, want NACK 40160", f)
 	}
 
 	// any-allowed: carol has message-update-any.
 	carol := dialTokenClientID(t, srv, `{"chat:*":["message-update-any"]}`, "carol")
 	drainConnected(t, carol)
-	if f := sendUpdate(t, carol, channel, serial); f.Action != protocol.ActionAck {
+	if f := sendUpdate(t, carol, channel, serial, 1); f.Action != protocol.ActionAck {
 		t.Errorf("carol update (any-allowed) = %+v, want ACK", f)
 	}
 
 	// missing-capability: dave has only publish.
 	dave := dialTokenClientID(t, srv, `{"chat:*":["publish"]}`, "dave")
 	drainConnected(t, dave)
-	if f := sendUpdate(t, dave, channel, serial); f.Action != protocol.ActionNack || f.Error == nil || f.Error.Code != 40160 {
+	if f := sendUpdate(t, dave, channel, serial, 1); f.Action != protocol.ActionNack || f.Error == nil || f.Error.Code != 40160 {
 		t.Errorf("dave update (missing-cap) = %+v, want NACK 40160", f)
 	}
 }

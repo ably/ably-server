@@ -625,6 +625,14 @@ out-of-order or premature ack corrupts its pending-publish accounting).
 Validation rejections are enqueued through the same worker so their `NACK`
 stays ordered behind any still-in-flight publishes.
 
+An inbound `MESSAGE` / `PRESENCE` `msgSerial` must be monotonic per
+connection. A frame whose `msgSerial` repeats or goes backward is a client
+retransmit — e.g. the SDK re-flushing a queued publish with the same
+`msgSerial` after a reconnect (RTL6c2) — and is **dropped** on the read
+goroutine before it reaches the worker: it is neither re-published nor
+re-`ACK`ed. A duplicate `ACK` for a `msgSerial` the SDK has already dequeued
+would corrupt its positional accounting. A forward skip is accepted.
+
 Inbound `ATTACH` / `DETACH` are handled by the connection itself on the
 read goroutine, calling into `ChannelManager` to get/release a Channel.
 

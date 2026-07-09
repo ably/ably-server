@@ -134,6 +134,7 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		publishQ:          make(chan func(), 16),
 		reauth:            make(chan time.Time, 1),
 		resumeError:       resumeError,
+		lastMsgSerial:     -1,
 	}
 
 	// The upgrade succeeded: count the connection and time its lifetime,

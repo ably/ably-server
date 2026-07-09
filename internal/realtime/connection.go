@@ -73,6 +73,15 @@ type connection struct {
 	// timers. Buffered (cap 1) so the read goroutine never blocks on it.
 	reauth chan time.Time
 
+	// lastMsgSerial is the highest publish msgSerial accepted on this
+	// connection (-1 until the first publish). A publish/presence frame that
+	// repeats or goes backward from it is a client retransmit (e.g. the SDK
+	// re-flushing a queued publish after a reconnect with the same msgSerial,
+	// RTL6c2) — it is dropped without an ACK so the SDK's pending-publish
+	// accounting stays consistent (DESIGN.md §5.2). Touched only by the read
+	// goroutine.
+	lastMsgSerial int64
+
 	// resumeError, when non-nil, is carried on the initial CONNECTED frame
 	// to decline a resume/recover the server cannot honour (DESIGN.md §4.3):
 	// a malformed resume/recover key. The fresh connectionId plus this error
@@ -263,8 +272,14 @@ func (c *connection) dispatch(ctx context.Context, msg *protocol.ProtocolMessage
 	case protocol.ActionDetach:
 		c.handleDetach(ctx, msg.Channel)
 	case protocol.ActionMessage:
+		if !c.acceptMsgSerial(msg.MsgSerial) {
+			return
+		}
 		c.handleMessage(ctx, msg)
 	case protocol.ActionPresence:
+		if !c.acceptMsgSerial(msg.MsgSerial) {
+			return
+		}
 		c.handlePresence(ctx, msg)
 	case protocol.ActionAuth:
 		c.handleAuth(ctx, msg)
@@ -273,6 +288,26 @@ func (c *connection) dispatch(ctx context.Context, msg *protocol.ProtocolMessage
 	default:
 		c.logger.Debug("received frame", "action", msg.Action.String())
 	}
+}
+
+// acceptMsgSerial reports whether an inbound publish/presence frame with the
+// given msgSerial should be processed. It tracks the connection's msgSerial
+// (shared by MESSAGE and PRESENCE, matching the SDK's single per-connection
+// counter) and drops a non-monotonic retransmit — a serial at or below the
+// next expected — so a publish the SDK re-flushes after a reconnect with the
+// same msgSerial (RTL6c2) is not re-ACKed. A second ACK for a msgSerial the
+// SDK has already dequeued corrupts its positional pending-publish accounting
+// (it panics). A forward skip is allowed. Mirrors the reference server's
+// checkMsgSerial (drop, don't close). Called only on the read goroutine.
+func (c *connection) acceptMsgSerial(serial int64) bool {
+	last := c.lastMsgSerial
+	c.lastMsgSerial = serial
+	if last == -1 {
+		// First publish on the connection: adopt it as the baseline (the SDK
+		// may not reset msgSerial to 0 after a resume).
+		return true
+	}
+	return serial >= last+1
 }
 
 // handleClose responds to a client-initiated CLOSE with CLOSED. The
