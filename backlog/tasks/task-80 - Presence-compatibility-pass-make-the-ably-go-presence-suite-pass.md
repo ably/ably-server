@@ -1,9 +1,11 @@
 ---
 id: TASK-80
 title: 'Presence compatibility pass: make the ably-go presence suite pass'
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-07-09 19:22'
+updated_date: '2026-07-09 21:41'
 labels:
   - presence
   - compat
