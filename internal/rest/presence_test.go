@@ -183,7 +183,7 @@ func TestPresenceHistoryPagination(t *testing.T) {
 	if len(page1) != 2 || page1[0].ClientID != "a" || page1[1].ClientID != "b" {
 		t.Fatalf("page1 = %+v, want [a b]", page1)
 	}
-	nextURL := nextLink(t, resp.Header.Get("Link"))
+	nextURL := nextLink(t, resp)
 	if nextURL == "" {
 		t.Fatal("page1 missing rel=next link")
 	}

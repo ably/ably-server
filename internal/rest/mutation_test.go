@@ -238,7 +238,7 @@ func TestVersionsListPaginates(t *testing.T) {
 	if len(page1) != 2 {
 		t.Fatalf("page1 = %d, want 2", len(page1))
 	}
-	next := nextLink(t, resp.Header.Get("Link"))
+	next := nextLink(t, resp)
 	if next == "" {
 		t.Fatal("no rel=next link on a limited versions page")
 	}

@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -1127,31 +1128,39 @@ func writeHistoryLinks(w http.ResponseWriter, r *http.Request, page storage.Hist
 // cursor that should bound the next request. Clients are required to
 // treat the link URLs opaquely; the cursor's parameter name and value
 // are internal-only.
+//
+// The link URL is the request path's final segment plus query (e.g.
+// "history?limit=2&from=..."), not the absolute path: Ably SDKs resolve
+// each Link relative to path.Dir(requestPath) (via path.Join), so an
+// absolute path would be doubled onto that base and the continuation
+// would 404 (DESIGN.md §2.2).
 func writeLinkHeaders(w http.ResponseWriter, r *http.Request, boundary string, hasMore bool) {
-	current := *r.URL
-	current.Host, current.Scheme = "", ""
-
-	first := current
-	firstQ := first.Query()
-	firstQ.Del(internalCursorParam)
-	first.RawQuery = firstQ.Encode()
-
-	links := []string{
-		fmt.Sprintf(`<%s>; rel="current"`, current.RequestURI()),
-		fmt.Sprintf(`<%s>; rel="first"`, first.RequestURI()),
+	base := path.Base(r.URL.Path)
+	rel := func(q url.Values) string {
+		if enc := q.Encode(); enc != "" {
+			return base + "?" + enc
+		}
+		return base
 	}
+
+	first := r.URL.Query()
+	first.Del(internalCursorParam)
+
+	// Each rel is emitted as its own Link header line, not one comma-joined
+	// value: Ably SDKs parse each Header["Link"] element with a single-match
+	// regexp, so multiple rels folded into one line would leave all but the
+	// first (here rel="next") unseen and pagination would stall.
+	h := w.Header()
+	h.Add("Link", fmt.Sprintf(`<%s>; rel="current"`, rel(r.URL.Query())))
+	h.Add("Link", fmt.Sprintf(`<%s>; rel="first"`, rel(first)))
 
 	if boundary != "" && hasMore {
-		next := current
-		nextQ := next.Query()
+		next := r.URL.Query()
 		// Pagination strictly excludes the cursor in the requested
 		// direction (matching Ably's REST).
-		nextQ.Set(internalCursorParam, boundary)
-		next.RawQuery = nextQ.Encode()
-		links = append(links, fmt.Sprintf(`<%s>; rel="next"`, next.RequestURI()))
+		next.Set(internalCursorParam, boundary)
+		h.Add("Link", fmt.Sprintf(`<%s>; rel="next"`, rel(next)))
 	}
-
-	w.Header().Set("Link", strings.Join(links, ", "))
 }
 
 // lastVersionSerial returns the version serial of the trailing message in

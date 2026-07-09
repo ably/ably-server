@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -621,7 +622,7 @@ func TestHistoryLimitAndCursorTraversal(t *testing.T) {
 	if !equalStrings(got, []string{"m4", "m3"}) {
 		t.Fatalf("page1 names = %v, want [m4 m3]", got)
 	}
-	nextURL := nextLink(t, resp.Header.Get("Link"))
+	nextURL := nextLink(t, resp)
 	if nextURL == "" {
 		t.Fatal("page1 missing rel=next link")
 	}
@@ -638,7 +639,7 @@ func TestHistoryLimitAndCursorTraversal(t *testing.T) {
 	if !equalStrings(got, []string{"m2", "m1"}) {
 		t.Fatalf("page2 names = %v, want [m2 m1]", got)
 	}
-	nextURL2 := nextLink(t, resp2.Header.Get("Link"))
+	nextURL2 := nextLink(t, resp2)
 	if nextURL2 == "" {
 		t.Fatal("page2 missing rel=next link")
 	}
@@ -655,7 +656,7 @@ func TestHistoryLimitAndCursorTraversal(t *testing.T) {
 	if !equalStrings(got, []string{"m0"}) {
 		t.Errorf("page3 names = %v, want [m0]", got)
 	}
-	if nextLink(t, resp3.Header.Get("Link")) != "" {
+	if nextLink(t, resp3) != "" {
 		t.Error("page3 should not have a rel=next link")
 	}
 }
@@ -714,7 +715,7 @@ func TestHistoryLimitSplitsAtomicBatch(t *testing.T) {
 	if !equalStrings(got, []string{"m4", "m3"}) {
 		t.Fatalf("page1 names = %v, want [m4 m3]", got)
 	}
-	nextURL := nextLink(t, resp.Header.Get("Link"))
+	nextURL := nextLink(t, resp)
 	if nextURL == "" {
 		t.Fatal("expected a rel=next link with a mid-batch cursor")
 	}
@@ -742,7 +743,7 @@ func TestHistoryLinkHeadersAlwaysIncludeFirstAndCurrent(t *testing.T) {
 	srv, _ := newTestServer(t)
 	publishBatch(t, srv, "foo", []*protocol.Message{{Name: "x"}})
 	resp := historyGet(t, srv, "foo", "limit=10", "")
-	link := resp.Header.Get("Link")
+	link := strings.Join(resp.Header.Values("Link"), ", ")
 	if !strings.Contains(link, `rel="current"`) {
 		t.Errorf("Link missing rel=current: %q", link)
 	}
@@ -754,21 +755,84 @@ func TestHistoryLinkHeadersAlwaysIncludeFirstAndCurrent(t *testing.T) {
 	}
 }
 
-// nextLink extracts the URI from the rel="next" entry of a Link
-// header, returning "" if no such entry is present.
-func nextLink(t *testing.T, header string) string {
+// TestHistoryLinkHeadersRelativeAndSeparate pins the wire shape Ably SDKs
+// require (TASK-76): each rel is its own Link header line (SDKs parse each
+// Header["Link"] element with a single-match regexp), and the link URL is
+// relative to the resource — the request path's final segment plus query,
+// never an absolute path (SDKs resolve it against path.Dir(requestPath)).
+func TestHistoryLinkHeadersRelativeAndSeparate(t *testing.T) {
+	srv, _ := newTestServer(t)
+	publishBatch(t, srv, "foo", []*protocol.Message{
+		{Name: "m0"}, {Name: "m1"}, {Name: "m2"},
+	})
+
+	for _, tc := range []struct {
+		name, path, base string
+	}{
+		{"messages", "/channels/foo/messages?limit=1", "messages"},
+		{"history-alias", "/channels/foo/history?limit=1", "history"},
+		{"presence-history", "/channels/foo/presence/history?limit=1", "history"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+tc.path, nil)
+			req.SetBasicAuth("app.key", "secret")
+			resp, err := srv.Client().Do(req)
+			if err != nil {
+				t.Fatalf("do: %v", err)
+			}
+			t.Cleanup(func() { resp.Body.Close() })
+
+			values := resp.Header.Values("Link")
+			// current + first (+ next when there is more) — each on its own line.
+			if len(values) < 2 {
+				t.Fatalf("want >=2 separate Link headers, got %d: %v", len(values), values)
+			}
+			for _, v := range values {
+				if strings.Count(v, "rel=") != 1 {
+					t.Errorf("Link header line carries multiple rels: %q", v)
+				}
+				// Extract the URL and assert it is relative to the resource.
+				start, end := strings.Index(v, "<"), strings.Index(v, ">")
+				if start != 0 || end < 0 {
+					t.Fatalf("malformed Link entry: %q", v)
+				}
+				linkURL := v[1:end]
+				if strings.HasPrefix(linkURL, "/") || strings.HasPrefix(linkURL, "http") {
+					t.Errorf("Link URL must be relative to the resource, got %q", linkURL)
+				}
+				if !strings.HasPrefix(linkURL, tc.base) {
+					t.Errorf("Link URL %q does not start with resource segment %q", linkURL, tc.base)
+				}
+			}
+		})
+	}
+}
+
+// nextLink extracts the rel="next" entry from resp's Link headers and
+// resolves it against the request URL, returning a server-root-relative
+// path (e.g. "/channels/foo/messages?from=..."), or "" if no such entry
+// is present. Links are emitted as separate Link header lines and are
+// relative to the request resource, matching how Ably SDKs resolve them
+// (path.Dir(requestPath) + link) — so this mirrors that resolution.
+func nextLink(t *testing.T, resp *http.Response) string {
 	t.Helper()
-	for part := range strings.SplitSeq(header, ",") {
-		part = strings.TrimSpace(part)
-		if !strings.Contains(part, `rel="next"`) {
-			continue
+	for _, header := range resp.Header.Values("Link") {
+		for part := range strings.SplitSeq(header, ",") {
+			part = strings.TrimSpace(part)
+			if !strings.Contains(part, `rel="next"`) {
+				continue
+			}
+			// Format: <url>; rel="next"
+			end := strings.Index(part, ">")
+			if !strings.HasPrefix(part, "<") || end < 0 {
+				t.Fatalf("malformed Link entry: %q", part)
+			}
+			ref, err := url.Parse(part[1:end])
+			if err != nil {
+				t.Fatalf("parse link %q: %v", part, err)
+			}
+			return resp.Request.URL.ResolveReference(ref).RequestURI()
 		}
-		// Format: <url>; rel="next"
-		end := strings.Index(part, ">")
-		if !strings.HasPrefix(part, "<") || end < 0 {
-			t.Fatalf("malformed Link entry: %q", part)
-		}
-		return part[1:end]
 	}
 	return ""
 }
