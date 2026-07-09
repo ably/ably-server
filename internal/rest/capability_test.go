@@ -17,11 +17,20 @@ import (
 // bearerToken mints an HS256 JWT carrying the given capability claim,
 // signed with the test key's secret and its name as kid.
 func bearerToken(t *testing.T, capability string) string {
+	return bearerTokenWithClientID(t, capability, "")
+}
+
+// bearerTokenWithClientID mints a token with an optional x-ably-clientId
+// claim in addition to the capability.
+func bearerTokenWithClientID(t *testing.T, capability, clientID string) string {
 	t.Helper()
 	now := time.Now()
 	claims := jwt.MapClaims{"iat": now.Unix(), "exp": now.Add(time.Hour).Unix()}
 	if capability != "" {
 		claims["x-ably-capability"] = capability
+	}
+	if clientID != "" {
+		claims["x-ably-clientId"] = clientID
 	}
 	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	tok.Header["kid"] = "app.key"
@@ -86,6 +95,74 @@ func TestRESTCapabilityEnforcement(t *testing.T) {
 	}
 	if resp := tokenRequest(t, srv, http.MethodGet, "/channels/room:1/presence", hist, nil); resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("presence with history-only cap status = %d, want 401", resp.StatusCode)
+	}
+}
+
+// publishAs creates a message via a token and returns its stable serial
+// and stamped creator clientId (read back from history via Basic auth).
+func publishAs(t *testing.T, srv *httptest.Server, channel, token string, m *protocol.Message) (serial, creator string) {
+	t.Helper()
+	body, _ := json.Marshal(m)
+	if resp := tokenRequest(t, srv, http.MethodPost, "/channels/"+channel+"/messages", token, body); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("publishAs: status %d, want 201", resp.StatusCode)
+	}
+	hr := historyGet(t, srv, channel, "direction=forwards", "")
+	var msgs []*protocol.Message
+	decodeJSON(t, hr, &msgs)
+	if len(msgs) == 0 {
+		t.Fatal("publishAs: history empty after publish")
+	}
+	last := msgs[len(msgs)-1]
+	return last.Serial, last.ClientID
+}
+
+func TestRESTMutationOwnership(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	// alice creates a message on doc:1; she is its creator.
+	alice := bearerTokenWithClientID(t, `{"doc:*":["publish","message-update-own","message-delete-own"]}`, "alice")
+	serial, creator := publishAs(t, srv, "doc:1", alice, &protocol.Message{Name: "n", Data: "orig"})
+	if creator != "alice" {
+		t.Fatalf("creator clientId = %q, want alice", creator)
+	}
+	path := "/channels/doc:1/messages/" + serial
+	update, _ := json.Marshal(&protocol.Message{Action: protocol.MessageUpdate, Data: "edited"})
+
+	// own-allowed: alice may update her own message.
+	if resp := tokenRequest(t, srv, http.MethodPatch, path, alice, update); resp.StatusCode != http.StatusOK {
+		t.Errorf("alice update (own-allowed) status = %d, want 200", resp.StatusCode)
+	}
+
+	// own-denied: bob has message-update-own but is not the creator.
+	bob := bearerTokenWithClientID(t, `{"doc:*":["message-update-own"]}`, "bob")
+	resp := tokenRequest(t, srv, http.MethodPatch, path, bob, update)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("bob update (own-denied) status = %d, want 401", resp.StatusCode)
+	}
+	assertCapabilityError(t, resp)
+
+	// any-allowed: carol has message-update-any and may update anyone's.
+	carol := bearerTokenWithClientID(t, `{"doc:*":["message-update-any"]}`, "carol")
+	if resp := tokenRequest(t, srv, http.MethodPatch, path, carol, update); resp.StatusCode != http.StatusOK {
+		t.Errorf("carol update (any-allowed) status = %d, want 200", resp.StatusCode)
+	}
+
+	// missing-capability: dave has only publish, no mutation op.
+	dave := bearerTokenWithClientID(t, `{"doc:*":["publish"]}`, "dave")
+	resp = tokenRequest(t, srv, http.MethodPatch, path, dave, update)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("dave update (missing-cap) status = %d, want 401", resp.StatusCode)
+	}
+	assertCapabilityError(t, resp)
+
+	// delete authorises against message-delete-*: alice has delete-own.
+	del, _ := json.Marshal(&protocol.Message{Action: protocol.MessageDelete})
+	if resp := tokenRequest(t, srv, http.MethodPatch, path, alice, del); resp.StatusCode != http.StatusOK {
+		t.Errorf("alice delete (own-allowed) status = %d, want 200", resp.StatusCode)
+	}
+	// carol has update-any but NOT delete-any, so cannot delete.
+	if resp := tokenRequest(t, srv, http.MethodPatch, path, carol, del); resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("carol delete (no delete cap) status = %d, want 401", resp.StatusCode)
 	}
 }
 

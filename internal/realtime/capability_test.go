@@ -16,11 +16,19 @@ import (
 // dialToken connects a WebSocket client authenticating with a JWT
 // carrying the given capability claim (via the access_token query param).
 func dialToken(t *testing.T, srv *httptest.Server, capability string) *websocket.Conn {
+	return dialTokenClientID(t, srv, capability, "")
+}
+
+// dialTokenClientID is dialToken with an optional x-ably-clientId claim.
+func dialTokenClientID(t *testing.T, srv *httptest.Server, capability, clientID string) *websocket.Conn {
 	t.Helper()
 	now := time.Now()
 	claims := jwt.MapClaims{"iat": now.Unix(), "exp": now.Add(time.Hour).Unix()}
 	if capability != "" {
 		claims["x-ably-capability"] = capability
+	}
+	if clientID != "" {
+		claims["x-ably-clientId"] = clientID
 	}
 	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	tok.Header["kid"] = "app.key"
@@ -116,5 +124,64 @@ func TestInboundMessageCapability(t *testing.T) {
 	f = readFrame(t, ws2, protocol.FormatJSON, 2*time.Second)
 	if f.Action != protocol.ActionAck {
 		t.Fatalf("frame = %+v, want ACK", f)
+	}
+}
+
+// sendUpdate sends an update mutation targeting serial and returns the
+// resulting ACK/NACK frame.
+func sendUpdate(t *testing.T, ws *websocket.Conn, channel, serial string) *protocol.ProtocolMessage {
+	t.Helper()
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   channel,
+		MsgSerial: 1,
+		Messages:  []*protocol.Message{{Action: protocol.MessageUpdate, Serial: serial, Data: "edited"}},
+	})
+	return readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+}
+
+func TestWSMutationOwnership(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+	const channel = "chat:room"
+
+	// alice publishes a create; she is the creator.
+	alice := dialTokenClientID(t, srv, `{"chat:*":["publish","message-update-own"]}`, "alice")
+	drainConnected(t, alice)
+	sendFrame(t, alice, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   channel,
+		MsgSerial: 1,
+		Messages:  []*protocol.Message{{Name: "n", Data: "orig"}},
+	})
+	ack := readFrame(t, alice, protocol.FormatJSON, 2*time.Second)
+	if ack.Action != protocol.ActionAck || len(ack.Res) == 0 || len(ack.Res[0].Serials) == 0 {
+		t.Fatalf("create ack = %+v, want ACK with serials", ack)
+	}
+	serial := ack.Res[0].Serials[0]
+
+	// own-allowed: alice updates her own message.
+	if f := sendUpdate(t, alice, channel, serial); f.Action != protocol.ActionAck {
+		t.Errorf("alice update (own-allowed) = %+v, want ACK", f)
+	}
+
+	// own-denied: bob has message-update-own but is not the creator.
+	bob := dialTokenClientID(t, srv, `{"chat:*":["message-update-own"]}`, "bob")
+	drainConnected(t, bob)
+	if f := sendUpdate(t, bob, channel, serial); f.Action != protocol.ActionNack || f.Error == nil || f.Error.Code != 40160 {
+		t.Errorf("bob update (own-denied) = %+v, want NACK 40160", f)
+	}
+
+	// any-allowed: carol has message-update-any.
+	carol := dialTokenClientID(t, srv, `{"chat:*":["message-update-any"]}`, "carol")
+	drainConnected(t, carol)
+	if f := sendUpdate(t, carol, channel, serial); f.Action != protocol.ActionAck {
+		t.Errorf("carol update (any-allowed) = %+v, want ACK", f)
+	}
+
+	// missing-capability: dave has only publish.
+	dave := dialTokenClientID(t, srv, `{"chat:*":["publish"]}`, "dave")
+	drainConnected(t, dave)
+	if f := sendUpdate(t, dave, channel, serial); f.Action != protocol.ActionNack || f.Error == nil || f.Error.Code != 40160 {
+		t.Errorf("dave update (missing-cap) = %+v, want NACK 40160", f)
 	}
 }

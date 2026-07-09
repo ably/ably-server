@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 
+	"github.com/ably/ably-server/internal/auth"
+	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/storage"
 )
@@ -24,12 +26,11 @@ import (
 // frame via the normal attachment cursor (forward()), carrying the action,
 // the new version, and the unchanged serial in stream order.
 //
-// No attachment or capability gate is applied — a mutation is a write to
-// the channel stream, handled exactly like a create publish, which needs
-// no attachment either. DESIGN §13.5's PUBLISH-mode + message-* capability
-// gating lands uniformly (for publish and mutate) with the capability
-// framework (TASK-12); applying it to mutations alone would diverge from
-// the create path.
+// The mutation is authorised against the message-{update,delete}-{own,any}
+// capability ops (DESIGN.md §13.5): -any waives ownership, -own requires
+// the caller's resolved clientId to equal the target's creator. The check
+// runs on the publish worker (where the creator lookup is available) so it
+// stays ordered with this connection's other ACK/NACKs.
 func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolMessage) {
 	msgSerial := msg.MsgSerial
 	if len(msg.Messages) != 1 {
@@ -72,6 +73,12 @@ func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolM
 			c.nack(ctx, msgSerial, nil)
 			return
 		}
+		if errInfo := c.authorizeMutation(ctx, ch, channel, m); errInfo != nil {
+			c.logger.Warn("mutation rejected", "channel", channel, "target", m.Serial,
+				"action", m.Action.String(), "msgSerial", msgSerial, "code", errInfo.Code)
+			c.nack(ctx, msgSerial, errInfo)
+			return
+		}
 		cm, _, err := ch.Mutate(ctx, m)
 		if err != nil {
 			if errors.Is(err, storage.ErrTargetNotFound) {
@@ -98,4 +105,58 @@ func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolM
 			Res:       []*protocol.PublishResult{{Serials: []string{storage.VersionSerial(cm.Messages[0])}}},
 		})
 	})
+}
+
+// authorizeMutation applies the §13.5 capability + ownership check for a
+// mutation of m on channel. It returns nil when the mutation is permitted,
+// or an ErrorInfo describing the rejection (40160 insufficient capability,
+// 40400 when the target does not exist and ownership had to be checked).
+// The creator lookup is performed only when the caller holds just the
+// -own op — the -any op waives it.
+func (c *connection) authorizeMutation(ctx context.Context, ch *core.Channel, channel string, m *protocol.Message) *protocol.ErrorInfo {
+	ownOp, anyOp := mutationOps(m.Action)
+	switch c.principal.Capabilities().MutationGrant(channel, ownOp, anyOp) {
+	case auth.MutationAllowed:
+		return nil
+	case auth.MutationDeniedCapability:
+		return &protocol.ErrorInfo{
+			Message:    "insufficient capability for message mutation",
+			Code:       40160,
+			StatusCode: 401,
+		}
+	}
+	// MutationNeedsOwnership: the caller must own the target message.
+	latest, err := ch.LatestVersion(ctx, m.Serial)
+	if err != nil {
+		if errors.Is(err, storage.ErrTargetNotFound) {
+			return &protocol.ErrorInfo{Message: "target message not found", Code: 40400, StatusCode: 404}
+		}
+		return &protocol.ErrorInfo{Message: "mutation authorization failed", Code: 50000, StatusCode: 500}
+	}
+	if ownsMessage(c.clientID, latest.ClientID) {
+		return nil
+	}
+	return &protocol.ErrorInfo{
+		Message:    "insufficient capability: caller does not own the target message",
+		Code:       40160,
+		StatusCode: 401,
+	}
+}
+
+// mutationOps maps a mutation action to its ownership-scoped capability op
+// pair (DESIGN.md §13.5): update and append are gated by message-update-*,
+// delete by message-delete-*.
+func mutationOps(a protocol.MessageAction) (own, any auth.Op) {
+	if a == protocol.MessageDelete {
+		return auth.OpMessageDeleteOwn, auth.OpMessageDeleteAny
+	}
+	return auth.OpMessageUpdateOwn, auth.OpMessageUpdateAny
+}
+
+// ownsMessage reports whether a caller with the given resolved clientId
+// owns a message whose creator clientId is creator (DESIGN.md §13.5). A
+// wildcard or anonymous caller owns nothing — ownership requires a
+// concrete identity matching the creator.
+func ownsMessage(callerClientID, creator string) bool {
+	return callerClientID != "" && callerClientID != wildcardClientID && callerClientID == creator
 }

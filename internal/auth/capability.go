@@ -83,6 +83,37 @@ func (c Capability) Permits(channel string, op Op) bool {
 	return false
 }
 
+// MutationOutcome is the capability decision for a message mutation
+// (DESIGN.md §13.5), before any ownership check.
+type MutationOutcome int
+
+const (
+	// MutationDeniedCapability means neither the -own nor -any op is
+	// granted on the channel: the mutation is rejected outright.
+	MutationDeniedCapability MutationOutcome = iota
+	// MutationAllowed means the -any op is granted: the ownership check is
+	// waived and the mutation proceeds.
+	MutationAllowed
+	// MutationNeedsOwnership means only the -own op is granted: the
+	// mutation proceeds only if the caller owns the target message (its
+	// resolved clientId equals the target's creator clientId).
+	MutationNeedsOwnership
+)
+
+// MutationGrant resolves the capability decision for a mutation on
+// channel given its ownership-scoped op pair (DESIGN.md §13.5). The -any
+// op waives the ownership check; the -own op requires it; neither denies.
+func (c Capability) MutationGrant(channel string, ownOp, anyOp Op) MutationOutcome {
+	switch {
+	case c.Permits(channel, anyOp):
+		return MutationAllowed
+	case c.Permits(channel, ownOp):
+		return MutationNeedsOwnership
+	default:
+		return MutationDeniedCapability
+	}
+}
+
 // IsEmpty reports whether the capability grants nothing (no resource
 // carries any op).
 func (c Capability) IsEmpty() bool {

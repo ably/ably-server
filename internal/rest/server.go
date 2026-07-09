@@ -256,11 +256,17 @@ func (s *Server) HandleHistory(w http.ResponseWriter, r *http.Request) {
 // Content-Type). On success it returns the resulting merged version in
 // the Accept format. A missing/aged-out target is a 404.
 //
-// No capability/ownership gating is applied: the capability framework
-// (TASK-12) is unbuilt, so the endpoint requires only the API key, like
-// publish. TASK-51 adds the message-* ownership check once TASK-12 lands.
+// The mutation is authorised against message-{update,delete}-{own,any}
+// (DESIGN.md §13.5): -any waives ownership, -own requires the request's
+// resolved clientId to equal the target's creator. Insufficient capability
+// is a 401 with the Ably error shape.
 func (s *Server) HandleMutate(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticate(w, r); !ok {
+	principal, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	clientID, ok := s.resolveRequestClientID(w, r, principal)
+	if !ok {
 		return
 	}
 	name := r.PathValue("name")
@@ -295,6 +301,11 @@ func (s *Server) HandleMutate(w http.ResponseWriter, r *http.Request) {
 	}
 	// The target serial comes from the path — it is authoritative.
 	mut.Serial = target
+	// Record the operating clientId on the new version (DESIGN.md §13.1);
+	// only a concrete identity is stamped as the operator.
+	if clientID != "" && clientID != auth.WildcardClientID {
+		mut.ClientID = clientID
+	}
 
 	respFormat, err := acceptFormat(r.Header.Get("Accept"))
 	if err != nil {
@@ -306,6 +317,9 @@ func (s *Server) HandleMutate(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
 		http.Error(w, "channel unavailable", http.StatusInternalServerError)
+		return
+	}
+	if !s.authorizeMutation(w, r, principal, clientID, ch, name, &mut) {
 		return
 	}
 	cm, _, err := ch.Mutate(r.Context(), &mut)
@@ -710,19 +724,75 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, p *auth.Princ
 	if p.Capabilities().Permits(channel, op) {
 		return true
 	}
+	s.writeCapabilityError(w, r, fmt.Sprintf("insufficient capability: %q required for channel %q", op, channel))
+	return false
+}
+
+// writeCapabilityError writes a 401 carrying the Ably error shape with the
+// insufficient-capability code 40160 (DESIGN.md §3.1).
+func (s *Server) writeCapabilityError(w http.ResponseWriter, r *http.Request, msg string) {
 	format, err := acceptFormat(r.Header.Get("Accept"))
 	if err != nil {
 		format = protocol.FormatJSON
 	}
 	body, _ := marshalValue(errorResponse{Error: &protocol.ErrorInfo{
-		Message:    fmt.Sprintf("insufficient capability: %q required for channel %q", op, channel),
+		Message:    msg,
 		Code:       40160,
 		StatusCode: http.StatusUnauthorized,
 	}}, format)
 	w.Header().Set("Content-Type", contentTypeFor(format))
 	w.WriteHeader(http.StatusUnauthorized)
 	_, _ = w.Write(body)
+}
+
+// authorizeMutation applies the §13.5 capability + ownership check for a
+// REST mutation. It returns true when permitted; on rejection it writes
+// the response (401 for insufficient capability, 404 for a missing target
+// whose ownership had to be checked) and returns false. The creator lookup
+// runs only when the caller holds just the -own op.
+func (s *Server) authorizeMutation(w http.ResponseWriter, r *http.Request, p *auth.Principal, clientID string, ch *core.Channel, channel string, mut *protocol.Message) bool {
+	ownOp, anyOp := mutationOps(mut.Action)
+	switch p.Capabilities().MutationGrant(channel, ownOp, anyOp) {
+	case auth.MutationAllowed:
+		return true
+	case auth.MutationDeniedCapability:
+		s.writeCapabilityError(w, r, "insufficient capability for message mutation")
+		return false
+	}
+	// MutationNeedsOwnership: the caller must own the target message.
+	latest, err := ch.LatestVersion(r.Context(), mut.Serial)
+	if errors.Is(err, storage.ErrTargetNotFound) {
+		http.Error(w, "target message not found", http.StatusNotFound)
+		return false
+	}
+	if err != nil {
+		s.logger.Warn("mutation authorization failed", "channel", channel, "target", mut.Serial, "err", err)
+		http.Error(w, "mutate failed", http.StatusInternalServerError)
+		return false
+	}
+	if ownsMessage(clientID, latest.ClientID) {
+		return true
+	}
+	s.writeCapabilityError(w, r, "insufficient capability: caller does not own the target message")
 	return false
+}
+
+// mutationOps maps a mutation action to its ownership-scoped capability op
+// pair (DESIGN.md §13.5): update and append are gated by message-update-*,
+// delete by message-delete-*.
+func mutationOps(a protocol.MessageAction) (own, any auth.Op) {
+	if a == protocol.MessageDelete {
+		return auth.OpMessageDeleteOwn, auth.OpMessageDeleteAny
+	}
+	return auth.OpMessageUpdateOwn, auth.OpMessageUpdateAny
+}
+
+// ownsMessage reports whether a caller with the given resolved clientId
+// owns a message whose creator clientId is creator (DESIGN.md §13.5): a
+// concrete identity matching the creator. A wildcard/anonymous caller owns
+// nothing.
+func ownsMessage(callerClientID, creator string) bool {
+	return callerClientID != "" && callerClientID != auth.WildcardClientID && callerClientID == creator
 }
 
 // resolveRequestClientID applies the §3.2 resolution for a REST request:
