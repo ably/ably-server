@@ -852,6 +852,18 @@ should use Ably or fork.
   unit storage persists. A presence publish is the same unit carrying
   `Presence []*PresenceMessage` instead of `Messages` (§12.1), observed
   on the wire as one `PRESENCE` frame.
+- **ChannelMessage.id** (message-publish batch id): the idempotency key
+  for a message publish. When the publisher supplies no message ids, the
+  server generates a random 8-character base64 batch id; when the
+  publisher supplies ids, the batch id is derived from them. Either way
+  the server stamps each contained `Message.id = "<batchID>:<idx>"`
+  (idx unpadded, so a single-message publish stamps `"<batchID>:0"`),
+  and the batch id is what storage indexes for idempotency (below). A
+  client that supplies ids on a multi-message publish must make them
+  conform to `"<batchID>:<idx>"`; a mismatch is rejected (`NACK` on WS,
+  `400` on REST). A single-message publish accepts any client id (the
+  batch id is that id with a trailing `:0` trimmed). The REST publish
+  response's `messageId` is this stamped first-message id (§2.2).
 - **PresenceMessage**: a single presence operation within a presence
   ChannelMessage — the presence-stream analogue of Message. It carries
   an `action` (ENTER/UPDATE/LEAVE inbound; PRESENT in sync; LEAVE/ABSENT
@@ -914,14 +926,19 @@ should use Ably or fork.
   ordering. The wire `version` object also carries operation metadata
   (timestamp, the operating `clientId`, an optional description, and
   optional metadata).
-- **Message.id**: optional, **client-supplied** identifier used for
-  idempotent publishing. If present, the server enforces uniqueness
-  per channel within the message retention window: a second publish
-  whose ChannelMessage contains an `id` already seen on this channel
-  returns the original publish's `channelSerial` and is *not*
-  re-appended. If absent, the server treats every publish as new.
-  `id` is opaque to the server — clients typically use a UUID or a
-  deterministic hash of payload + intent.
+- **Message.id**: the per-message identifier used for idempotent
+  publishing, always of the form `"<batchID>:<idx>"` where `batchID` is
+  the containing ChannelMessage's batch id (above). The server stamps it
+  on every publish — deriving `batchID` from client-supplied ids, or
+  generating one when none is supplied. The server enforces uniqueness
+  per channel within the message retention window: because every message
+  in a batch shares the same `batchID`, a repeat of a client-idempotent
+  publish collides on its first message id and returns the original
+  publish's `channelSerial` without re-appending. A publish whose batch
+  id was server-generated carries a fresh random `batchID` each time, so
+  it is always treated as new. `batchID` is opaque to the server —
+  clients typically use a UUID or a deterministic hash of payload +
+  intent.
 
 Replay on `ATTACH` is a bounded history read from storage between the
 client-supplied `channelSerial` and the channel's current head, streamed

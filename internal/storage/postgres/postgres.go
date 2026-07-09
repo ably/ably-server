@@ -460,6 +460,14 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 		return nil, false, err
 	}
 
+	// Resolve the batch id and stamp each Message.ID = "<batchID>:<idx>"
+	// (DESIGN.md §8) before the tx, so the partial UNIQUE id index keys on
+	// the batch-derived ids.
+	batchID, err := storage.StampMessageIDs(msgs)
+	if err != nil {
+		return nil, false, err
+	}
+
 	tx, err := cs.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, false, fmt.Errorf("storage/postgres: begin tx: %w", err)
@@ -509,7 +517,7 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 		m.Action = protocol.MessageCreate
 		storage.StampCreateVersion(m)
 	}
-	cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Messages: msgs}
+	cm := &protocol.ChannelMessage{ID: batchID, ChannelSerial: channelSerial, Messages: msgs}
 
 	for i, m := range msgs {
 		payload, err := msgpack.Marshal(m)

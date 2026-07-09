@@ -133,6 +133,14 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 		return nil, false, err
 	}
 
+	// Resolve the batch id and stamp each Message.ID = "<batchID>:<idx>"
+	// (DESIGN.md §8) before minting, so the idempotency index keys on the
+	// batch-derived ids.
+	batchID, err := storage.StampMessageIDs(msgs)
+	if err != nil {
+		return nil, false, err
+	}
+
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
@@ -154,6 +162,7 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 		storage.StampCreateVersion(m)
 	}
 	cm := &protocol.ChannelMessage{
+		ID:            batchID,
 		ChannelSerial: channelSerial,
 		Messages:      msgs,
 	}

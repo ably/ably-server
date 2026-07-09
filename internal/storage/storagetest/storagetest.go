@@ -152,23 +152,69 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 		}
 	})
 
-	t.Run("IdempotencyMatchesAnyMessageInBatch", func(t *testing.T) {
+	t.Run("GeneratesBatchIDAndStampsMessageIDs", func(t *testing.T) {
 		s := f(t)
 		ch := mustChannel(t, s, "foo")
 
-		first, _, err := ch.Store(context.Background(), []*protocol.Message{{ID: "a"}, {ID: "b"}})
+		// A publish with no message ids is stamped with a fresh 8-char
+		// base64 batch id, and each Message.ID = "<batchID>:<idx>"
+		// (DESIGN.md §8, TASK-18 AC#1).
+		cm, _, err := ch.Store(context.Background(), []*protocol.Message{{Name: "a"}, {Name: "b"}})
+		if err != nil {
+			t.Fatalf("Store: %v", err)
+		}
+		if len(cm.ID) != 8 {
+			t.Errorf("ChannelMessage.ID = %q, want an 8-char base64 batch id", cm.ID)
+		}
+		for i, m := range cm.Messages {
+			want := cm.ID + ":" + strconv.Itoa(i)
+			if m.ID != want {
+				t.Errorf("Messages[%d].ID = %q, want %q", i, m.ID, want)
+			}
+		}
+	})
+
+	t.Run("RejectsMismatchedClientBatchIDs", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+
+		// A client-supplied multi-message batch whose ids do not conform
+		// to "<batchID>:<idx>" is rejected (TASK-18 AC#2).
+		_, _, err := ch.Store(context.Background(), []*protocol.Message{{ID: "x:0"}, {ID: "y:1"}})
+		if !errors.Is(err, storage.ErrInvalidMessageID) {
+			t.Fatalf("Store err = %v, want ErrInvalidMessageID", err)
+		}
+		// Nothing should have been persisted.
+		page, err := ch.History(context.Background(), storage.HistoryQuery{Direction: storage.DirectionForwards})
+		if err != nil {
+			t.Fatalf("History: %v", err)
+		}
+		if len(page.ChannelMessages) != 0 {
+			t.Errorf("History len = %d, want 0 (rejected publish must not persist)", len(page.ChannelMessages))
+		}
+	})
+
+	t.Run("IdempotentByBatchID", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+
+		// A conforming client-supplied batch is idempotent on its batch
+		// id: republishing the same "<batchID>:<idx>" ids returns the
+		// original (the shared batch id collides on the first message id).
+		first, _, err := ch.Store(context.Background(), []*protocol.Message{{ID: "b:0"}, {ID: "b:1"}})
 		if err != nil {
 			t.Fatalf("first publish: %v", err)
 		}
+		if first.ID != "b" {
+			t.Errorf("ChannelMessage.ID = %q, want %q", first.ID, "b")
+		}
 
-		// A new publish where any contained id matches should be
-		// treated as a duplicate.
-		second, idemp, err := ch.Store(context.Background(), []*protocol.Message{{ID: "c"}, {ID: "b"}})
+		second, idemp, err := ch.Store(context.Background(), []*protocol.Message{{ID: "b:0"}, {ID: "b:1"}})
 		if err != nil {
 			t.Fatalf("second publish: %v", err)
 		}
 		if !idemp {
-			t.Error("idempotent=false; expected match on shared id 'b'")
+			t.Error("idempotent=false; expected match on batch id 'b'")
 		}
 		if second.ChannelSerial != first.ChannelSerial {
 			t.Errorf("returned ChannelSerial = %q, want original %q", second.ChannelSerial, first.ChannelSerial)

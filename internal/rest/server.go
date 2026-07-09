@@ -118,6 +118,10 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cm, _, err := ch.Publish(r.Context(), msgs)
+	if errors.Is(err, storage.ErrInvalidMessageID) {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if err != nil {
 		s.logger.Warn("publish failed", "channel", name, "err", err)
 		http.Error(w, "publish failed", http.StatusInternalServerError)

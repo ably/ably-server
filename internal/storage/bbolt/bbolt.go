@@ -294,11 +294,19 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 		return nil, false, err
 	}
 
+	// Resolve the batch id and stamp each Message.ID = "<batchID>:<idx>"
+	// (DESIGN.md §8) before the write tx, so the ids bucket keys on the
+	// batch-derived ids.
+	batchID, err := storage.StampMessageIDs(msgs)
+	if err != nil {
+		return nil, false, err
+	}
+
 	var (
 		resultCM   *protocol.ChannelMessage
 		idempotent bool
 	)
-	err := cs.db.Update(func(tx *bolt.Tx) error {
+	err = cs.db.Update(func(tx *bolt.Tx) error {
 		messages := tx.Bucket(channelMessagesBucket)
 		ids := tx.Bucket(idsBucket)
 
@@ -332,6 +340,7 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 			storage.StampCreateVersion(m)
 		}
 		cm := &protocol.ChannelMessage{
+			ID:            batchID,
 			ChannelSerial: channelSerial,
 			Messages:      msgs,
 		}

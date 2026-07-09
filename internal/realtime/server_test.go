@@ -481,7 +481,7 @@ func TestPublishAckIsPerProtocolMessage(t *testing.T) {
 		Action:    protocol.ActionMessage,
 		Channel:   "foo",
 		MsgSerial: 3,
-		Messages:  []*protocol.Message{{ID: "a"}, {ID: "b"}, {ID: "c"}},
+		Messages:  []*protocol.Message{{ID: "batch:0"}, {ID: "batch:1"}, {ID: "batch:2"}},
 	})
 
 	ack := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)

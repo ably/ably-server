@@ -19,7 +19,10 @@ package storage
 import (
 	"context"
 	"errors"
+	"strconv"
+	"strings"
 
+	"github.com/ably/ably-server/internal/id"
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/serial"
 )
@@ -29,6 +32,12 @@ import (
 // channel, or has aged out of retention (DESIGN.md §13.2). Callers map
 // it to a 4xx (REST) or a NACK/ERROR (WS).
 var ErrTargetNotFound = errors.New("storage: target message not found")
+
+// ErrInvalidMessageID is returned by StampMessageIDs (and therefore by
+// Store) when a client supplies message ids that do not conform to the
+// required "<batchID>:<idx>" batch shape (DESIGN.md §8). Callers map it
+// to a 400 (REST) or a NACK (WS).
+var ErrInvalidMessageID = errors.New("storage: client-supplied message ids do not match the required <batchID>:<idx> format")
 
 // Appender is the bridge between the storage backend and the in-process
 // channel state. The backend calls Initialize exactly once, before any
@@ -212,6 +221,73 @@ func (k Kind) Normalize() Kind {
 // clientId over two connections is two distinct members (DESIGN.md §12.1).
 func MemberKey(connectionID, clientID string) string {
 	return connectionID + ":" + clientID
+}
+
+// StampMessageIDs resolves the ChannelMessage batch id for a create
+// publish and stamps the contained Message.IDs (DESIGN.md §8). It is
+// called by every backend's Store before minting the channelSerial, so
+// the batch id — the idempotency key indexed by storage — is derived
+// identically regardless of surface (REST or WS) or backend.
+//
+// If no contained message carries an ID, a fresh 8-char base64 batch id
+// is generated and each Message.ID is stamped "<batchID>:<idx>" (idx
+// unpadded, matching Ably's wire shape, e.g. "TojWzTkLiH:0"). If any
+// message carries an ID, the publish is client-idempotent: the batch id
+// is derived from the messages and, for a multi-message batch, each
+// Message.ID must equal "<batchID>:<idx>" — a mismatch returns
+// ErrInvalidMessageID and nothing is stamped. A single-message publish
+// accepts any client id (the batch id is that id with a trailing ":0"
+// trimmed), matching Ably. Returns the batch id to stamp onto
+// ChannelMessage.ID.
+func StampMessageIDs(msgs []*protocol.Message) (string, error) {
+	base, hasID, err := messageBaseID(msgs)
+	if err != nil {
+		return "", err
+	}
+	if !hasID {
+		base = id.NewMessageBaseID()
+		for i, m := range msgs {
+			m.ID = base + ":" + strconv.Itoa(i)
+		}
+	}
+	return base, nil
+}
+
+// messageBaseID extracts the batch id shared by a publish's message ids,
+// validating the "<batchID>:<idx>" shape for a multi-message batch. It
+// reports hasID=false (and an empty base) when no message carries an id,
+// signalling the caller to generate one. Mirrors Ably's getMessageBaseID.
+func messageBaseID(msgs []*protocol.Message) (base string, hasID bool, err error) {
+	if len(msgs) == 1 {
+		// A single-message publish carries no multi-message index
+		// requirement: any id is accepted, and the batch id is that id
+		// with a trailing ":0" trimmed if present.
+		id0 := msgs[0].ID
+		return strings.TrimSuffix(id0, ":0"), id0 != "", nil
+	}
+
+	for _, m := range msgs {
+		if m.ID != "" {
+			hasID = true
+		} else if hasID {
+			// Some messages carry an id and others do not — all must if any do.
+			return "", false, ErrInvalidMessageID
+		}
+	}
+	if !hasID {
+		return "", false, nil
+	}
+
+	base, ok := strings.CutSuffix(msgs[0].ID, ":0")
+	if !ok {
+		return "", false, ErrInvalidMessageID
+	}
+	for i := 1; i < len(msgs); i++ {
+		if msgs[i].ID != base+":"+strconv.Itoa(i) {
+			return "", false, ErrInvalidMessageID
+		}
+	}
+	return base, true, nil
 }
 
 // StampCreateVersion stamps a freshly-published create message's Version

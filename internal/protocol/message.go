@@ -60,7 +60,14 @@ type MessageVersion struct {
 // A ChannelMessage carries either Messages (a data publish) or Presence
 // (a presence publish), never both — the two ride one ordered stream
 // distinguished by which slice is populated (DESIGN.md §12.1).
+//
+// ID is the batch identifier for a message publish (DESIGN.md §8): the
+// client-supplied idempotency key, or a server-generated 8-char base64
+// string when none is supplied. Each contained Message.ID is stamped
+// "<ID>:<idx>", so the batch id is the idempotency key indexed by
+// storage. Empty for a presence cm.
 type ChannelMessage struct {
+	ID            string             `json:"id,omitempty"            msgpack:"id,omitempty"`
 	ChannelSerial string             `json:"channelSerial,omitempty" msgpack:"channelSerial,omitempty"`
 	Messages      []*Message         `json:"messages,omitempty"      msgpack:"messages,omitempty"`
 	Presence      []*PresenceMessage `json:"presence,omitempty"      msgpack:"presence,omitempty"`
