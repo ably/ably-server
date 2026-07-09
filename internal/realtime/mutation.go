@@ -91,6 +91,16 @@ func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolM
 				})
 				return
 			}
+			if errors.Is(err, storage.ErrIncompatibleAppend) {
+				c.logger.Warn("append data incompatible; NACKing",
+					"channel", channel, "target", m.Serial, "msgSerial", msgSerial)
+				c.nack(ctx, msgSerial, &protocol.ErrorInfo{
+					Message:    "append data type is incompatible with the target's current data",
+					Code:       40000,
+					StatusCode: 400,
+				})
+				return
+			}
 			c.logger.Warn("mutation failed; NACKing",
 				"channel", channel, "target", m.Serial, "msgSerial", msgSerial, "err", err)
 			c.nack(ctx, msgSerial, nil)

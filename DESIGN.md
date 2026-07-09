@@ -1403,21 +1403,30 @@ targets the high-frequency single-publisher case (e.g. streaming an LLM
 token sequence onto one message), so its delivery is looser than update /
 delete:
 
-- The server maintains the **rolled-up** latest data for the message. A
-  subscriber that is caught up receives each append **incrementally**
-  (just the delta `data`); the first delivery for a message a subscriber
-  has not yet seen — e.g. immediately after attach — is a full
-  `action: update` carrying the aggregated payload, after which it
-  receives subsequent appends incrementally.
+- The server maintains the **rolled-up** latest data for the message. An
+  append is persisted and fanned out as a full `action: update` whose
+  `data` is the aggregate so far, carrying the incremental append in
+  `alt["delta-append"]` (an `action: append` message holding just the new
+  `data`, sharing the version). The delivery path chooses per subscriber:
+  a subscriber that is caught up receives the delta **incrementally**
+  (`action: append`, just the new `data`); the first delivery for a
+  message a subscriber has not yet seen — e.g. immediately after attach,
+  or backlog replay on resume/rewind — is the full `action: update`
+  carrying the aggregate, after which it receives subsequent appends
+  incrementally. This needs per-attachment tracking of which message
+  identities the subscriber has seen since attach.
 - The server may **conflate**: coalesce multiple appends, drop superseded
   intermediate versions, or deliver an append as a full rolled-up
   `update`. The only guarantee is that the last version a subscriber
   receives is the most recent — there is no promise that every
-  intermediate append is delivered.
+  intermediate append is delivered. Collapsing the pre-attach append run
+  into a single full-on-first-sight update is exactly this: the
+  intermediate appends a fresh subscriber never saw are never sent.
 - Appends are **not** retained as individual entries in version history;
-  only the aggregated latest version is durable. A channel param lets a
-  subscriber opt into receiving full versions instead of incremental
-  appends.
+  only the aggregated latest version is durable (§13.4). The
+  `appendMode=full` channel param opts a subscriber out of incremental
+  delivery, so it always receives the full rolled-up versions instead of
+  append deltas.
 
 Append aggregation is inherently stateful and conflation-sensitive, which
 is why its delivery contract is deliberately looser than that of update /
@@ -1438,11 +1447,14 @@ set:
   timeline but shows current content, and a deleted message shows as a
   tombstone.
 - **the `serial → versions` index** over the log. Backs
-  `GET .../messages/{serial}/versions`, which returns *every* version of a
-  message (create + each update / delete) ordered by `version`, paginated
-  with the same `Link` convention as message history (§2.2). It is also
-  what an update / delete consults to validate and merge against its
-  target.
+  `GET .../messages/{serial}/versions`, which returns the versions of a
+  message ordered by `version`, paginated with the same `Link` convention
+  as message history (§2.2). It is also what an update / delete consults
+  to validate and merge against its target. Appends are the exception to
+  "every version": the log keeps each append cm for live and resume
+  fan-out, but the versions read-path collapses a run of appends to its
+  aggregate, so a streamed append shows as one evolving version rather
+  than one entry per delta (§13.3).
 
 Live and resume delivery are **not** collapsed: a fresh subscriber, and a
 resuming one replaying the gap (§4.3), receive the raw version cms in

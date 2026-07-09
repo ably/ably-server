@@ -31,6 +31,30 @@ type Message struct {
 	Encoding     string          `json:"encoding,omitempty"     msgpack:"encoding,omitempty"`
 	Timestamp    int64           `json:"timestamp,omitempty"    msgpack:"timestamp,omitempty"`
 	Version      *MessageVersion `json:"version,omitempty"      msgpack:"version,omitempty"`
+	// Alt carries alternative in-band representations of this message,
+	// keyed by role (DESIGN.md §13.3). Its sole current use is the
+	// append delta: an append is persisted and fanned out as a full
+	// action=update Message whose Data is the rolled-up aggregate, with
+	// Alt[DeltaAppend] holding the incremental append (action=append,
+	// just the new data) the server hands a caught-up subscriber instead
+	// of the full version. It is a server-internal carrier — persisted so
+	// resume and cross-node fan-out can still choose delta vs full — and
+	// is resolved away before a frame reaches a client, so it is excluded
+	// from the client-facing JSON encoding.
+	Alt map[string]*Message `json:"-" msgpack:"alt,omitempty"`
+}
+
+// DeltaAppend is the Alt key under which an append's incremental delta
+// message rides on the full aggregated version (DESIGN.md §13.3). Matches
+// Ably's reference constant.
+const DeltaAppend = "delta-append"
+
+// HasAppendDelta reports whether m is an append aggregate — a full
+// version carrying an incremental append in Alt (DESIGN.md §13.3). It is
+// how the delivery path and the version-history collapse distinguish an
+// append from an ordinary update, which are otherwise both action=update.
+func (m *Message) HasAppendDelta() bool {
+	return m != nil && m.Alt[DeltaAppend] != nil
 }
 
 // MessageVersion names a single version of a message (DESIGN.md §13.1).

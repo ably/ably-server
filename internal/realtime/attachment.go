@@ -12,6 +12,15 @@ import (
 	"github.com/ably/ably-server/internal/storage"
 )
 
+// ParamAppendMode is the ATTACH channel param that selects how a
+// subscriber receives streamed appends (DESIGN.md §13.3); AppendModeFull
+// is its only value, opting the subscriber into full rolled-up versions
+// instead of incremental append deltas. Names match Ably's reference.
+const (
+	ParamAppendMode = "appendMode"
+	AppendModeFull  = "full"
+)
+
 // defaultReplayCap caps the number of Messages replayed per ATTACH
 // (resume or rewind). A client that has missed more than this many
 // messages still receives the most recent defaultReplayCap, with
@@ -53,6 +62,16 @@ type attachment struct {
 	metrics *metrics.Metrics
 	logger  *slog.Logger
 
+	// appendModeFull is set when the subscriber requested
+	// appendMode=full: it always receives full rolled-up versions rather
+	// than incremental append deltas (DESIGN.md §13.3).
+	appendModeFull bool
+	// seen tracks the message identity serials this attachment has
+	// delivered since attach, so the first append for a not-yet-seen
+	// message is a full aggregated update and later appends arrive as
+	// deltas (DESIGN.md §13.3). Touched only by the run goroutine.
+	seen map[string]struct{}
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -80,13 +99,15 @@ func newAttachment(parent context.Context, name string, channel *core.Channel, s
 		modes:       modes,
 		replayCap:   defaultReplayCap,
 		out:         out,
-		connID:      connID,
-		echo:        echo,
-		metrics:     m,
-		logger:      logger,
-		ctx:         ctx,
-		cancel:      cancel,
-		done:        make(chan struct{}),
+		connID:         connID,
+		echo:           echo,
+		metrics:        m,
+		logger:         logger,
+		appendModeFull: params[ParamAppendMode] == AppendModeFull,
+		seen:           make(map[string]struct{}),
+		ctx:            ctx,
+		cancel:         cancel,
+		done:           make(chan struct{}),
 	}
 }
 
@@ -173,8 +194,10 @@ func (a *attachment) run() {
 		}
 	}
 
+	// Replay (resume/rewind) is backlog delivery: appends arrive as full
+	// rolled-up updates, never deltas (DESIGN.md §13.3).
 	for _, cm := range replay {
-		if !a.forward(cm) {
+		if !a.forward(cm, true) {
 			return
 		}
 	}
@@ -184,7 +207,7 @@ func (a *attachment) run() {
 		if err != nil {
 			return
 		}
-		if !a.forward(cm) {
+		if !a.forward(cm, false) {
 			return
 		}
 	}
@@ -194,8 +217,10 @@ func (a *attachment) run() {
 // frame appropriate to its kind, gated by the attachment's modes: a
 // message cm becomes a MESSAGE frame (SUBSCRIBE), a presence cm becomes
 // a PRESENCE frame (PRESENCE_SUBSCRIBE). A cm the attachment is not
-// subscribed to is skipped. Returns false if the send is cancelled.
-func (a *attachment) forward(cm *protocol.ChannelMessage) bool {
+// subscribed to is skipped. backlog is true during resume/rewind replay,
+// which forces appends to be delivered as full versions. Returns false
+// if the send is cancelled.
+func (a *attachment) forward(cm *protocol.ChannelMessage, backlog bool) bool {
 	if len(cm.Messages) > 0 {
 		if !a.hasMode(protocol.FlagSubscribe) {
 			return true
@@ -212,7 +237,7 @@ func (a *attachment) forward(cm *protocol.ChannelMessage) bool {
 			Action:        protocol.ActionMessage,
 			Channel:       a.channelName,
 			ChannelSerial: cm.ChannelSerial,
-			Messages:      cm.Messages,
+			Messages:      a.resolveAppends(cm.Messages, backlog),
 		}) {
 			return false
 		}
@@ -231,6 +256,70 @@ func (a *attachment) forward(cm *protocol.ChannelMessage) bool {
 		})
 	}
 	return true
+}
+
+// resolveAppends adapts a message cm's payload to this subscriber's
+// append delivery mode (DESIGN.md §13.3). An append is stored as a full
+// action=update carrying the rolled-up aggregate plus the incremental
+// delta in Alt[DeltaAppend]. A caught-up subscriber receives the delta
+// (action=append); otherwise the full aggregate is delivered.
+//
+// Deltas are used only when NONE of the following forces a full version:
+// the subscriber opted into full versions (appendMode=full); delivery is
+// backlog replay (resume/rewind); or the cm carries an append for a
+// message this attachment has not yet seen — the first delivery for a
+// not-yet-seen message is always the full aggregate so the subscriber
+// has complete state before later deltas apply. The decision is
+// all-or-nothing across the cm's messages, matching the atomic frame.
+// Every message's identity is then recorded as seen. The internal Alt
+// carrier is stripped from any message delivered as a full version.
+func (a *attachment) resolveAppends(msgs []*protocol.Message, backlog bool) []*protocol.Message {
+	asDeltas := !backlog && !a.appendModeFull
+	if asDeltas {
+		for _, m := range msgs {
+			if m.HasAppendDelta() && m.Serial != "" {
+				if _, ok := a.seen[m.Serial]; !ok {
+					asDeltas = false
+					break
+				}
+			}
+		}
+	}
+	for _, m := range msgs {
+		if m.Serial != "" {
+			a.seen[m.Serial] = struct{}{}
+		}
+	}
+
+	// Fast path: nothing carries an append delta, so there is nothing to
+	// strip or swap.
+	transform := false
+	for _, m := range msgs {
+		if m.HasAppendDelta() {
+			transform = true
+			break
+		}
+	}
+	if !transform {
+		return msgs
+	}
+
+	out := make([]*protocol.Message, len(msgs))
+	for i, m := range msgs {
+		switch {
+		case !m.HasAppendDelta():
+			out[i] = m
+		case asDeltas:
+			out[i] = m.Alt[protocol.DeltaAppend]
+		default:
+			// Full version: hand over the aggregate without the internal
+			// Alt carrier.
+			clone := *m
+			clone.Alt = nil
+			out[i] = &clone
+		}
+	}
+	return out
 }
 
 // computeReplay decides what to replay, what attach point to advertise

@@ -109,7 +109,7 @@ func TestPostgresMigrateIsConcurrentSafe(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate: %v", err)
 	}
-	want := []string{"0001_initial", "0002_channels_and_serial_mint", "0003_channels_initial_serial", "0004_presence", "0005_mutable_messages", "0006_presence_liveness"}
+	want := []string{"0001_initial", "0002_channels_and_serial_mint", "0003_channels_initial_serial", "0004_presence", "0005_mutable_messages", "0006_presence_liveness", "0007_append_versions"}
 	if !slices.Equal(versions, want) {
 		t.Errorf("schema_migrations rows = %v, want %v", versions, want)
 	}

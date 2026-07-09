@@ -133,6 +133,54 @@ func TestPatchDeleteThenSingleReadShowsTombstone(t *testing.T) {
 	}
 }
 
+// TestPatchAppendAggregatesAndCollapses: PATCH appends concatenate onto
+// the message; the single-message read returns the rolled-up aggregate,
+// and the versions read collapses the append run rather than listing each
+// delta (DESIGN.md §13.3, §13.4).
+func TestPatchAppendAggregatesAndCollapses(t *testing.T) {
+	srv, _ := newTestServer(t)
+	serial := publishOne(t, srv, "room", &protocol.Message{Data: "a", ClientID: "alice"})
+
+	for _, chunk := range []string{"b", "c", "d"} {
+		if resp := patch(t, srv, "room", serial, &protocol.Message{Action: protocol.MessageAppend, Data: chunk}); resp.StatusCode != http.StatusOK {
+			t.Fatalf("append %q: status %d, want 200", chunk, resp.StatusCode)
+		}
+	}
+
+	// Single-message read returns the aggregate.
+	mr := request(t, srv, http.MethodGet, "/channels/room/messages/"+serial, "", nil, true)
+	var m protocol.Message
+	decodeJSON(t, mr, &m)
+	if m.Data != "abcd" {
+		t.Errorf("aggregate data = %v, want abcd", m.Data)
+	}
+	if m.Alt != nil {
+		t.Errorf("client-facing read leaked internal alt carrier: %+v", m.Alt)
+	}
+
+	// Versions read collapses the append run: create + aggregate = 2.
+	vr := versionsGet(t, srv, "room", serial, "direction=forwards")
+	var all []*protocol.Message
+	decodeJSON(t, vr, &all)
+	if len(all) != 2 {
+		t.Fatalf("versions = %d, want 2 (create + collapsed aggregate)", len(all))
+	}
+	if all[1].Data != "abcd" {
+		t.Errorf("collapsed aggregate data = %v, want abcd", all[1].Data)
+	}
+}
+
+// TestPatchAppendIncompatibleRejected: appending a value whose type
+// cannot concatenate onto the current data is a 400 (DESIGN.md §13.3).
+func TestPatchAppendIncompatibleRejected(t *testing.T) {
+	srv, _ := newTestServer(t)
+	serial := publishOne(t, srv, "room", &protocol.Message{Data: "text", ClientID: "alice"})
+	resp := patch(t, srv, "room", serial, &protocol.Message{Action: protocol.MessageAppend, Data: 42})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("incompatible append status = %d, want 400", resp.StatusCode)
+	}
+}
+
 func TestGetSingleMessageNotFound(t *testing.T) {
 	srv, _ := newTestServer(t)
 	resp := request(t, srv, http.MethodGet, "/channels/room/messages/00000000000001-000@nope000000:000", "", nil, true)

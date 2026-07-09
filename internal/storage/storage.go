@@ -33,6 +33,13 @@ import (
 // it to a 4xx (REST) or a NACK/ERROR (WS).
 var ErrTargetNotFound = errors.New("storage: target message not found")
 
+// ErrIncompatibleAppend is returned by Mutate (via MergeVersion) when an
+// append's data cannot be concatenated onto the target's current data
+// because their types are incompatible — appends are defined only for
+// string-onto-string and binary-onto-binary (DESIGN.md §13.3). Callers
+// map it to a 400 (REST) or a NACK (WS).
+var ErrIncompatibleAppend = errors.New("storage: append data type is incompatible with the target's current data")
+
 // ErrInvalidMessageID is returned by StampMessageIDs (and therefore by
 // Store) when a client supplies message ids that do not conform to the
 // required "<batchID>:<idx>" batch shape (DESIGN.md §8). Callers map it
@@ -306,47 +313,27 @@ func StampCreateVersion(m *protocol.Message) {
 }
 
 // MergeVersion produces the new merged version of a message for a
-// mutation (DESIGN.md §13.2). current is the target's current latest
-// version (a complete Message); mut is the inbound mutation carrying the
-// action, the operating clientId and the supplied fields;
+// mutation (DESIGN.md §13.2, §13.3). current is the target's current
+// latest version (a complete Message); mut is the inbound mutation
+// carrying the action, the operating clientId and the supplied fields;
 // versionSerial is the `<channelSerial>:<idx>` minted for this mutation
 // publish. The result is a complete Message that repeats current's
 // stable identity (Serial) and creator (ClientID), applies shallow-mixin
-// for update/append (only supplied fields replace; append concatenates
-// data), tombstones for delete, and carries a fresh Version stamped with
-// the operator and serial. An append is delivered and stored as a full
-// update in this phase (incremental delivery is TASK-54).
-func MergeVersion(current, mut *protocol.Message, versionSerial string) *protocol.Message {
+// for update/append (only supplied fields replace), tombstones for
+// delete, and carries a fresh Version stamped with the operator and
+// serial.
+//
+// An append is stored and fanned out as a full action=update whose Data
+// is the rolled-up aggregate, carrying the incremental delta in
+// Alt[DeltaAppend] (action=append, just the new data) so the delivery
+// path can hand a caught-up subscriber the delta rather than the full
+// version (DESIGN.md §13.3). An append whose data cannot concatenate onto
+// the current data (incompatible types) returns ErrIncompatibleAppend.
+func MergeVersion(current, mut *protocol.Message, versionSerial string) (*protocol.Message, error) {
 	v := *current // carry every field forward, then mix in the supplied ones
 	v.Serial = current.Serial
 	v.ConnectionID = current.ConnectionID
-
-	switch mut.Action {
-	case protocol.MessageDelete:
-		// Tombstone: drop the payload but keep identity + creator.
-		v.Action = protocol.MessageDelete
-		v.Data = nil
-		v.Name = ""
-		v.Encoding = ""
-	case protocol.MessageAppend:
-		v.Action = protocol.MessageUpdate // delivered/stored as a full update
-		v.Data = concatData(current.Data, mut.Data)
-		if mut.Encoding != "" {
-			v.Encoding = mut.Encoding
-		}
-		if mut.Name != "" {
-			v.Name = mut.Name
-		}
-	default: // update
-		v.Action = protocol.MessageUpdate
-		if mut.Data != nil {
-			v.Data = mut.Data
-			v.Encoding = mut.Encoding
-		}
-		if mut.Name != "" {
-			v.Name = mut.Name
-		}
-	}
+	v.Alt = nil // any prior append delta does not carry forward
 
 	ts, _ := serial.Timestamp(versionSerial)
 	ver := &protocol.MessageVersion{
@@ -358,29 +345,100 @@ func MergeVersion(current, mut *protocol.Message, versionSerial string) *protoco
 		ver.Description = mut.Version.Description
 		ver.Metadata = mut.Version.Metadata
 	}
+
+	switch mut.Action {
+	case protocol.MessageDelete:
+		// Tombstone: drop the payload but keep identity + creator.
+		v.Action = protocol.MessageDelete
+		v.Data = nil
+		v.Name = ""
+		v.Encoding = ""
+	case protocol.MessageAppend:
+		concatenated, err := concatData(current.Data, mut.Data)
+		if err != nil {
+			return nil, err
+		}
+		// The delta the delivery path hands a caught-up subscriber: the
+		// incremental append alone, sharing this version so newest-wins
+		// convergence treats the delta and the full aggregate as one.
+		delta := &protocol.Message{
+			Serial:       current.Serial,
+			Action:       protocol.MessageAppend,
+			ClientID:     current.ClientID,
+			ConnectionID: current.ConnectionID,
+			Data:         mut.Data,
+			Encoding:     mut.Encoding,
+			Version:      ver,
+		}
+		v.Action = protocol.MessageUpdate
+		v.Data = concatenated
+		if mut.Encoding != "" {
+			v.Encoding = mut.Encoding
+		}
+		if mut.Name != "" {
+			v.Name = mut.Name
+			delta.Name = mut.Name
+		}
+		v.Alt = map[string]*protocol.Message{protocol.DeltaAppend: delta}
+	default: // update
+		v.Action = protocol.MessageUpdate
+		if mut.Data != nil {
+			v.Data = mut.Data
+			v.Encoding = mut.Encoding
+		}
+		if mut.Name != "" {
+			v.Name = mut.Name
+		}
+	}
+
 	v.Version = ver
-	return &v
+	return &v, nil
 }
 
-// concatData concatenates an append's data onto the current value. It
-// handles the string and []byte cases (the only ones for which
-// concatenation is well-defined); for any other / mismatched types it
-// falls back to replacement, and a nil current is replaced outright.
-func concatData(current, add any) any {
+// concatData concatenates an append's data onto the current value. It is
+// defined only for string-onto-string and binary-onto-binary; any other
+// combination of types is rejected with ErrIncompatibleAppend (DESIGN.md
+// §13.3). A nil current is seeded by the append outright, and a nil
+// addition leaves the current value unchanged.
+func concatData(current, add any) (any, error) {
+	if add == nil {
+		return current, nil
+	}
 	if current == nil {
-		return add
+		return add, nil
 	}
 	switch c := current.(type) {
 	case string:
 		if a, ok := add.(string); ok {
-			return c + a
+			return c + a, nil
 		}
 	case []byte:
 		if a, ok := add.([]byte); ok {
-			return append(append([]byte{}, c...), a...)
+			return append(append([]byte{}, c...), a...), nil
 		}
 	}
-	return add
+	return nil, ErrIncompatibleAppend
+}
+
+// CollapseAppendVersions reduces an ascending-by-version list of a single
+// message's versions so appends do not appear as individual entries
+// (DESIGN.md §13.3, §13.4): each maximal run of append aggregates
+// collapses to the run's last (most-aggregated) version, while creates,
+// updates and deletes are kept verbatim. The append-only log still
+// carries every append cm for live and resume fan-out — this only shapes
+// the version-history read-path, so GET .../messages/{serial}/versions
+// reflects the aggregate, never each delta. The input is not mutated.
+func CollapseAppendVersions(all []*protocol.Message) []*protocol.Message {
+	out := make([]*protocol.Message, 0, len(all))
+	for i, m := range all {
+		// Keep an append aggregate only when it is the last of its run —
+		// the next version is not itself an append (or there is none).
+		if m.HasAppendDelta() && i+1 < len(all) && all[i+1].HasAppendDelta() {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // VersionSerial returns the serial that identifies a single version of a

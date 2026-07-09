@@ -1088,9 +1088,88 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 		if appended.Data != "Hello, world" {
 			t.Errorf("appended data = %v, want %q", appended.Data, "Hello, world")
 		}
-		// Delivered/stored as a full update in this phase (DESIGN.md §13.3).
+		// Stored/fanned out as a full aggregated update carrying the
+		// incremental delta in Alt (DESIGN.md §13.3).
 		if appended.Action != protocol.MessageUpdate {
-			t.Errorf("append action = %v, want update (full delivery)", appended.Action)
+			t.Errorf("append action = %v, want update (aggregate)", appended.Action)
+		}
+		delta := appended.Alt[protocol.DeltaAppend]
+		if delta == nil {
+			t.Fatalf("append version carries no %q delta", protocol.DeltaAppend)
+		}
+		if delta.Action != protocol.MessageAppend || delta.Data != ", world" {
+			t.Errorf("delta = action %v data %v, want append / %q", delta.Action, delta.Data, ", world")
+		}
+		if delta.Serial != created.Serial {
+			t.Errorf("delta serial = %q, want stable identity %q", delta.Serial, created.Serial)
+		}
+	})
+
+	t.Run("MutateAppendRejectsIncompatibleData", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+
+		strMsg := mustCreate(t, ch, &protocol.Message{Data: "hello", ClientID: "alice"})
+		if _, _, err := ch.Mutate(context.Background(), &protocol.Message{
+			Action: protocol.MessageAppend, Serial: strMsg.Serial, Data: []byte("x"), ClientID: "alice",
+		}); !errors.Is(err, storage.ErrIncompatibleAppend) {
+			t.Errorf("binary-onto-string append err = %v, want ErrIncompatibleAppend", err)
+		}
+		// The rejected append must not have applied.
+		if latest, _ := ch.LatestVersion(context.Background(), strMsg.Serial); latest.Data != "hello" {
+			t.Errorf("data after rejected append = %v, want unchanged hello", latest.Data)
+		}
+
+		// Binary-onto-binary concatenates.
+		binMsg := mustCreate(t, ch, &protocol.Message{Data: []byte("ab"), ClientID: "alice"})
+		appended := mustMutate(t, ch, &protocol.Message{Action: protocol.MessageAppend, Serial: binMsg.Serial, Data: []byte("cd"), ClientID: "alice"})
+		if got, ok := appended.Data.([]byte); !ok || string(got) != "abcd" {
+			t.Errorf("binary append data = %v, want abcd", appended.Data)
+		}
+	})
+
+	t.Run("MutateAppendVersionHistoryCollapses", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		created := mustCreate(t, ch, &protocol.Message{Data: "a", ClientID: "alice"})
+		for _, chunk := range []string{"b", "c", "d"} {
+			mustMutate(t, ch, &protocol.Message{Action: protocol.MessageAppend, Serial: created.Serial, Data: chunk, ClientID: "alice"})
+		}
+
+		// The aggregate is the full concatenation and stays queryable.
+		latest, err := ch.LatestVersion(context.Background(), created.Serial)
+		if err != nil {
+			t.Fatalf("LatestVersion: %v", err)
+		}
+		if latest.Data != "abcd" {
+			t.Errorf("aggregate data = %v, want abcd", latest.Data)
+		}
+
+		// Version history reflects the aggregate, not each append: the
+		// run of appends collapses to a single version after the create.
+		vers, err := ch.Versions(context.Background(), created.Serial, storage.HistoryQuery{Direction: storage.DirectionForwards})
+		if err != nil {
+			t.Fatalf("Versions: %v", err)
+		}
+		if n := itemCountVersions(vers); n != 2 {
+			t.Fatalf("versions after create+3 appends = %d, want 2 (create + collapsed aggregate)", n)
+		}
+		agg := vers.ChannelMessages[len(vers.ChannelMessages)-1].Messages[0]
+		if agg.Data != "abcd" {
+			t.Errorf("collapsed aggregate data = %v, want abcd", agg.Data)
+		}
+
+		// An update between append runs is a checkpoint: it and a later
+		// append run both survive the collapse.
+		mustMutate(t, ch, &protocol.Message{Action: protocol.MessageUpdate, Serial: created.Serial, Data: "X", ClientID: "alice"})
+		mustMutate(t, ch, &protocol.Message{Action: protocol.MessageAppend, Serial: created.Serial, Data: "Y", ClientID: "alice"})
+		mustMutate(t, ch, &protocol.Message{Action: protocol.MessageAppend, Serial: created.Serial, Data: "Z", ClientID: "alice"})
+		vers, _ = ch.Versions(context.Background(), created.Serial, storage.HistoryQuery{Direction: storage.DirectionForwards})
+		if n := itemCountVersions(vers); n != 4 {
+			t.Errorf("versions after create+appends+update+appends = %d, want 4 (create, aggregate, update, aggregate)", n)
+		}
+		if final, _ := ch.LatestVersion(context.Background(), created.Serial); final.Data != "XYZ" {
+			t.Errorf("final aggregate = %v, want XYZ", final.Data)
 		}
 	})
 

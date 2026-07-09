@@ -431,7 +431,10 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 		}
 
 		channelSerial := cs.gen.Mint()
-		version := storage.MergeVersion(&current, mut, serial.MessageSerial(channelSerial, 0))
+		version, err := storage.MergeVersion(&current, mut, serial.MessageSerial(channelSerial, 0))
+		if err != nil {
+			return err
+		}
 		cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Messages: []*protocol.Message{version}}
 		blob, err := msgpack.Marshal(cm)
 		if err != nil {
@@ -514,7 +517,9 @@ func (cs *channelStore) Versions(ctx context.Context, serial string, q storage.H
 	if len(all) == 0 {
 		return storage.HistoryPage{}, storage.ErrTargetNotFound
 	}
-	return storage.PaginateVersions(all, q), nil
+	// Collapse append runs so history reflects the aggregate, not each
+	// delta (DESIGN.md §13.3, §13.4); the log keeps every append cm.
+	return storage.PaginateVersions(storage.CollapseAppendVersions(all), q), nil
 }
 
 // StorePresence persists a presence publish onto the channel_messages

@@ -949,7 +949,10 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 	).Scan(&channelSerial); err != nil {
 		return nil, false, fmt.Errorf("storage/postgres: advance channel serial: %w", err)
 	}
-	version := storage.MergeVersion(&current, mut, serial.MessageSerial(channelSerial, 0))
+	version, err := storage.MergeVersion(&current, mut, serial.MessageSerial(channelSerial, 0))
+	if err != nil {
+		return nil, false, err
+	}
 	cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Messages: []*protocol.Message{version}}
 
 	payload, err := msgpack.Marshal(version)
@@ -960,10 +963,12 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 	if mut.ID != "" {
 		idArg = mut.ID
 	}
+	// is_append marks appends so the versions read collapses their runs
+	// to the aggregate (DESIGN.md §13.3); the log row itself is retained.
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload, message_serial)
-		 VALUES ($1, $2, 0, $3, 'message', $4, $5)`,
-		cs.name, channelSerial, idArg, payload, mut.Serial,
+		`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload, message_serial, is_append)
+		 VALUES ($1, $2, 0, $3, 'message', $4, $5, $6)`,
+		cs.name, channelSerial, idArg, payload, mut.Serial, mut.Action == protocol.MessageAppend,
 	); err != nil {
 		return nil, false, fmt.Errorf("storage/postgres: insert version: %w", err)
 	}
@@ -1035,10 +1040,25 @@ func (cs *channelStore) Versions(ctx context.Context, serial2 string, q storage.
 		}
 	}
 
+	// Collapse runs of appends to the aggregate (DESIGN.md §13.3, §13.4):
+	// the inner LEAD window (always in forward version order) keeps an
+	// append row only when the next version is not itself an append —
+	// i.e. the last of its run — while creates/updates/deletes are kept
+	// verbatim. Pagination (cursor + Limit) then applies over the
+	// collapsed set, so the read reflects the aggregate, not each delta.
 	query := fmt.Sprintf(`
-		SELECT channel_serial, payload FROM channel_messages
-		WHERE channel = $1 AND message_serial = $2
-		  AND ($3 = '' OR (channel_serial, idx) %s ($3, $4))
+		WITH ordered AS (
+			SELECT channel_serial, idx, payload, is_append,
+			       LEAD(is_append) OVER (ORDER BY channel_serial, idx) AS next_is_append
+			FROM channel_messages
+			WHERE channel = $1 AND message_serial = $2 AND kind = 'message'
+		),
+		collapsed AS (
+			SELECT channel_serial, idx, payload FROM ordered
+			WHERE is_append = FALSE OR next_is_append IS DISTINCT FROM TRUE
+		)
+		SELECT channel_serial, payload FROM collapsed
+		WHERE ($3 = '' OR (channel_serial, idx) %s ($3, $4))
 		ORDER BY channel_serial %s, idx %s
 		LIMIT CASE WHEN $5 > 0 THEN $5 + 1 ELSE NULL END
 	`, cursorOp, order, order)

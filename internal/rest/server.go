@@ -345,6 +345,10 @@ func (s *Server) HandleMutate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "target message not found", http.StatusNotFound)
 		return
 	}
+	if errors.Is(err, storage.ErrIncompatibleAppend) {
+		http.Error(w, "append data type is incompatible with the target's current data", http.StatusBadRequest)
+		return
+	}
 	if err != nil {
 		s.logger.Warn("mutate failed", "channel", name, "target", target, "err", err)
 		http.Error(w, "mutate failed", http.StatusInternalServerError)
