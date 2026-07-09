@@ -1,5 +1,7 @@
 # ably-server
 
+[![CI](https://github.com/ably/ably-server/actions/workflows/ci.yml/badge.svg)](https://github.com/ably/ably-server/actions/workflows/ci.yml)
+
 A single-binary, [Ably](https://ably.com)-compatible server. Speaks Ably's
 realtime WebSocket protocol and the core REST pub/sub endpoints, so
 existing Ably client SDKs can connect with only a host/port override.
