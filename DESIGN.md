@@ -19,7 +19,11 @@ This document describes how it works, section by section. The task list in
 - Statistics collection. `GET /stats` exists purely as a compatibility
   stub — authenticated like any other REST read, gated by the app-wide
   `stats` op (§3.1), always returning an empty array — so SDK flows that
-  call it succeed against this server. No statistics are collected.
+  call it succeed against this server. `POST /stats` is accepted as a
+  matching no-op (same auth, drains the body, empty `201`): SDK test flows
+  write stats before reading them, and the SDK's write path treats a
+  non-2xx as an error whose body it reads, so a `404` would leave it
+  blocked. No statistics are collected or stored.
 - Hard durability or HA guarantees beyond what the chosen database provides.
 - Backwards compatibility with arbitrary historical Ably protocol versions —
   we target v2 and later.
@@ -109,6 +113,7 @@ All REST endpoints live under the root and accept either `application/json` or
 | GET | `/channels/{channel}/presence/history` | presence history (paginated) |
 | POST | `/keys/{keyName}/requestToken` | mint a token (JWT) from a signed `TokenRequest` (see §3) |
 | GET | `/stats` | compatibility stub: always an empty array (see §1) |
+| POST | `/stats` | compatibility no-op: accepts and discards, empty `201` (see §1) |
 | GET | `/time` | server time (ms since epoch) |
 | GET | `/healthz` | liveness — no auth, dependency-free, 200 once serving |
 | GET | `/readyz` | readiness — no auth; 200 in `memory`/`disk` mode; in `cluster` mode pings Postgres and returns 503 if unreachable |

@@ -48,6 +48,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *core.Manager) {
 	mux.HandleFunc("GET /channels/{name}/presence", rs.HandlePresence)
 	mux.HandleFunc("GET /channels/{name}/presence/history", rs.HandlePresenceHistory)
 	mux.HandleFunc("GET /stats", rs.HandleStats)
+	mux.HandleFunc("POST /stats", rs.HandlePostStats)
 	mux.HandleFunc("GET /time", rs.HandleTime)
 	mux.HandleFunc("GET /healthz", rs.HandleHealthz)
 	mux.HandleFunc("GET /readyz", rs.HandleReadyz)
@@ -530,6 +531,28 @@ func TestHandleNotFoundAblyError(t *testing.T) {
 				t.Errorf("body error statusCode = %d, want 404", body.Error.StatusCode)
 			}
 		})
+	}
+}
+
+// TestPostStatsIsPromptNoOp pins the POST /stats stub (TASK-82): SDK test
+// flows write stats before reading them, and the write path treats a
+// non-2xx as an error whose body it reads — a 404 left ably-go's
+// TestRestClient blocked. POST /stats must answer promptly with an empty
+// 201 (authenticated like the GET), draining the request body.
+func TestPostStatsIsPromptNoOp(t *testing.T) {
+	srv, _ := newTestServer(t)
+	body, _ := json.Marshal([]map[string]any{{"a": 1}, {"b": 2}})
+	done := make(chan *http.Response, 1)
+	go func() {
+		done <- request(t, srv, http.MethodPost, "/stats", "application/json", body, true)
+	}()
+	select {
+	case resp := <-done:
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("status = %d, want 201", resp.StatusCode)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("POST /stats did not respond promptly (hang)")
 	}
 }
 

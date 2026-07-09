@@ -384,6 +384,10 @@ func newMux(rt *realtime.Server, rs *rest.Server, m *metrics.Metrics) *http.Serv
 	rest("GET /channels/{name}/presence/history", rs.HandlePresenceHistory)
 	rest("POST /keys/{keyName}/requestToken", rs.HandleRequestToken)
 	rest("GET /stats", rs.HandleStats)
+	// POST /stats is a no-op stats-injection stub (DESIGN.md §1): SDK test
+	// flows write stats before reading them, and a 404 would leave the SDK
+	// blocked reading the error body of a request it never fully sent.
+	rest("POST /stats", rs.HandlePostStats)
 	rest("GET /time", rs.HandleTime)
 	rest("GET /healthz", rs.HandleHealthz)
 	rest("GET /readyz", rs.HandleReadyz)

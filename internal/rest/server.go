@@ -633,6 +633,42 @@ func (s *Server) HandleStats(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
+// HandlePostStats serves POST /stats. Statistics collection is a non-goal
+// (DESIGN.md §1), but Ably SDKs' test flows POST stats before reading them
+// back (e.g. ably-go's TestRestClient), and the SDK's REST write path
+// treats a non-2xx as an error whose body it then reads — a 404 here leaves
+// the SDK blocked reading the error body of a request whose body the server
+// never consumed. So the endpoint is accepted as a no-op: it authenticates
+// like the GET (app-wide `stats` op), fully drains the request body, and
+// returns an empty 201 so the SDK's write succeeds and returns promptly. No
+// statistics are stored.
+func (s *Server) HandlePostStats(w http.ResponseWriter, r *http.Request) {
+	principal, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	if !principal.Capabilities().Permits("*", auth.OpStats) {
+		s.writeCapabilityError(w, r, `insufficient capability: "stats" required`)
+		return
+	}
+	// Drain and discard the posted stats: reading the request body to
+	// completion keeps the connection clean for the SDK's follow-up reads.
+	_, _ = io.Copy(io.Discard, r.Body)
+	format, err := acceptFormat(r.Header.Get("Accept"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotAcceptable)
+		return
+	}
+	body, err := marshalValue([]struct{}{}, format)
+	if err != nil {
+		http.Error(w, "encode failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeFor(format))
+	w.WriteHeader(http.StatusCreated)
+	_, _ = w.Write(body)
+}
+
 // readyzTimeout bounds the dependency check HandleReadyz performs on
 // every request, so a wedged database can't hang the probe.
 const readyzTimeout = 2 * time.Second
