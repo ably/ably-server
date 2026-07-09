@@ -167,6 +167,23 @@ func TestAuthenticateJWT(t *testing.T) {
 		}
 	})
 
+	t.Run("valid token via Authorization: Bearer base64 (RSA3a)", func(t *testing.T) {
+		// Ably SDKs base64-encode the JWT in the Authorization header
+		// (RSA3a); it must verify identically to the raw form. This is the
+		// transport the JWT-as-token flow (TestAuth_JWT_Token_RSA8c) uses,
+		// with a minimal iat/exp token like ably's echo server mints.
+		enc := base64.StdEncoding.EncodeToString([]byte(mintToken(t, testSecret, valid)))
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.Header.Set("Authorization", "Bearer "+enc)
+		p, err := a.Authenticate(r)
+		if err != nil {
+			t.Fatalf("Authenticate: %v", err)
+		}
+		if p.Method != MethodToken {
+			t.Errorf("Method = %v, want Token", p.Method)
+		}
+	})
+
 	t.Run("valid token via access_token and accessToken params", func(t *testing.T) {
 		for _, param := range []string{"access_token", "accessToken"} {
 			tok := mintToken(t, testSecret, valid)
