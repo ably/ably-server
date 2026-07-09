@@ -6,6 +6,7 @@
 package rest
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,16 +32,20 @@ type Server struct {
 	authn   *auth.Authenticator
 	manager *core.Manager
 	logger  *slog.Logger
+	ready   storage.Pinger
 }
 
 // NewServer constructs a Server. The Manager pairs each Channel with
 // its storage facet — publishes go through Channel.Publish, which
-// delegates to the storage backend.
-func NewServer(key auth.APIKey, manager *core.Manager, logger *slog.Logger) *Server {
+// delegates to the storage backend. ready, if non-nil, is consulted by
+// HandleReadyz on every request (see DESIGN.md §2.2); callers pass nil
+// for backends with no external dependency to check (memory, bbolt).
+func NewServer(key auth.APIKey, manager *core.Manager, logger *slog.Logger, ready storage.Pinger) *Server {
 	return &Server{
 		authn:   auth.NewAuthenticator(key),
 		manager: manager,
 		logger:  logger,
+		ready:   ready,
 	}
 }
 
@@ -527,14 +532,34 @@ func (s *Server) HandleTime(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(out)
 }
 
-// HandleHealthz returns a 200 OK response with body "ok". No auth.
+// readyzTimeout bounds the dependency check HandleReadyz performs on
+// every request, so a wedged database can't hang the probe.
+const readyzTimeout = 2 * time.Second
+
+// HandleHealthz is the liveness probe: it reports 200 "ok" as soon as
+// the process is serving HTTP, with no dependency checks. No auth.
 func (s *Server) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = io.WriteString(w, "ok")
 }
 
-// HandleReadyz returns a 200 OK response with body "ok". No auth.
+// HandleReadyz is the readiness probe: it reports whether the server
+// is ready to take traffic. In memory/disk mode (s.ready is nil)
+// that's always true. In cluster mode it pings Postgres and returns
+// 503 when the database is unreachable, so orchestrators stop routing
+// to a node that can't serve (DESIGN.md §2.2). No auth.
 func (s *Server) HandleReadyz(w http.ResponseWriter, r *http.Request) {
+	if s.ready != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), readyzTimeout)
+		defer cancel()
+		if err := s.ready.Ping(ctx); err != nil {
+			s.logger.Warn("readyz: dependency unreachable", "err", err)
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, "not ready")
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = io.WriteString(w, "ok")
 }

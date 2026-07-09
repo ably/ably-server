@@ -124,7 +124,11 @@ func run(ctx context.Context, opts runOpts) int {
 
 	manager := core.NewManager(store)
 	rt := realtime.NewServer(parsedKey, manager, *hbInterval, logger)
-	rs := rest.NewServer(parsedKey, manager, logger)
+	// ready is non-nil only for backends with an external dependency
+	// worth probing (currently postgres.Storage); memory/disk leave it
+	// nil and /readyz reports 200 unconditionally (TASK-62).
+	ready, _ := store.(storage.Pinger)
+	rs := rest.NewServer(parsedKey, manager, logger, ready)
 
 	mux := newMux(rt, rs)
 

@@ -75,8 +75,8 @@ All REST endpoints live under the root and accept either `application/json` or
 | GET | `/channels/{channel}/presence/history` | presence history (paginated) |
 | POST | `/keys/{keyName}/requestToken` | mint a token (JWT) from a signed `TokenRequest` (see §3) |
 | GET | `/time` | server time (ms since epoch) |
-| GET | `/healthz` | liveness — no auth |
-| GET | `/readyz` | readiness — DB ping in `cluster` mode |
+| GET | `/healthz` | liveness — no auth, dependency-free, 200 once serving |
+| GET | `/readyz` | readiness — no auth; 200 in `memory`/`disk` mode; in `cluster` mode pings Postgres and returns 503 if unreachable |
 
 Pagination follows Ably's `Link` header convention (`first`, `next`).
 

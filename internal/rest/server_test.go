@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,6 +19,7 @@ import (
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/storage"
 	"github.com/ably/ably-server/internal/storage/memory"
 )
 
@@ -34,7 +36,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *core.Manager) {
 		t.Fatalf("parse api key: %v", err)
 	}
 	manager := core.NewManager(memory.New(memory.Options{}))
-	rs := NewServer(parsed, manager, slog.New(slog.DiscardHandler))
+	rs := NewServer(parsed, manager, slog.New(slog.DiscardHandler), nil)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /channels/{name}/messages", rs.HandlePublish)
 	mux.HandleFunc("GET /channels/{name}/messages", rs.HandleHistory)
@@ -274,6 +276,54 @@ func TestHealthzAndReadyzNoAuth(t *testing.T) {
 		if string(body) != "ok" {
 			t.Errorf("%s body = %q, want %q", path, body, "ok")
 		}
+	}
+}
+
+// fakePinger is a storage.Pinger stub for exercising HandleReadyz's
+// cluster-mode dependency check without a real Postgres.
+type fakePinger struct{ err error }
+
+func (f fakePinger) Ping(context.Context) error { return f.err }
+
+// newTestServerWithReady is like newTestServer but wires ready as the
+// Server's storage.Pinger, so tests can drive HandleReadyz's
+// cluster-mode branch directly.
+func newTestServerWithReady(t *testing.T, ready storage.Pinger) *httptest.Server {
+	t.Helper()
+	parsed, err := auth.ParseAPIKey(testKey)
+	if err != nil {
+		t.Fatalf("parse api key: %v", err)
+	}
+	manager := core.NewManager(memory.New(memory.Options{}))
+	rs := NewServer(parsed, manager, slog.New(slog.DiscardHandler), ready)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", rs.HandleHealthz)
+	mux.HandleFunc("GET /readyz", rs.HandleReadyz)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestReadyzClusterModeReachable(t *testing.T) {
+	srv := newTestServerWithReady(t, fakePinger{})
+	resp := request(t, srv, http.MethodGet, "/readyz", "", nil, false)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("/readyz status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestReadyzClusterModeUnreachable(t *testing.T) {
+	srv := newTestServerWithReady(t, fakePinger{err: errors.New("dial tcp: connection refused")})
+
+	resp := request(t, srv, http.MethodGet, "/readyz", "", nil, false)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("/readyz status = %d, want 503", resp.StatusCode)
+	}
+
+	// /healthz stays dependency-free and unaffected.
+	resp = request(t, srv, http.MethodGet, "/healthz", "", nil, false)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("/healthz status = %d, want 200", resp.StatusCode)
 	}
 }
 

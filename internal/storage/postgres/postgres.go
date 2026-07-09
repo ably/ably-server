@@ -200,6 +200,13 @@ func (s *Storage) Close() error {
 	return nil
 }
 
+// Ping reports whether the Postgres pool is reachable. It satisfies
+// storage.Pinger, backing the /readyz check in cluster mode
+// (DESIGN.md §2.2).
+func (s *Storage) Ping(ctx context.Context) error {
+	return s.pool.Ping(ctx)
+}
+
 // listenLoop dispatches NOTIFY events to the registered channelStore
 // for each channel. A NOTIFY for an unregistered channel is dropped:
 // local attachments materialise the channelStore on demand via

@@ -83,6 +83,18 @@ type Storage interface {
 	Close() error
 }
 
+// Pinger is implemented by backends with an external dependency worth
+// confirming reachable before serving traffic (currently only
+// postgres.Storage, for the cluster-mode readiness check — see
+// DESIGN.md §2.2 / §11). Backends without one, such as memory and
+// bbolt, don't implement it; callers treat that as "always ready".
+type Pinger interface {
+	// Ping reports whether the backend's dependency is reachable. It
+	// should be cheap and side-effect-free — callers may invoke it on
+	// every readiness probe.
+	Ping(ctx context.Context) error
+}
+
 // ChannelStore is the per-channel persistence facet. All methods are
 // safe for concurrent use.
 type ChannelStore interface {
