@@ -128,9 +128,12 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Return the server-assigned serials so the SDK can populate its
-	// publish result (DESIGN.md §8).
-	respBody, err := marshalValue(publishResponse{Serials: messageSerials(cm.Messages)}, respFormat)
+	// Ably's publish response (RSL1): 201 with {channel, messageId}. The
+	// messageId is the server-stamped id of the publish's first message —
+	// "<batchID>:0" (DESIGN.md §8) — which is exactly the id carried on the
+	// delivered MESSAGE frame for this publish, and matches Ably's observed
+	// shape (e.g. "TojWzTkLiH:0").
+	respBody, err := marshalValue(publishResponse{Channel: name, MessageID: publishMessageID(cm)}, respFormat)
 	if err != nil {
 		s.logger.Warn("publish encode failed", "channel", name, "err", err)
 		http.Error(w, "encode failed", http.StatusInternalServerError)
@@ -141,25 +144,27 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(respBody)
 }
 
-// publishResponse is the REST POST /messages response body: the serials
-// the server assigned, one per published message in order.
+// publishResponse is the REST POST /messages response body (Ably RSL1):
+// the channel name and the publish's messageId.
 type publishResponse struct {
-	Serials []string `json:"serials,omitempty" msgpack:"serials,omitempty"`
+	Channel   string `json:"channel"   msgpack:"channel"`
+	MessageID string `json:"messageId" msgpack:"messageId"`
+}
+
+// publishMessageID returns the messageId for a publish response: the
+// stamped id of the first message in the batch ("<batchID>:0"), which is
+// the value delivered on the wire for that message (DESIGN.md §8).
+func publishMessageID(cm *protocol.ChannelMessage) string {
+	if len(cm.Messages) == 0 {
+		return cm.ID
+	}
+	return cm.Messages[0].ID
 }
 
 // updateDeleteResponse is the REST PATCH /messages/{serial} response
 // body: the new version's serial.
 type updateDeleteResponse struct {
 	VersionSerial string `json:"versionSerial,omitempty" msgpack:"versionSerial,omitempty"`
-}
-
-// messageSerials returns each message's server-assigned Serial in order.
-func messageSerials(msgs []*protocol.Message) []string {
-	out := make([]string, len(msgs))
-	for i, m := range msgs {
-		out[i] = m.Serial
-	}
-	return out
 }
 
 // marshalValue encodes an arbitrary value in the requested wire format.

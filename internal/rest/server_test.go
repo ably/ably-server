@@ -171,6 +171,132 @@ func TestPublishJSONArrayBody(t *testing.T) {
 	}
 }
 
+// publishResponseBody is a local decode target mirroring the server's
+// publishResponse — the tests decode the wire body independently to pin
+// the {channel, messageId} shape (Ably RSL1) for both formats.
+type publishResponseBody struct {
+	Channel   string `json:"channel"   msgpack:"channel"`
+	MessageID string `json:"messageId" msgpack:"messageId"`
+}
+
+func TestPublishResponseBodyJSON(t *testing.T) {
+	srv, manager := newTestServer(t)
+	stream := attachStream(t, manager, "foo")
+
+	body, _ := json.Marshal(&protocol.Message{Name: "greet", Data: "hi"})
+	resp := request(t, srv, http.MethodPost, "/channels/foo/messages", "application/json", body, true)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+
+	raw, _ := io.ReadAll(resp.Body)
+	var got publishResponseBody
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode JSON response: %v (body %q)", err, raw)
+	}
+	if got.Channel != "foo" {
+		t.Errorf("channel = %q, want %q", got.Channel, "foo")
+	}
+	if got.MessageID == "" {
+		t.Fatal("messageId is empty")
+	}
+
+	// AC#3: messageId is the id carried on the delivered MESSAGE for the
+	// same publish (the value a WS subscriber would see).
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	cm, err := stream.Next(ctx)
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if got.MessageID != cm.Messages[0].ID {
+		t.Errorf("messageId = %q, want delivered Message.ID %q", got.MessageID, cm.Messages[0].ID)
+	}
+	// The shape is "<batchID>:0" for the first message (Ably's e.g. "TojWzTkLiH:0").
+	if !strings.HasSuffix(got.MessageID, ":0") {
+		t.Errorf("messageId = %q, want a trailing \":0\" (first-message batch id)", got.MessageID)
+	}
+}
+
+func TestPublishResponseBodyMsgpack(t *testing.T) {
+	srv, manager := newTestServer(t)
+	stream := attachStream(t, manager, "foo")
+
+	body, err := msgpack.Marshal(&protocol.Message{Name: "greet", Data: "hi"})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+"/channels/foo/messages", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-msgpack")
+	req.Header.Set("Accept", "application/x-msgpack")
+	req.SetBasicAuth("app.key", "secret")
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/x-msgpack" {
+		t.Errorf("Content-Type = %q, want application/x-msgpack", ct)
+	}
+
+	raw, _ := io.ReadAll(resp.Body)
+	var got publishResponseBody
+	if err := msgpack.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode msgpack response: %v", err)
+	}
+	if got.Channel != "foo" {
+		t.Errorf("channel = %q, want %q", got.Channel, "foo")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	cm, err := stream.Next(ctx)
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if got.MessageID != cm.Messages[0].ID {
+		t.Errorf("messageId = %q, want delivered Message.ID %q", got.MessageID, cm.Messages[0].ID)
+	}
+}
+
+func TestPublishResponseMessageIDIsFirstOfBatch(t *testing.T) {
+	srv, manager := newTestServer(t)
+	stream := attachStream(t, manager, "foo")
+
+	msgs := []*protocol.Message{{Name: "a"}, {Name: "b"}, {Name: "c"}}
+	body, _ := json.Marshal(msgs)
+	resp := request(t, srv, http.MethodPost, "/channels/foo/messages", "application/json", body, true)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	var got publishResponseBody
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// One publish (array body) yields exactly one messageId — the first
+	// message's stamped id.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	cm, err := stream.Next(ctx)
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if len(cm.Messages) != 3 {
+		t.Fatalf("delivered Messages = %d, want 3", len(cm.Messages))
+	}
+	if got.MessageID != cm.Messages[0].ID {
+		t.Errorf("messageId = %q, want first message id %q", got.MessageID, cm.Messages[0].ID)
+	}
+}
+
 func TestPublishMsgpackArrayBody(t *testing.T) {
 	srv, manager := newTestServer(t)
 	stream := attachStream(t, manager, "foo")

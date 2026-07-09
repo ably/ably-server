@@ -78,6 +78,12 @@ All REST endpoints live under the root and accept either `application/json` or
 | GET | `/healthz` | liveness — no auth, dependency-free, 200 once serving |
 | GET | `/readyz` | readiness — no auth; 200 in `memory`/`disk` mode; in `cluster` mode pings Postgres and returns 503 if unreachable |
 
+A successful publish returns `201` with a `{"channel": "<name>",
+"messageId": "<id>"}` body (msgpack when the `Accept` header requests
+it). `messageId` is the stamped id of the publish's first message —
+`"<batchID>:0"` (§8) — the same id carried on the delivered `MESSAGE`
+frame.
+
 Pagination follows Ably's `Link` header convention (`first`, `next`).
 
 ## 3. Authentication & authorisation
