@@ -536,6 +536,18 @@ type HistoryQuery struct {
 	// ChannelMessage carrying only the surviving subset of Messages.
 	Cursor string
 
+	// AfterChannelSerial, if non-empty, restricts results to
+	// ChannelMessages with channel_serial strictly greater than this
+	// value. Distinct from Cursor: Cursor is a Message.Serial applied
+	// direction-specifically as an exclusive pagination boundary,
+	// AfterChannelSerial is an exclusive channel-serial-level lower
+	// bound applied in either direction.
+	//
+	// Used by the cluster broker's post-reconnect reconcile (DESIGN.md
+	// §7.2) to replay every cm minted past a channel's last-delivered
+	// serial, at channelSerial (not item) granularity.
+	AfterChannelSerial string
+
 	// EndChannelSerial, if non-empty, additionally caps results to
 	// ChannelMessages with channel_serial <= this value (inclusive).
 	// Distinct from Cursor: Cursor is an exclusive pagination boundary

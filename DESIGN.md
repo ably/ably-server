@@ -898,9 +898,26 @@ order is the storage scan.
 
 NOTIFY's 8KB payload limit is why we send pointers `(channel,
 serial)` rather than full payloads. PG delivers notifications
-at-most-once during reconnect gaps (queued notifications are lost if
-the LISTEN conn drops); reconciling missed events via a post-
-reconnect history scan is left as a follow-up.
+at-most-once: a NOTIFY emitted while the LISTEN conn is down is not
+redelivered when it reconnects. The broker therefore survives dropped
+LISTEN connections rather than treating a `WaitForNotification` error
+as fatal. When the conn drops, the LISTEN goroutine re-dials a fresh
+`pgx.Conn` with capped exponential backoff, re-`LISTEN`s, and — before
+resuming the notification loop — **reconciles** each registered
+channel: it reads `History(AfterChannelSerial: lastSeen)` (both the
+message and presence streams, merged in serial order) and delivers each
+missed cm. Re-`LISTEN` precedes the reconcile scan, so any cm committed
+during reconciliation is also buffered as a NOTIFY and observed once the
+loop resumes — never lost in a gap between the snapshot and resubscribe.
+It retries until the storage is `Close()`d.
+
+Delivery is idempotent across the two paths. Every append — steady-state
+NOTIFY dispatch and reconcile replay alike — funnels through a single
+per-channel delivery point that tracks the highest `channel_serial`
+handed to the appender and drops any cm whose serial is not strictly
+greater. So a cm that arrives via both the reconnect history replay and
+a subsequently-buffered NOTIFY reaches the Channel exactly once, in
+order.
 
 LISTEN/NOTIFY's well-known throughput ceiling is not a concern here:
 ably-server targets developer-loop, CI, and modest single-region

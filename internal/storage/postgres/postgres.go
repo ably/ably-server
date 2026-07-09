@@ -40,9 +40,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -67,6 +69,16 @@ const migrationLockKey int64 = 0x1ab1_e5e7_2e0a_17a3
 // broker — distinct concept from an Ably channel.
 const notifyChannelName = "ably_channel"
 
+// listenReconnectBaseDelay / listenReconnectMaxDelay bound the capped
+// exponential backoff the LISTEN goroutine applies between re-dial
+// attempts after its connection drops (DESIGN.md §7.2). They are
+// package vars, not consts, so integration tests can shrink them; in
+// production they are effectively constant.
+var (
+	listenReconnectBaseDelay = 200 * time.Millisecond
+	listenReconnectMaxDelay  = 5 * time.Second
+)
+
 // notifyPayload is the JSON-encoded NOTIFY body. Keeping it JSON
 // avoids ambiguity in the face of Ably channel names that contain
 // arbitrary characters (including ':' and '@').
@@ -84,19 +96,26 @@ type Options struct {
 	// Now is the clock used by the serial generator. Nil means
 	// time.Now().UnixMilli — overridden by tests for determinism.
 	Now func() int64
+
+	// Logger receives operational events — currently the LISTEN
+	// broker's reconnect/reconcile lifecycle (DESIGN.md §7.2) and the
+	// presence reaper (§12.5). Nil means slog.Default().
+	Logger *slog.Logger
 }
 
 // Storage is the pgx/pgxpool-backed storage.Storage.
 type Storage struct {
 	pool   *pgxpool.Pool
+	dsn    string // retained so the LISTEN goroutine can re-dial on drop
 	series string // per-process seriesId, embedded in every minted channelSerial
+	logger *slog.Logger
 
 	mu       sync.Mutex
 	channels map[string]*channelStore
 
-	listenConn   *pgx.Conn
-	listenCancel context.CancelFunc
-	listenDone   chan struct{}
+	initialListenConn *pgx.Conn // first LISTEN conn, dialed by Open; owned by listenLoop thereafter
+	cancel            context.CancelFunc
+	wg                sync.WaitGroup
 }
 
 // Open dials Postgres at opts.DSN, applies any pending migrations
@@ -125,30 +144,49 @@ func Open(ctx context.Context, opts Options) (*Storage, error) {
 
 	// Dedicated LISTEN connection. pgxpool doesn't expose the long-
 	// lived single-conn semantics LISTEN needs, so we acquire a
-	// separate raw conn for the broker goroutine.
-	listenConn, err := pgx.Connect(ctx, opts.DSN)
+	// separate raw conn for the broker goroutine. Dialing it here lets
+	// Open fail fast on a bad DSN; the goroutine re-dials fresh conns
+	// itself when this one drops.
+	listenConn, err := dialAndListen(ctx, opts.DSN)
 	if err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("storage/postgres: dial LISTEN conn: %w", err)
+		return nil, err
 	}
-	if _, err := listenConn.Exec(ctx, `LISTEN `+pgx.Identifier{notifyChannelName}.Sanitize()); err != nil {
-		_ = listenConn.Close(context.Background())
-		pool.Close()
-		return nil, fmt.Errorf("storage/postgres: LISTEN: %w", err)
+
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
 	}
 
 	s := &Storage{
-		pool:       pool,
-		series:     serial.NewSeriesID(),
-		channels:   make(map[string]*channelStore),
-		listenConn: listenConn,
-		listenDone: make(chan struct{}),
+		pool:              pool,
+		dsn:               opts.DSN,
+		series:            serial.NewSeriesID(),
+		logger:            logger,
+		channels:          make(map[string]*channelStore),
+		initialListenConn: listenConn,
 	}
 
 	loopCtx, cancel := context.WithCancel(context.Background())
-	s.listenCancel = cancel
+	s.cancel = cancel
+	s.wg.Add(1)
 	go s.listenLoop(loopCtx)
 	return s, nil
+}
+
+// dialAndListen opens a fresh raw pgx.Conn and issues the broker LISTEN
+// on it. Used both for the initial conn in Open and for every
+// post-drop re-dial in the LISTEN goroutine.
+func dialAndListen(ctx context.Context, dsn string) (*pgx.Conn, error) {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("storage/postgres: dial LISTEN conn: %w", err)
+	}
+	if _, err := conn.Exec(ctx, `LISTEN `+pgx.Identifier{notifyChannelName}.Sanitize()); err != nil {
+		_ = conn.Close(context.Background())
+		return nil, fmt.Errorf("storage/postgres: LISTEN: %w", err)
+	}
+	return conn, nil
 }
 
 // Channel returns the ChannelStore for name, binding it to appender on
@@ -186,15 +224,14 @@ func (s *Storage) Channel(ctx context.Context, name string, appender storage.App
 	return cs, nil
 }
 
-// Close stops the LISTEN goroutine, closes the LISTEN conn, and
-// releases the pool.
+// Close stops the background goroutines (LISTEN broker and, in cluster
+// presence, the lease-bump and reaper loops) and releases the pool. The
+// LISTEN goroutine owns closing its own conn, so Close only cancels and
+// waits.
 func (s *Storage) Close() error {
-	if s.listenCancel != nil {
-		s.listenCancel()
-		<-s.listenDone
-	}
-	if s.listenConn != nil {
-		_ = s.listenConn.Close(context.Background())
+	if s.cancel != nil {
+		s.cancel()
+		s.wg.Wait()
 	}
 	s.pool.Close()
 	return nil
@@ -208,21 +245,50 @@ func (s *Storage) Ping(ctx context.Context) error {
 }
 
 // listenLoop dispatches NOTIFY events to the registered channelStore
-// for each channel. A NOTIFY for an unregistered channel is dropped:
-// local attachments materialise the channelStore on demand via
-// Storage.Channel, so events that arrive before any local interest
-// are intentionally lost (the canonical cm is still in storage and
-// will be picked up by a subsequent ATTACH+resume via History).
+// for each channel, surviving dropped LISTEN connections (DESIGN.md
+// §7.2). It runs consume() on the current conn until a
+// WaitForNotification error; unless that error is Close() cancelling
+// the context, it re-dials a fresh conn with capped-exponential
+// backoff, re-LISTENs, reconciles each channel's missed cms from
+// history, and resumes. It exits only when the storage is Close()d.
+//
+// A NOTIFY for an unregistered channel is dropped: local attachments
+// materialise the channelStore on demand via Storage.Channel, so
+// events that arrive before any local interest are intentionally lost
+// (the canonical cm is still in storage and picked up by a subsequent
+// ATTACH+resume via History).
 func (s *Storage) listenLoop(ctx context.Context) {
-	defer close(s.listenDone)
+	defer s.wg.Done()
 
+	conn := s.initialListenConn
 	for {
-		n, err := s.listenConn.WaitForNotification(ctx)
+		err := s.consume(ctx, conn)
+		_ = conn.Close(context.Background())
+		if ctx.Err() != nil {
+			return // Close(): expected shutdown
+		}
+		s.logger.Warn("storage/postgres: LISTEN connection lost; reconnecting", "err", err)
+
+		conn = s.redial(ctx)
+		if conn == nil {
+			return // ctx cancelled during backoff
+		}
+		// Re-LISTEN is already done by redial; reconcile before resuming
+		// so any cm minted during the gap is replayed exactly once
+		// (deliver() dedups against a subsequent buffered NOTIFY).
+		s.reconcile(ctx)
+		s.logger.Info("storage/postgres: LISTEN reconnected and reconciled")
+	}
+}
+
+// consume runs the steady-state WaitForNotification dispatch on conn,
+// returning the error that ended it (a dropped conn, or ctx
+// cancellation on Close).
+func (s *Storage) consume(ctx context.Context, conn *pgx.Conn) error {
+	for {
+		n, err := conn.WaitForNotification(ctx)
 		if err != nil {
-			// Context cancellation is the expected shutdown path.
-			// Other errors are terminal for this conn — there's no
-			// reconnect strategy yet (TASK-22 follow-up).
-			return
+			return err
 		}
 
 		var p notifyPayload
@@ -241,7 +307,55 @@ func (s *Storage) listenLoop(ctx context.Context) {
 		if err != nil {
 			continue // best-effort; nothing we can do without the cm
 		}
-		cs.appender.Append(cm)
+		cs.deliver(cm)
+	}
+}
+
+// redial re-establishes the LISTEN connection with capped exponential
+// backoff, retrying until it succeeds or ctx is cancelled (Close). A
+// nil return means ctx was cancelled.
+func (s *Storage) redial(ctx context.Context) *pgx.Conn {
+	delay := listenReconnectBaseDelay
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(delay):
+		}
+
+		conn, err := dialAndListen(ctx, s.dsn)
+		if err == nil {
+			return conn
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		s.logger.Warn("storage/postgres: LISTEN re-dial failed; backing off", "err", err, "delay", delay)
+		if delay *= 2; delay > listenReconnectMaxDelay {
+			delay = listenReconnectMaxDelay
+		}
+	}
+}
+
+// reconcile replays, per registered channel, every cm minted past the
+// channel's last-delivered serial — the cms whose NOTIFY was lost while
+// the LISTEN conn was down (DESIGN.md §7.2). Each is delivered through
+// cs.deliver, whose high-water mark makes replay idempotent against the
+// normal NOTIFY path.
+func (s *Storage) reconcile(ctx context.Context) {
+	s.mu.Lock()
+	stores := make([]*channelStore, 0, len(s.channels))
+	for _, cs := range s.channels {
+		if cs.appender != nil {
+			stores = append(stores, cs)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, cs := range stores {
+		if err := cs.reconcileFromHistory(ctx); err != nil {
+			s.logger.Warn("storage/postgres: reconcile failed", "channel", cs.name, "err", err)
+		}
 	}
 }
 
@@ -442,6 +556,83 @@ type channelStore struct {
 	series   string
 	name     string
 	appender storage.Appender
+
+	// hwmMu guards lastSeen, the highest channel_serial delivered to
+	// appender. It is the per-channel de-dup high-water mark that makes
+	// post-reconnect history replay (reconcileFromHistory) idempotent
+	// against the normal NOTIFY dispatch (DESIGN.md §7.2). Only the
+	// LISTEN goroutine writes it, via deliver.
+	hwmMu    sync.Mutex
+	lastSeen string
+}
+
+// deliver hands cm to the appender exactly once and in order, advancing
+// the per-channel high-water mark. A cm whose serial is not strictly
+// greater than the last delivered serial is dropped — the case where a
+// reconnect's history replay and a subsequently-buffered NOTIFY both
+// carry it. All appends (steady-state NOTIFY dispatch and reconcile)
+// funnel through here, from the single LISTEN goroutine.
+func (cs *channelStore) deliver(cm *protocol.ChannelMessage) {
+	cs.hwmMu.Lock()
+	if cm.ChannelSerial <= cs.lastSeen {
+		cs.hwmMu.Unlock()
+		return
+	}
+	cs.lastSeen = cm.ChannelSerial
+	cs.hwmMu.Unlock()
+	cs.appender.Append(cm)
+}
+
+// reconcileFromHistory replays every cm minted after the channel's
+// last-delivered serial — both message and presence kinds, merged in
+// channelSerial order — through deliver (DESIGN.md §7.2). Called after
+// a LISTEN reconnect to recover cms whose NOTIFY was lost in the gap.
+func (cs *channelStore) reconcileFromHistory(ctx context.Context) error {
+	cs.hwmMu.Lock()
+	after := cs.lastSeen
+	cs.hwmMu.Unlock()
+
+	messages, err := cs.History(ctx, storage.HistoryQuery{
+		Kind:               storage.KindMessage,
+		Direction:          storage.DirectionForwards,
+		AfterChannelSerial: after,
+	})
+	if err != nil {
+		return fmt.Errorf("reconcile messages: %w", err)
+	}
+	presence, err := cs.History(ctx, storage.HistoryQuery{
+		Kind:               storage.KindPresence,
+		Direction:          storage.DirectionForwards,
+		AfterChannelSerial: after,
+	})
+	if err != nil {
+		return fmt.Errorf("reconcile presence: %w", err)
+	}
+
+	for _, cm := range mergeByChannelSerial(messages.ChannelMessages, presence.ChannelMessages) {
+		cs.deliver(cm)
+	}
+	return nil
+}
+
+// mergeByChannelSerial merges two channelSerial-ascending cm slices
+// (the message and presence streams share one channelSerial namespace
+// but never collide on a serial) into a single ascending slice.
+func mergeByChannelSerial(a, b []*protocol.ChannelMessage) []*protocol.ChannelMessage {
+	out := make([]*protocol.ChannelMessage, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		if a[i].ChannelSerial <= b[j].ChannelSerial {
+			out = append(out, a[i])
+			i++
+		} else {
+			out = append(out, b[j])
+			j++
+		}
+	}
+	out = append(out, a[i:]...)
+	out = append(out, b[j:]...)
+	return out
 }
 
 // Store persists one publish atomically: look up any contained
@@ -978,6 +1169,7 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 		  AND ($3 = '' OR channel_serial <  $3)
 		  AND ($4 = '' OR (channel_serial, idx) %s ($4, $5))
 		  AND ($7 = '' OR channel_serial <= $7)
+		  AND ($9 = '' OR channel_serial > $9)
 		ORDER BY channel_serial %s, idx %s
 		LIMIT CASE WHEN $6 > 0 THEN $6 + 1 ELSE NULL END
 	`, cursorOp, order, order)
@@ -988,6 +1180,7 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 		limit,
 		q.EndChannelSerial,
 		string(wantKind),
+		q.AfterChannelSerial,
 	)
 	if err != nil {
 		return storage.HistoryPage{}, fmt.Errorf("storage/postgres: history query: %w", err)

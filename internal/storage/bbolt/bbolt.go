@@ -680,6 +680,15 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 	if timeLower != "" {
 		lowerKey = channelKey(cs.name, timeLower)
 	}
+	if q.AfterChannelSerial != "" {
+		// Strict lower bound on channelSerial — the lex successor of the
+		// channel key for AfterChannelSerial (append NUL) skips that
+		// serial's own rows.
+		afterKey := append(channelKey(cs.name, q.AfterChannelSerial), 0)
+		if bytes.Compare(afterKey, lowerKey) > 0 {
+			lowerKey = afterKey
+		}
+	}
 	upperKey := nextPrefix(prefix)
 	if timeUpper != "" {
 		upperKey = channelKey(cs.name, timeUpper)

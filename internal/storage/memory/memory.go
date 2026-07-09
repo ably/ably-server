@@ -446,6 +446,14 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 	if lower != "" {
 		lo = sort.SearchStrings(cs.order, lower)
 	}
+	if q.AfterChannelSerial != "" {
+		// Strict lower bound on channelSerial: the first index whose
+		// channelSerial > AfterChannelSerial. Searching for the lex
+		// successor (append NUL) skips the equal serial's own rows.
+		if after := sort.SearchStrings(cs.order, q.AfterChannelSerial+"\x00"); after > lo {
+			lo = after
+		}
+	}
 	hi := len(cs.order)
 	if upper != "" {
 		hi = sort.SearchStrings(cs.order, upper)
