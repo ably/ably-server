@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -489,7 +490,9 @@ func (s *Server) HandleMessageVersions(w http.ResponseWriter, r *http.Request) {
 
 // HandlePresence returns the channel's current presence set as a flat
 // array of PresenceMessages, each stamped action=PRESENT (DESIGN.md
-// §12.6). Format follows the Accept header.
+// §12.6). It honours the `clientId` and `connectionId` filter query
+// params (RSP3a2/RSP3a3) and paginates with `limit` and the shared Link
+// convention (RSP3a1). Format follows the Accept header.
 //
 // Gated by the `subscribe` capability op (DESIGN.md §3.1).
 func (s *Server) HandlePresence(w http.ResponseWriter, r *http.Request) {
@@ -503,6 +506,12 @@ func (s *Server) HandlePresence(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.authorize(w, r, principal, name, auth.OpSubscribe) {
+		return
+	}
+
+	pq, err := parsePresenceQuery(r.URL.Query())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -525,14 +534,82 @@ func (s *Server) HandlePresence(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := marshalPresence(presentMembers(members), format)
+	page, boundary, hasMore := paginateMembers(members, pq)
+
+	body, err := marshalPresence(presentMembers(page), format)
 	if err != nil {
 		s.logger.Warn("presence encode failed", "channel", name, "err", err)
 		http.Error(w, "encode failed", http.StatusInternalServerError)
 		return
 	}
+	writeLinkHeaders(w, r, boundary, hasMore)
 	w.Header().Set("Content-Type", contentTypeFor(format))
 	_, _ = w.Write(body)
+}
+
+// presenceQuery bounds a GET .../presence read: an optional clientId /
+// connectionId equality filter (RSP3a2/RSP3a3), a limit, and an opaque
+// pagination cursor (the trailing member's Serial from the prior page).
+type presenceQuery struct {
+	clientID     string
+	connectionID string
+	limit        int
+	cursor       string
+}
+
+// parsePresenceQuery reads the GET .../presence query params. limit
+// defaults to defaultHistoryLimit and is bounded like history's; clientId
+// and connectionId are exact-match filters; the cursor is the internal
+// pagination param.
+func parsePresenceQuery(values url.Values) (presenceQuery, error) {
+	q := presenceQuery{
+		clientID:     values.Get("clientId"),
+		connectionID: values.Get("connectionId"),
+		limit:        defaultHistoryLimit,
+		cursor:       values.Get(internalCursorParam),
+	}
+	if v := values.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > maxHistoryLimit {
+			return q, fmt.Errorf("limit: must be an integer between 1 and %d", maxHistoryLimit)
+		}
+		q.limit = n
+	}
+	return q, nil
+}
+
+// paginateMembers applies the clientId/connectionId filter, orders the
+// surviving members by Serial for a stable page sequence, then slices one
+// limit-bounded page after the query's cursor. It returns the page, the
+// boundary serial for the next cursor, and whether more members remain.
+// The membership set is small (§12.4), so an in-memory sort-and-slice is
+// adequate — the presence set is a snapshot, not a large history scan.
+func paginateMembers(members []*protocol.PresenceMessage, q presenceQuery) (page []*protocol.PresenceMessage, boundary string, hasMore bool) {
+	filtered := make([]*protocol.PresenceMessage, 0, len(members))
+	for _, m := range members {
+		if q.clientID != "" && m.ClientID != q.clientID {
+			continue
+		}
+		if q.connectionID != "" && m.ConnectionID != q.connectionID {
+			continue
+		}
+		if q.cursor != "" && m.Serial <= q.cursor {
+			continue
+		}
+		filtered = append(filtered, m)
+	}
+	sort.Slice(filtered, func(i, j int) bool { return filtered[i].Serial < filtered[j].Serial })
+
+	if q.limit > 0 && len(filtered) > q.limit {
+		page = filtered[:q.limit]
+		hasMore = true
+	} else {
+		page = filtered
+	}
+	if n := len(page); n > 0 {
+		boundary = page[n-1].Serial
+	}
+	return page, boundary, hasMore
 }
 
 // HandlePresenceHistory returns the channel's presence history — a flat

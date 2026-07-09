@@ -1405,7 +1405,10 @@ node's appender). This bounds orphan visibility to one lease window.
 
 - `GET /channels/{channel}/presence` — the current membership set,
   served from `Members`; requires `subscribe`. Returns a PresenceMessage
-  array (each with action `PRESENT`).
+  array (each with action `PRESENT`). Accepts `clientId` and
+  `connectionId` exact-match filters (RSP3a2/RSP3a3) and paginates with
+  `limit` and the same `Link` convention as message history (§2.2), the
+  member `serial` doubling as the opaque page cursor.
 - `GET /channels/{channel}/presence/history` — presence history, a
   `kind=presence` history scan (§12.1) paginated with the same `Link`
   convention as message history (§2.2); requires `history`.

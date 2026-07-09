@@ -3,6 +3,7 @@ package rest
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -199,6 +200,89 @@ func TestPresenceHistoryPagination(t *testing.T) {
 	page2 := decodePresenceJSON(t, resp2)
 	if len(page2) != 2 || page2[0].ClientID != "c" || page2[1].ClientID != "d" {
 		t.Fatalf("page2 = %+v, want [c d]", page2)
+	}
+}
+
+// TestPresenceGetPaginatesByLimit seeds six members and pages the
+// presence set with limit=2: three full pages of two, a rel=next link on
+// all but the last, and the full set recovered across pages (RSP3a1).
+func TestPresenceGetPaginatesByLimit(t *testing.T) {
+	srv, manager := newTestServer(t)
+	for i := range 6 {
+		enterPresence(t, manager, "room", &protocol.PresenceMessage{
+			Action:       protocol.PresenceEnter,
+			ClientID:     fmt.Sprintf("c%d", i),
+			ConnectionID: fmt.Sprintf("conn%d", i),
+			Data:         fmt.Sprintf("d%d", i),
+		})
+	}
+
+	seen := map[string]struct{}{}
+	nextURL := "/channels/room/presence?limit=2"
+	pages := 0
+	for nextURL != "" {
+		resp := getAuthed(t, srv, nextURL, "")
+		got := decodePresenceJSON(t, resp)
+		pages++
+		if len(got) != 2 {
+			t.Fatalf("page %d got %d items, want 2", pages, len(got))
+		}
+		for _, m := range got {
+			if m.Action != protocol.PresencePresent {
+				t.Errorf("page %d member %s action = %v, want PRESENT", pages, m.ClientID, m.Action)
+			}
+			seen[m.ClientID] = struct{}{}
+		}
+		nextURL = nextLink(t, resp)
+	}
+	if pages != 3 {
+		t.Fatalf("paged %d times, want 3", pages)
+	}
+	if len(seen) != 6 {
+		t.Fatalf("saw %d distinct members across pages, want 6", len(seen))
+	}
+}
+
+// TestPresenceGetFiltersByClientID asserts the clientId query param
+// filters the returned set to the matching member (RSP3a2).
+func TestPresenceGetFiltersByClientID(t *testing.T) {
+	srv, manager := newTestServer(t)
+	enterPresence(t, manager, "room",
+		&protocol.PresenceMessage{Action: protocol.PresenceEnter, ClientID: "alice", ConnectionID: "connA"},
+		&protocol.PresenceMessage{Action: protocol.PresenceEnter, ClientID: "bob", ConnectionID: "connB"},
+		&protocol.PresenceMessage{Action: protocol.PresenceEnter, ClientID: "carol", ConnectionID: "connC"},
+	)
+
+	resp := getAuthed(t, srv, "/channels/room/presence?clientId=bob", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	got := decodePresenceJSON(t, resp)
+	if len(got) != 1 || got[0].ClientID != "bob" {
+		t.Fatalf("clientId=bob returned %+v, want single member bob", got)
+	}
+	if nextLink(t, resp) != "" {
+		t.Error("single-member filtered result should have no next link")
+	}
+}
+
+// TestPresenceGetFiltersByConnectionID asserts the connectionId query
+// param filters the returned set to members on that connection (RSP3a3).
+func TestPresenceGetFiltersByConnectionID(t *testing.T) {
+	srv, manager := newTestServer(t)
+	enterPresence(t, manager, "room",
+		&protocol.PresenceMessage{Action: protocol.PresenceEnter, ClientID: "alice", ConnectionID: "connA"},
+		&protocol.PresenceMessage{Action: protocol.PresenceEnter, ClientID: "bob", ConnectionID: "connB"},
+		&protocol.PresenceMessage{Action: protocol.PresenceEnter, ClientID: "carol", ConnectionID: "connC"},
+	)
+
+	resp := getAuthed(t, srv, "/channels/room/presence?connectionId=connB", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	got := decodePresenceJSON(t, resp)
+	if len(got) != 1 || got[0].ClientID != "bob" || got[0].ConnectionID != "connB" {
+		t.Fatalf("connectionId=connB returned %+v, want single member bob/connB", got)
 	}
 }
 
