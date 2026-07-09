@@ -1276,12 +1276,17 @@ new `connectionId`.) Departure:
 leaves orphaned rows in the `presence` table — the one case the LEAVE
 path cannot cover, and a cluster-only one (a single-process crash takes
 the whole set down with it). Each `presence` row therefore records its
-owning `node_id` and an `expires_at`; a live node bumps `expires_at` for
-all of its rows on the heartbeat tick (§5.2). A periodic reaper runs
-`DELETE FROM presence WHERE expires_at < now() RETURNING …` — Postgres
-row locking means exactly one node's `RETURNING` yields a given row, and
-that node synthesises the LEAVE for it through the normal publish path.
-This bounds orphan visibility to one lease window.
+owning `node_id` and an `expires_at` lease, stamped by `StorePresence`
+on ENTER/UPDATE. The storage backend runs two background loops on fixed
+cadences (constants; operator config is a follow-up): a **lease-bump**
+loop refreshes `expires_at` for every row the node owns in one
+`UPDATE … WHERE node_id = $node`, at an interval comfortably shorter
+than the lease window, so a live node's members never lapse; and a
+**reaper** loop runs `DELETE FROM presence WHERE expires_at < now()
+RETURNING …` — Postgres row locking means exactly one node's `RETURNING`
+yields a given row, and that node synthesises the LEAVE for it through
+the normal publish path (a fresh presence publish → NOTIFY → every
+node's appender). This bounds orphan visibility to one lease window.
 
 ### 12.6 REST
 
