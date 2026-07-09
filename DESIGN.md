@@ -1077,9 +1077,24 @@ supplies a value nothing more specific set.
 ## 10. Observability
 
 - **Logs**: structured (`slog`), `text` for dev, `json` for prod.
-- **Metrics**: Prometheus at `/metrics`. Counters for connections, attaches,
-  messages in/out, REST requests; histograms for connection lifetime, publish
-  latency.
+- **Metrics**: Prometheus at `/metrics`, served unauthenticated on the main
+  listener alongside `/healthz`. The series are process-wide and
+  low-cardinality — no per-channel, per-connection, or per-clientId labels:
+  - `ably_connections_opened_total` (counter) — WebSocket upgrades.
+  - `ably_connections_open` (gauge) — currently-open WebSocket connections.
+  - `ably_connection_lifetime_seconds` (histogram) — connection lifetime,
+    upgrade to teardown.
+  - `ably_attachments_total` (counter) — channel attachments established.
+  - `ably_messages_published_total` (counter) — inbound publishes accepted
+    (WebSocket + REST).
+  - `ably_messages_delivered_total` (counter) — outbound `MESSAGE` frames
+    forwarded to attachments.
+  - `ably_publish_latency_seconds` (histogram) — inbound publish to
+    storage-commit/ACK.
+  - `ably_http_requests_total{route,method,status}` (counter) — REST requests
+    by matched route pattern, method, and response status.
+
+  Standard Go runtime and process collectors are also registered.
 - **Tracing**: OpenTelemetry, off by default, enabled by `OTEL_*` env.
 - **pprof**: behind `--debug-listen` on a separate port.
 

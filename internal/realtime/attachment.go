@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ably/ably-server/internal/core"
+	"github.com/ably/ably-server/internal/metrics"
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/storage"
 )
@@ -47,9 +48,10 @@ type attachment struct {
 	// connID is the owning connection's id, and echo its `echo` setting.
 	// When echo is false the fan-out skips message cms this connection
 	// published itself (DESIGN.md §2.1).
-	connID string
-	echo   bool
-	logger *slog.Logger
+	connID  string
+	echo    bool
+	metrics *metrics.Metrics
+	logger  *slog.Logger
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -62,7 +64,7 @@ type attachment struct {
 // empty for a fresh attach; if non-empty, run() will replay the gap
 // before entering the live Stream loop. rewindParam takes effect only
 // when resumeFrom is empty — channelSerial wins (DESIGN §4.3).
-func newAttachment(parent context.Context, name string, channel *core.Channel, stream *core.Stream, resumeFrom string, modes int64, params map[string]string, out chan<- *protocol.ProtocolMessage, connID string, echo bool, logger *slog.Logger) *attachment {
+func newAttachment(parent context.Context, name string, channel *core.Channel, stream *core.Stream, resumeFrom string, modes int64, params map[string]string, out chan<- *protocol.ProtocolMessage, connID string, echo bool, m *metrics.Metrics, logger *slog.Logger) *attachment {
 	ctx, cancel := context.WithCancel(parent)
 	rewind := ""
 	if resumeFrom == "" {
@@ -80,6 +82,7 @@ func newAttachment(parent context.Context, name string, channel *core.Channel, s
 		out:         out,
 		connID:      connID,
 		echo:        echo,
+		metrics:     m,
 		logger:      logger,
 		ctx:         ctx,
 		cancel:      cancel,
@@ -205,12 +208,16 @@ func (a *attachment) forward(cm *protocol.ChannelMessage) bool {
 		if !a.echo && a.connID != "" && cm.Messages[0].ConnectionID == a.connID {
 			return true
 		}
-		return a.send(&protocol.ProtocolMessage{
+		if !a.send(&protocol.ProtocolMessage{
 			Action:        protocol.ActionMessage,
 			Channel:       a.channelName,
 			ChannelSerial: cm.ChannelSerial,
 			Messages:      cm.Messages,
-		})
+		}) {
+			return false
+		}
+		a.metrics.MessageDelivered()
+		return true
 	}
 	if len(cm.Presence) > 0 {
 		if !a.hasMode(protocol.FlagPresenceSubscribe) {

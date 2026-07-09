@@ -11,6 +11,7 @@ import (
 
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/core"
+	"github.com/ably/ably-server/internal/metrics"
 	"github.com/ably/ably-server/internal/protocol"
 )
 
@@ -33,6 +34,7 @@ type connection struct {
 	echo    bool
 	logger  *slog.Logger
 	manager *core.Manager
+	metrics *metrics.Metrics
 
 	outbound    chan *protocol.ProtocolMessage
 	attachments map[string]*attachment
@@ -296,8 +298,9 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 		c.logger.Warn("Attach failed", "channel", name, "err", err)
 		return
 	}
-	a := newAttachment(ctx, name, ch, stream, msg.ChannelSerial, effective, msg.Params, c.outbound, c.id, c.echo, c.logger.With("channel", name))
+	a := newAttachment(ctx, name, ch, stream, msg.ChannelSerial, effective, msg.Params, c.outbound, c.id, c.echo, c.metrics, c.logger.With("channel", name))
 	c.attachments[name] = a
+	c.metrics.AttachmentOpened()
 	go a.run()
 }
 
@@ -403,6 +406,10 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 
 	channel := msg.Channel
 	messages := msg.Messages
+	// Timed from here — the point the publish is accepted and handed to
+	// the worker — so publish latency spans the queue wait plus the
+	// storage commit, i.e. inbound publish to ACK (DESIGN.md §10).
+	accepted := time.Now()
 	c.enqueuePublish(ctx, func() {
 		ch, err := c.manager.GetChannel(ctx, channel)
 		if err != nil {
@@ -416,6 +423,7 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 			c.nack(ctx, msgSerial, nil)
 			return
 		}
+		c.metrics.MessagePublished(time.Since(accepted).Seconds())
 		// Count is 1: an ACK acknowledges protocol messages (one msgSerial
 		// per frame), not the inner messages. We emit one ACK per inbound
 		// frame and never batch-ack, so it is always 1. The per-message

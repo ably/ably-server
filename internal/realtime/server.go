@@ -15,6 +15,7 @@ import (
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/id"
+	"github.com/ably/ably-server/internal/metrics"
 	"github.com/ably/ably-server/internal/protocol"
 )
 
@@ -29,6 +30,7 @@ type Server struct {
 	manager           *core.Manager
 	heartbeatInterval time.Duration
 	logger            *slog.Logger
+	metrics           *metrics.Metrics
 	upgrader          websocket.Upgrader
 
 	// mu guards conns, the registry of live connections used by Shutdown
@@ -40,12 +42,13 @@ type Server struct {
 // NewServer constructs a Server. The Manager pairs each Channel with
 // its storage facet — publishes go through Channel.Publish, which
 // delegates to the storage backend.
-func NewServer(keys []auth.APIKey, manager *core.Manager, heartbeatInterval time.Duration, logger *slog.Logger) *Server {
+func NewServer(keys []auth.APIKey, manager *core.Manager, heartbeatInterval time.Duration, logger *slog.Logger, m *metrics.Metrics) *Server {
 	return &Server{
 		authn:             auth.NewAuthenticator(keys...),
 		manager:           manager,
 		heartbeatInterval: heartbeatInterval,
 		logger:            logger,
+		metrics:           m,
 		conns:             make(map[*connection]struct{}),
 		upgrader: websocket.Upgrader{
 			// Tests use httptest.Server which sets up a same-origin
@@ -100,12 +103,20 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		echo:              echoFromQuery(r.URL.Query().Get("echo")),
 		logger:            s.logger.With("connId", connID),
 		manager:           s.manager,
+		metrics:           s.metrics,
 		outbound:          make(chan *protocol.ProtocolMessage, 16),
 		attachments:       make(map[string]*attachment),
 		entered:           make(map[string]map[string]struct{}),
 		publishQ:          make(chan func(), 16),
 		reauth:            make(chan time.Time, 1),
 	}
+
+	// The upgrade succeeded: count the connection and time its lifetime,
+	// bracketing conn.run so the gauge and lifetime histogram stay
+	// balanced whichever way the loop exits (DESIGN.md §10).
+	opened := time.Now()
+	s.metrics.ConnectionOpened()
+	defer func() { s.metrics.ConnectionClosed(time.Since(opened).Seconds()) }()
 
 	s.register(conn)
 	defer s.deregister(conn)

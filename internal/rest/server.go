@@ -22,6 +22,7 @@ import (
 
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/core"
+	"github.com/ably/ably-server/internal/metrics"
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/storage"
 )
@@ -33,6 +34,7 @@ type Server struct {
 	manager *core.Manager
 	logger  *slog.Logger
 	ready   storage.Pinger
+	metrics *metrics.Metrics
 }
 
 // NewServer constructs a Server. The Manager pairs each Channel with
@@ -40,12 +42,13 @@ type Server struct {
 // delegates to the storage backend. ready, if non-nil, is consulted by
 // HandleReadyz on every request (see DESIGN.md §2.2); callers pass nil
 // for backends with no external dependency to check (memory, bbolt).
-func NewServer(keys []auth.APIKey, manager *core.Manager, logger *slog.Logger, ready storage.Pinger) *Server {
+func NewServer(keys []auth.APIKey, manager *core.Manager, logger *slog.Logger, ready storage.Pinger, m *metrics.Metrics) *Server {
 	return &Server{
 		authn:   auth.NewAuthenticator(keys...),
 		manager: manager,
 		logger:  logger,
 		ready:   ready,
+		metrics: m,
 	}
 }
 
@@ -120,6 +123,7 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "channel unavailable", http.StatusInternalServerError)
 		return
 	}
+	accepted := time.Now()
 	cm, _, err := ch.Publish(r.Context(), msgs)
 	if errors.Is(err, storage.ErrInvalidMessageID) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -130,6 +134,7 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "publish failed", http.StatusInternalServerError)
 		return
 	}
+	s.metrics.MessagePublished(time.Since(accepted).Seconds())
 
 	// Ably's publish response (RSL1): 201 with {channel, messageId}. The
 	// messageId is the server-stamped id of the publish's first message —

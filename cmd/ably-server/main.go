@@ -21,6 +21,7 @@ import (
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/config"
 	"github.com/ably/ably-server/internal/core"
+	"github.com/ably/ably-server/internal/metrics"
 	"github.com/ably/ably-server/internal/realtime"
 	"github.com/ably/ably-server/internal/rest"
 	"github.com/ably/ably-server/internal/storage"
@@ -172,15 +173,16 @@ func run(ctx context.Context, opts runOpts) int {
 	}()
 	logger.Info("storage ready", "mode", *mode)
 
+	m := metrics.New()
 	manager := core.NewManager(store)
-	rt := realtime.NewServer(parsedKeys, manager, *hbInterval, logger)
+	rt := realtime.NewServer(parsedKeys, manager, *hbInterval, logger, m)
 	// ready is non-nil only for backends with an external dependency
 	// worth probing (currently postgres.Storage); memory/disk leave it
 	// nil and /readyz reports 200 unconditionally (TASK-62).
 	ready, _ := store.(storage.Pinger)
-	rs := rest.NewServer(parsedKeys, manager, logger, ready)
+	rs := rest.NewServer(parsedKeys, manager, logger, ready, m)
 
-	mux := newMux(rt, rs)
+	mux := newMux(rt, rs, m)
 
 	srv := &http.Server{
 		Handler:           mux,
@@ -320,24 +322,84 @@ func splitTrim(in []string) []string {
 // Go 1.22's ServeMux and would feed every unmatched GET path to the
 // upgrader (returning a confusing 400 with WebSocket headers). With `{$}`,
 // only `/` upgrades and unknown paths fall through to a clean 404.
-func newMux(rt *realtime.Server, rs *rest.Server) *http.ServeMux {
+func newMux(rt *realtime.Server, rs *rest.Server, m *metrics.Metrics) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", rt.HandleWebSocket)
-	mux.HandleFunc("POST /channels/{name}/messages", rs.HandlePublish)
-	mux.HandleFunc("GET /channels/{name}/messages", rs.HandleHistory)
+
+	// REST routes are wrapped so each records ably_http_requests_total by
+	// route pattern / method / status (DESIGN.md §10). The WebSocket route
+	// is excluded — its handler blocks for the connection's whole lifetime,
+	// which the connection metrics already cover. /metrics itself is
+	// unwrapped so scrapes don't inflate the counters.
+	rest := func(pattern string, h http.HandlerFunc) {
+		mux.Handle(pattern, instrumentHTTP(m, pattern, h))
+	}
+	rest("POST /channels/{name}/messages", rs.HandlePublish)
+	rest("GET /channels/{name}/messages", rs.HandleHistory)
 	// ably-go's REST History() requests /history (TASK-57); serve it as
 	// an alias so the SDK's history reads work.
-	mux.HandleFunc("GET /channels/{name}/history", rs.HandleHistory)
-	mux.HandleFunc("PATCH /channels/{name}/messages/{serial}", rs.HandleMutate)
-	mux.HandleFunc("GET /channels/{name}/messages/{serial}", rs.HandleMessage)
-	mux.HandleFunc("GET /channels/{name}/messages/{serial}/versions", rs.HandleMessageVersions)
-	mux.HandleFunc("GET /channels/{name}/presence", rs.HandlePresence)
-	mux.HandleFunc("GET /channels/{name}/presence/history", rs.HandlePresenceHistory)
-	mux.HandleFunc("POST /keys/{keyName}/requestToken", rs.HandleRequestToken)
-	mux.HandleFunc("GET /time", rs.HandleTime)
-	mux.HandleFunc("GET /healthz", rs.HandleHealthz)
-	mux.HandleFunc("GET /readyz", rs.HandleReadyz)
+	rest("GET /channels/{name}/history", rs.HandleHistory)
+	rest("PATCH /channels/{name}/messages/{serial}", rs.HandleMutate)
+	rest("GET /channels/{name}/messages/{serial}", rs.HandleMessage)
+	rest("GET /channels/{name}/messages/{serial}/versions", rs.HandleMessageVersions)
+	rest("GET /channels/{name}/presence", rs.HandlePresence)
+	rest("GET /channels/{name}/presence/history", rs.HandlePresenceHistory)
+	rest("POST /keys/{keyName}/requestToken", rs.HandleRequestToken)
+	rest("GET /time", rs.HandleTime)
+	rest("GET /healthz", rs.HandleHealthz)
+	rest("GET /readyz", rs.HandleReadyz)
+
+	// /metrics is served unauthenticated on the main listener, like
+	// /healthz (DESIGN.md §10). Skipped when no Metrics is configured
+	// (only tests pass nil; production always wires one).
+	if m != nil {
+		mux.Handle("GET /metrics", m.Handler())
+	}
 	return mux
+}
+
+// instrumentHTTP wraps a REST handler so it records the served request
+// against ably_http_requests_total, labelled by the route pattern (kept
+// low-cardinality by using the pattern, not the concrete path), method,
+// and response status.
+func instrumentHTTP(m *metrics.Metrics, pattern string, h http.HandlerFunc) http.HandlerFunc {
+	route := routePath(pattern)
+	return func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		h(rec, r)
+		m.HTTPRequest(route, r.Method, rec.status)
+	}
+}
+
+// routePath strips the leading "METHOD " from a ServeMux pattern, leaving
+// the path template used as the metric's route label.
+func routePath(pattern string) string {
+	if i := strings.IndexByte(pattern, ' '); i >= 0 {
+		return pattern[i+1:]
+	}
+	return pattern
+}
+
+// statusRecorder captures the response status code written by a handler
+// so the HTTP metrics middleware can label by it. A handler that never
+// calls WriteHeader leaves the default 200.
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if !s.wroteHeader {
+		s.status = code
+		s.wroteHeader = true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	s.wroteHeader = true
+	return s.ResponseWriter.Write(b)
 }
 
 func openStorage(ctx context.Context, mode, dataDir, dbDSN string) (storage.Storage, error) {

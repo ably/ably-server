@@ -25,7 +25,7 @@ func newShutdownServer(t *testing.T, hb time.Duration) (*httptest.Server, *Serve
 		t.Fatalf("parse api key: %v", err)
 	}
 	manager := core.NewManager(memory.New(memory.Options{}))
-	rt := NewServer([]auth.APIKey{parsed}, manager, hb, slog.New(slog.DiscardHandler))
+	rt := NewServer([]auth.APIKey{parsed}, manager, hb, slog.New(slog.DiscardHandler), nil)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", rt.HandleWebSocket)
 	srv := httptest.NewServer(mux)
