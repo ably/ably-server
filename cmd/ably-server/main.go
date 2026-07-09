@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -27,9 +28,10 @@ import (
 )
 
 const (
-	apiKeyEnv    = "ABLY_SERVER_API_KEY"
-	dbDSNEnv     = "ABLY_SERVER_DB_DSN"
-	logFormatEnv = "ABLY_SERVER_LOG_FORMAT"
+	apiKeyEnv      = "ABLY_SERVER_API_KEY"
+	dbDSNEnv       = "ABLY_SERVER_DB_DSN"
+	logFormatEnv   = "ABLY_SERVER_LOG_FORMAT"
+	debugListenEnv = "ABLY_SERVER_DEBUG_LISTEN"
 )
 
 func main() {
@@ -60,6 +62,12 @@ type runOpts struct {
 	// discover the ephemeral port. The send is bounded by ctx so a
 	// missing receiver does not deadlock startup.
 	Ready chan<- net.Addr
+
+	// DebugReady, when non-nil, receives the bound debug listener's
+	// address once it starts — used by tests that pass
+	// --debug-listen=:0 to discover the ephemeral port. Only sent to
+	// when --debug-listen is set; the send is bounded by ctx.
+	DebugReady chan<- net.Addr
 }
 
 // run executes the server and returns the process exit code. All
@@ -77,6 +85,7 @@ func run(ctx context.Context, opts runOpts) int {
 	shutdownGrace := fs.Duration("shutdown-grace", 10*time.Second, "window to disconnect existing connections on SIGTERM")
 	logLevel := fs.String("log-level", "info", "log level: debug, info, warn, error")
 	logFormat := fs.String("log-format", envOr(opts.Getenv, logFormatEnv, "text"), "log format: text or json (env: "+logFormatEnv+")")
+	debugListen := fs.String("debug-listen", opts.Getenv(debugListenEnv), "address for the pprof debug listener; disabled if empty (env: "+debugListenEnv+")")
 	if err := fs.Parse(opts.Args); err != nil {
 		return 2
 	}
@@ -146,10 +155,43 @@ func run(ctx context.Context, opts runOpts) int {
 		}
 	}()
 
+	// debugSrv is non-nil only when --debug-listen is set; it serves
+	// net/http/pprof's handlers (registered on http.DefaultServeMux by
+	// this file's blank import) on a separate address so pprof is
+	// never reachable via the main listener.
+	var debugSrv *http.Server
+	if *debugListen != "" {
+		debugListener, err := net.Listen("tcp", *debugListen)
+		if err != nil {
+			logger.Error("failed to listen on debug address", "addr", *debugListen, "err", err)
+			return 1
+		}
+		if opts.DebugReady != nil {
+			select {
+			case opts.DebugReady <- debugListener.Addr():
+			case <-ctx.Done():
+				_ = debugListener.Close()
+				return 1
+			}
+		}
+		debugSrv = &http.Server{ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			logger.Info("debug listening", "addr", debugListener.Addr().String())
+			if err := debugSrv.Serve(debugListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("debug serve error", "err", err)
+			}
+		}()
+	}
+
 	<-ctx.Done()
 	logger.Info("shutdown signal received")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), *shutdownGrace)
 	defer cancel()
+	if debugSrv != nil {
+		if err := debugSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Error("debug shutdown error", "err", err)
+		}
+	}
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("shutdown error", "err", err)
 		return 1
