@@ -201,6 +201,13 @@ const (
 	// flag as a discontinuity.
 	FlagResumed int64 = 1 << 2
 
+	// FlagAttachResume is set by the SDK on an ATTACH that continues an
+	// existing attachment (a non-clean attach, RTL4j) — e.g. re-attaching
+	// after a connection resume. Like a supplied channelSerial it marks the
+	// attach as a resume, which suppresses rewind (DESIGN.md §4.3): a
+	// continuation must not replay history the client has already seen.
+	FlagAttachResume int64 = 1 << 5
+
 	// Channel-mode flags (DESIGN.md §4.2). ATTACH.flags selects the
 	// requested modes; ATTACHED.flags carries the effective set.
 	FlagPresence          int64 = 1 << 16 // enter/update/leave presence

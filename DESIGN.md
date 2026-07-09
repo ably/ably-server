@@ -345,6 +345,13 @@ client                        server
   │   ◀──── DETACHED ────────────│
 ```
 
+A repeat `ATTACH` for a channel the connection is already attached to is a
+**re-attach**, not a no-op: the SDK sends `ATTACH` whenever the channel is
+not locally `ATTACHED`/`ATTACHING` and blocks until it sees an `ATTACHED`
+(RTL4). The server tears down the existing attachment and builds a fresh one
+from the new `ATTACH`'s modes, cursor, and params, so the client always
+receives a new `ATTACHED` (plus any replay).
+
 `ATTACHED` is the **first** frame the server emits in response to `ATTACH`;
 any replay or live messages follow it. Its fields:
 
@@ -429,7 +436,10 @@ channel params are silently ignored.
 
 `rewind` and `channelSerial` are mutually exclusive on a single `ATTACH`:
 if both are supplied, `channelSerial` wins (it is the more precise cursor)
-and `rewind` is ignored.
+and `rewind` is ignored. `rewind` is likewise suppressed when the `ATTACH`
+is a resume — either a supplied `channelSerial` or the `ATTACH_RESUME`
+flag (`1 << 5`, RTL4j, set by the SDK on a non-clean attach): a
+continuation must not replay history the client has already seen.
 
 ### 4.4 Implementation
 

@@ -281,8 +281,16 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 		c.logger.Warn("ATTACH with empty channel name; ignoring")
 		return
 	}
-	if _, exists := c.attachments[name]; exists {
-		return
+	// A repeat ATTACH for a channel this connection is already attached to
+	// is a re-attach, not a no-op: the SDK sends ATTACH whenever its channel
+	// is not locally ATTACHED/ATTACHING (e.g. after it moved the channel to
+	// FAILED, RTL4g) and blocks until it sees an ATTACHED. Silently dropping
+	// it strands the client. Tear the existing attachment down and fall
+	// through to build a fresh one with this ATTACH's modes/cursor/params,
+	// so the client gets a new ATTACHED (plus any replay) per protocol.
+	if prev, exists := c.attachments[name]; exists {
+		prev.stop()
+		delete(c.attachments, name)
 	}
 
 	// Effective mode set = requested ∩ capability-permitted (DESIGN.md
@@ -313,7 +321,7 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 		c.logger.Warn("Attach failed", "channel", name, "err", err)
 		return
 	}
-	a := newAttachment(ctx, name, ch, stream, msg.ChannelSerial, effective, msg.Params, c.outbound, c.id, c.echo, c.metrics, c.logger.With("channel", name))
+	a := newAttachment(ctx, name, ch, stream, msg.ChannelSerial, msg.Flags&protocol.FlagAttachResume != 0, effective, msg.Params, c.outbound, c.id, c.echo, c.metrics, c.logger.With("channel", name))
 	c.attachments[name] = a
 	c.metrics.AttachmentOpened()
 	go a.run()

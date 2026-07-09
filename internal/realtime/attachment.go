@@ -83,10 +83,14 @@ type attachment struct {
 // empty for a fresh attach; if non-empty, run() will replay the gap
 // before entering the live Stream loop. rewindParam takes effect only
 // when resumeFrom is empty — channelSerial wins (DESIGN §4.3).
-func newAttachment(parent context.Context, name string, channel *core.Channel, stream *core.Stream, resumeFrom string, modes int64, params map[string]string, out chan<- *protocol.ProtocolMessage, connID string, echo bool, m *metrics.Metrics, logger *slog.Logger) *attachment {
+func newAttachment(parent context.Context, name string, channel *core.Channel, stream *core.Stream, resumeFrom string, attachResume bool, modes int64, params map[string]string, out chan<- *protocol.ProtocolMessage, connID string, echo bool, m *metrics.Metrics, logger *slog.Logger) *attachment {
 	ctx, cancel := context.WithCancel(parent)
+	// rewind is suppressed when the attach is a resume — either a supplied
+	// channelSerial cursor or the ATTACH_RESUME flag (RTL4j) — so a
+	// continuation does not replay history the client has already seen
+	// (DESIGN.md §4.3, matching the reference's isResume gate).
 	rewind := ""
-	if resumeFrom == "" {
+	if resumeFrom == "" && !attachResume {
 		rewind = params["rewind"]
 	}
 	return &attachment{
