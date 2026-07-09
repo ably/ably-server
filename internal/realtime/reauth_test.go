@@ -51,11 +51,12 @@ func dialWithToken(t *testing.T, srv *httptest.Server, token string) *websocket.
 	return ws
 }
 
-// A token close to expiry (within preExpiryWindow) triggers an immediate
-// AUTH prompt, and lapsing without re-auth disconnects with 40142.
+// A token with enough life left (within preExpiryWindow but above the
+// no-warning margin) triggers an immediate AUTH prompt, and lapsing without
+// re-auth disconnects with 40142.
 func TestAuthPromptAndExpiry(t *testing.T) {
 	srv, _ := newTestServer(t, time.Hour)
-	ws := dialWithToken(t, srv, signToken(t, `{"*":["*"]}`, "", 700*time.Millisecond))
+	ws := dialWithToken(t, srv, signToken(t, `{"*":["*"]}`, "", 7*time.Second))
 
 	if f := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionConnected {
 		t.Fatalf("first frame = %v, want CONNECTED", f.Action)
@@ -67,9 +68,28 @@ func TestAuthPromptAndExpiry(t *testing.T) {
 	}
 	// With no re-auth, the connection is disconnected at expiry with the
 	// token-expired code.
-	f := readFrame(t, ws, protocol.FormatJSON, 3*time.Second)
+	f := readFrame(t, ws, protocol.FormatJSON, 9*time.Second)
 	if f.Action != protocol.ActionDisconnected || f.Error == nil || f.Error.Code != 40142 {
 		t.Fatalf("frame = %+v, want DISCONNECTED 40142", f)
+	}
+}
+
+// A token whose remaining lifetime is below the no-warning margin is not
+// prompted at all: the next frame after CONNECTED is the token-expired
+// DISCONNECTED. This is the RTN22a path — the SDK reconnects with a fresh
+// token rather than renewing inband, so prompting would be counterproductive.
+func TestShortTokenExpiresWithoutPrompt(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+	ws := dialWithToken(t, srv, signToken(t, `{"*":["*"]}`, "", 700*time.Millisecond))
+
+	if f := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionConnected {
+		t.Fatalf("first frame = %v, want CONNECTED", f.Action)
+	}
+	// No AUTH prompt for a sub-margin token: the connection goes straight to
+	// the token-expired DISCONNECTED.
+	f := readFrame(t, ws, protocol.FormatJSON, 3*time.Second)
+	if f.Action != protocol.ActionDisconnected || f.Error == nil || f.Error.Code != 40142 {
+		t.Fatalf("frame = %+v, want DISCONNECTED 40142 with no prompt", f)
 	}
 }
 
@@ -77,8 +97,9 @@ func TestAuthPromptAndExpiry(t *testing.T) {
 // replies with CONNECTED, without dropping the connection.
 func TestReauthSuccess(t *testing.T) {
 	srv, _ := newTestServer(t, time.Hour)
-	// Start subscribe-only, near expiry.
-	ws := dialWithToken(t, srv, signToken(t, `{"chat:*":["subscribe"]}`, "alice", 2*time.Second))
+	// Start subscribe-only, near expiry (above the no-warning margin so a
+	// prompt fires immediately).
+	ws := dialWithToken(t, srv, signToken(t, `{"chat:*":["subscribe"]}`, "alice", 7*time.Second))
 	if f := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionConnected {
 		t.Fatalf("first frame = %v, want CONNECTED", f.Action)
 	}
@@ -111,6 +132,9 @@ func TestReauthSuccess(t *testing.T) {
 }
 
 // An inband AUTH whose token resolves to a different clientId is rejected.
+// A client-supplied credential the server rejects is not renewable, so the
+// rejection is an ERROR frame (non-renewable code) that moves the SDK's
+// connection to FAILED — not a renewable DISCONNECTED (RTC8a2).
 func TestReauthIncompatibleClientID(t *testing.T) {
 	srv, _ := newTestServer(t, time.Hour)
 	ws := dialWithToken(t, srv, signToken(t, `{"*":["*"]}`, "alice", time.Hour))
@@ -125,12 +149,15 @@ func TestReauthIncompatibleClientID(t *testing.T) {
 		Auth:   &protocol.AuthDetails{AccessToken: other},
 	})
 	f := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
-	if f.Action != protocol.ActionDisconnected || f.Error == nil || f.Error.Code != 40102 {
-		t.Fatalf("frame = %+v, want DISCONNECTED 40102", f)
+	if f.Action != protocol.ActionError || f.Error == nil || f.Error.Code != 40102 {
+		t.Fatalf("frame = %+v, want ERROR 40102", f)
 	}
 }
 
-// An inband AUTH carrying an unverifiable token is rejected.
+// An inband AUTH carrying an unverifiable token is rejected with an ERROR
+// frame carrying a non-renewable credential error (RTC8a2): the SDK moves the
+// connection to FAILED rather than reconnecting, because the bad token was
+// supplied by the client, not lapsed on the server's clock.
 func TestReauthInvalidToken(t *testing.T) {
 	srv, _ := newTestServer(t, time.Hour)
 	ws := dialWithToken(t, srv, signToken(t, `{"*":["*"]}`, "alice", time.Hour))
@@ -143,7 +170,22 @@ func TestReauthInvalidToken(t *testing.T) {
 		Auth:   &protocol.AuthDetails{AccessToken: "not.a.valid.token"},
 	})
 	f := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
-	if f.Action != protocol.ActionDisconnected || f.Error == nil || f.Error.Code != 40140 {
-		t.Fatalf("frame = %+v, want DISCONNECTED 40140", f)
+	if f.Action != protocol.ActionError || f.Error == nil || f.Error.Code != 40101 {
+		t.Fatalf("frame = %+v, want ERROR 40101", f)
+	}
+}
+
+// An inband AUTH with no access token is rejected with a non-renewable ERROR.
+func TestReauthMissingToken(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+	ws := dialWithToken(t, srv, signToken(t, `{"*":["*"]}`, "alice", time.Hour))
+	if f := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionConnected {
+		t.Fatalf("first frame = %v, want CONNECTED", f.Action)
+	}
+
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{Action: protocol.ActionAuth})
+	f := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if f.Action != protocol.ActionError || f.Error == nil || f.Error.Code != 40101 {
+		t.Fatalf("frame = %+v, want ERROR 40101", f)
 	}
 }

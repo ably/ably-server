@@ -171,17 +171,29 @@ JWT claims:
 | `x-ably-clientId` | | string; controls the connection's `clientId` (see §3.2) |
 
 **Inband re-authentication.** A token-authenticated WebSocket tracks its
-token's `exp`. Shortly before expiry the server sends an `AUTH` frame
-prompting the client to renew; the client replies with an `AUTH` frame
+token's `exp`. About 30 seconds before expiry the server sends an `AUTH`
+frame prompting the client to renew (immediately if the token is adopted
+already inside that window); the client replies with an `AUTH` frame
 carrying a fresh token in `auth.accessToken`. The server verifies it and
 requires the new credential to be **compatible** with the connection — the
 resolved `clientId` (§3.2) must be unchanged — then swaps in the new
 capability set and expiry and replies with a `CONNECTED` frame carrying
-updated `connectionDetails`, all without dropping the connection. An
-invalid or incompatible token, or no valid token by `exp`, ends the
-connection with a `DISCONNECTED` frame: the token-expired code `40142`
-when the token lapsed, otherwise a token/credential error — each with
-status `401` so the SDK reconnects.
+updated `connectionDetails`, all without dropping the connection.
+
+A token whose remaining lifetime on adoption is below a small margin (~5.5
+seconds) is **not** prompted: it is simply left to expire. The two failure
+modes are deliberately distinct so the SDK reacts correctly:
+
+- **Token lapsed** (no valid token by `exp`) — the server sends a
+  `DISCONNECTED` frame with the token-expired code `40142` (status `401`).
+  This is renewable: the SDK obtains a fresh token and reconnects (RTN15h2,
+  RTN22a).
+- **Client-supplied token rejected** (an inband `AUTH` whose token fails to
+  verify, carries no token, or resolves to an incompatible `clientId`) — the
+  server sends an `ERROR` frame with a non-renewable credential error
+  (`40101` invalid credentials, `40102` incompatible; status `401`). The
+  code sits outside the SDK's renewable token-error range, so the SDK moves
+  the connection to `FAILED` rather than looping on reconnect (RTC8a2).
 
 ### 3.1 Capabilities
 
