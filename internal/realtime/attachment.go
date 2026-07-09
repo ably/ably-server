@@ -44,7 +44,12 @@ type attachment struct {
 	modes     int64
 	replayCap int
 	out       chan<- *protocol.ProtocolMessage
-	logger    *slog.Logger
+	// connID is the owning connection's id, and echo its `echo` setting.
+	// When echo is false the fan-out skips message cms this connection
+	// published itself (DESIGN.md §2.1).
+	connID string
+	echo   bool
+	logger *slog.Logger
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -56,7 +61,7 @@ type attachment struct {
 // attach; if non-empty, run() will replay the gap before entering the
 // live Stream loop. rewindParam takes effect only when resumeFrom is
 // empty — channelSerial wins (DESIGN §4.3).
-func newAttachment(parent context.Context, name string, channel *core.Channel, stream *core.Stream, resumeFrom string, flags int64, params map[string]string, out chan<- *protocol.ProtocolMessage, logger *slog.Logger) *attachment {
+func newAttachment(parent context.Context, name string, channel *core.Channel, stream *core.Stream, resumeFrom string, flags int64, params map[string]string, out chan<- *protocol.ProtocolMessage, connID string, echo bool, logger *slog.Logger) *attachment {
 	ctx, cancel := context.WithCancel(parent)
 	rewind := ""
 	if resumeFrom == "" {
@@ -72,6 +77,8 @@ func newAttachment(parent context.Context, name string, channel *core.Channel, s
 		modes:       resolveModes(flags),
 		replayCap:   defaultReplayCap,
 		out:         out,
+		connID:      connID,
+		echo:        echo,
 		logger:      logger,
 		ctx:         ctx,
 		cancel:      cancel,
@@ -185,6 +192,14 @@ func (a *attachment) run() {
 func (a *attachment) forward(cm *protocol.ChannelMessage) bool {
 	if len(cm.Messages) > 0 {
 		if !a.hasMode(protocol.FlagSubscribe) {
+			return true
+		}
+		// echo=false suppresses delivery of this connection's own published
+		// messages back to it (DESIGN.md §2.1). All messages in one cm share
+		// the publishing connection, so the first message's stamped
+		// connectionId identifies the origin. Presence is never suppressed —
+		// it is handled by the branch below.
+		if !a.echo && a.connID != "" && cm.Messages[0].ConnectionID == a.connID {
 			return true
 		}
 		return a.send(&protocol.ProtocolMessage{

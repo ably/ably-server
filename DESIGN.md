@@ -33,6 +33,11 @@ This document describes how it works, section by section. The task list in
   close.
 - **Format** — `format` query parameter selects `json` (text frames,
   default) or `msgpack` (binary frames).
+- **Echo** — `echo` query parameter (default `true`). When `false`, the
+  fan-out does not deliver a connection's own published `MESSAGE`s back to
+  it; a message is identified as the connection's own by its stamped
+  `connectionId`. Presence deliveries are unaffected — a connection always
+  receives its own presence messages.
 
 Each frame is a single `ProtocolMessage`. The server emits `CONNECTED` as
 the first frame after a successful upgrade.

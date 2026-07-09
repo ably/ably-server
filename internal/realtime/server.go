@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -85,6 +86,7 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		clientID:          clientID,
 		principal:         principal,
 		heartbeatInterval: s.heartbeatInterval,
+		echo:              echoFromQuery(r.URL.Query().Get("echo")),
 		logger:            s.logger.With("connId", connID),
 		manager:           s.manager,
 		outbound:          make(chan *protocol.ProtocolMessage, 16),
@@ -92,6 +94,20 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		entered:           make(map[string]map[string]struct{}),
 	}
 	conn.run(r.Context())
+}
+
+// echoFromQuery resolves the `echo` upgrade param. Ably defaults echo to
+// true; only an explicit, valid boolean flips it (a malformed value is
+// ignored, keeping the safe default of echoing).
+func echoFromQuery(v string) bool {
+	if v == "" {
+		return true
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return true
+	}
+	return b
 }
 
 func (s *Server) writeAuthError(w http.ResponseWriter, err error) {

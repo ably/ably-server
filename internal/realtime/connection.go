@@ -25,8 +25,12 @@ type connection struct {
 	clientID          string // resolved clientId for this connection ("" = anonymous, "*" = wildcard); see DESIGN.md §3.2
 	principal         *auth.Principal // verified credential + token claims; clientId resolution (TASK-11) consumes this
 	heartbeatInterval time.Duration
-	logger            *slog.Logger
-	manager           *core.Manager
+	// echo is the connection's `echo` upgrade param (default true). When
+	// false, the fan-out skips delivering this connection's own published
+	// MESSAGEs back to it (DESIGN.md §2.1); presence is always delivered.
+	echo    bool
+	logger  *slog.Logger
+	manager *core.Manager
 
 	outbound    chan *protocol.ProtocolMessage
 	attachments map[string]*attachment
@@ -187,7 +191,7 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 		c.logger.Warn("Attach failed", "channel", name, "err", err)
 		return
 	}
-	a := newAttachment(ctx, name, ch, stream, msg.ChannelSerial, msg.Flags, msg.Params, c.outbound, c.logger.With("channel", name))
+	a := newAttachment(ctx, name, ch, stream, msg.ChannelSerial, msg.Flags, msg.Params, c.outbound, c.id, c.echo, c.logger.With("channel", name))
 	c.attachments[name] = a
 	go a.run()
 }
@@ -250,6 +254,10 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 			return
 		}
 		m.ClientID = cid
+		// Stamp the publishing connection so subscribers see the origin
+		// (Ably delivers Message.connectionId) and the fan-out can honour
+		// echo=false (DESIGN.md §2.1, §8).
+		m.ConnectionID = c.id
 	}
 
 	ch, err := c.manager.GetChannel(ctx, msg.Channel)
