@@ -66,6 +66,9 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "channel name required", http.StatusBadRequest)
 		return
 	}
+	if !s.authorize(w, r, principal, name, auth.OpPublish) {
+		return
+	}
 
 	format, err := contentTypeFormat(r.Header.Get("Content-Type"))
 	if err != nil {
@@ -188,15 +191,18 @@ func marshalValue(v any, format protocol.Format) ([]byte, error) {
 // Link headers with rel="current", rel="first", and (when more results
 // exist) rel="next" — clients are required to treat the URLs opaquely.
 //
-// Capability enforcement (the `history` op) is deferred to TASK-12;
-// today the endpoint requires only the API key.
+// The `history` capability op is required (DESIGN.md §3.1).
 func (s *Server) HandleHistory(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticate(w, r); !ok {
+	principal, ok := s.authenticate(w, r)
+	if !ok {
 		return
 	}
 	name := r.PathValue("name")
 	if name == "" {
 		http.Error(w, "channel name required", http.StatusBadRequest)
+		return
+	}
+	if !s.authorize(w, r, principal, name, auth.OpHistory) {
 		return
 	}
 
@@ -329,15 +335,19 @@ func (s *Server) HandleMutate(w http.ResponseWriter, r *http.Request) {
 // HandleMessage returns the latest version of a single message —
 // GET /channels/{name}/messages/{serial} (DESIGN.md §13.4) — or its
 // tombstone if deleted. A message that never existed (or aged out) is a
-// 404. Gated by history (API key only today; capability is TASK-12).
+// 404. Gated by the `history` capability op (DESIGN.md §3.1).
 func (s *Server) HandleMessage(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticate(w, r); !ok {
+	principal, ok := s.authenticate(w, r)
+	if !ok {
 		return
 	}
 	name := r.PathValue("name")
 	serial := r.PathValue("serial")
 	if name == "" || serial == "" {
 		http.Error(w, "channel name and message serial required", http.StatusBadRequest)
+		return
+	}
+	if !s.authorize(w, r, principal, name, auth.OpHistory) {
 		return
 	}
 
@@ -378,15 +388,19 @@ func (s *Server) HandleMessage(w http.ResponseWriter, r *http.Request) {
 // version — GET /channels/{name}/messages/{serial}/versions (DESIGN.md
 // §13.4) — paginated with the same Link convention as message history,
 // except the cursor is a version serial. A message with no versions is a
-// 404. Gated by history (API key only today; capability is TASK-12).
+// 404. Gated by the `history` capability op (DESIGN.md §3.1).
 func (s *Server) HandleMessageVersions(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticate(w, r); !ok {
+	principal, ok := s.authenticate(w, r)
+	if !ok {
 		return
 	}
 	name := r.PathValue("name")
 	serial := r.PathValue("serial")
 	if name == "" || serial == "" {
 		http.Error(w, "channel name and message serial required", http.StatusBadRequest)
+		return
+	}
+	if !s.authorize(w, r, principal, name, auth.OpHistory) {
 		return
 	}
 
@@ -435,15 +449,18 @@ func (s *Server) HandleMessageVersions(w http.ResponseWriter, r *http.Request) {
 // array of PresenceMessages, each stamped action=PRESENT (DESIGN.md
 // §12.6). Format follows the Accept header.
 //
-// Capability enforcement (the `subscribe` op) is deferred to TASK-12;
-// today the endpoint requires only the API key, like message history.
+// Gated by the `subscribe` capability op (DESIGN.md §3.1).
 func (s *Server) HandlePresence(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticate(w, r); !ok {
+	principal, ok := s.authenticate(w, r)
+	if !ok {
 		return
 	}
 	name := r.PathValue("name")
 	if name == "" {
 		http.Error(w, "channel name required", http.StatusBadRequest)
+		return
+	}
+	if !s.authorize(w, r, principal, name, auth.OpSubscribe) {
 		return
 	}
 
@@ -479,15 +496,19 @@ func (s *Server) HandlePresence(w http.ResponseWriter, r *http.Request) {
 // HandlePresenceHistory returns the channel's presence history — a flat
 // array of PresenceMessages from the presence stream (DESIGN.md §12.6).
 // It reuses the message-history query shape and Link-header pagination,
-// scanning the presence kind. Capability enforcement (the `history` op)
-// is deferred to TASK-12.
+// scanning the presence kind. Gated by the `history` capability op
+// (DESIGN.md §3.1).
 func (s *Server) HandlePresenceHistory(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticate(w, r); !ok {
+	principal, ok := s.authenticate(w, r)
+	if !ok {
 		return
 	}
 	name := r.PathValue("name")
 	if name == "" {
 		http.Error(w, "channel name required", http.StatusBadRequest)
+		return
+	}
+	if !s.authorize(w, r, principal, name, auth.OpHistory) {
 		return
 	}
 
@@ -659,7 +680,8 @@ type tokenDetailsResponse struct {
 
 // authenticate verifies the request's credentials. On success it returns
 // the verified principal and true; on failure it writes a 401 and returns
-// false. Capability enforcement (TASK-12) will also consume the principal.
+// false. Handlers pass the returned principal to authorize for the
+// per-endpoint capability check (DESIGN.md §3.1).
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*auth.Principal, bool) {
 	principal, err := s.authn.Authenticate(r)
 	if err == nil {
@@ -673,6 +695,34 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*auth.Pri
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 	}
 	return nil, false
+}
+
+// errorResponse is the Ably REST error wire shape (`{"error":{...}}`)
+// used for capability rejections (DESIGN.md §3.1).
+type errorResponse struct {
+	Error *protocol.ErrorInfo `json:"error" msgpack:"error"`
+}
+
+// authorize reports whether the principal's capability grants op on
+// channel (DESIGN.md §3.1). On failure it writes a 401 carrying the Ably
+// error shape (code 40160) and returns false.
+func (s *Server) authorize(w http.ResponseWriter, r *http.Request, p *auth.Principal, channel string, op auth.Op) bool {
+	if p.Capabilities().Permits(channel, op) {
+		return true
+	}
+	format, err := acceptFormat(r.Header.Get("Accept"))
+	if err != nil {
+		format = protocol.FormatJSON
+	}
+	body, _ := marshalValue(errorResponse{Error: &protocol.ErrorInfo{
+		Message:    fmt.Sprintf("insufficient capability: %q required for channel %q", op, channel),
+		Code:       40160,
+		StatusCode: http.StatusUnauthorized,
+	}}, format)
+	w.Header().Set("Content-Type", contentTypeFor(format))
+	w.WriteHeader(http.StatusUnauthorized)
+	_, _ = w.Write(body)
+	return false
 }
 
 // resolveRequestClientID applies the §3.2 resolution for a REST request:

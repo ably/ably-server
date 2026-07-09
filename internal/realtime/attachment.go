@@ -36,11 +36,11 @@ type attachment struct {
 	rewindParam string
 	// params: full ATTACH params, echoed in ATTACHED.params.
 	params map[string]string
-	// modes is the effective channel-mode set for this attachment,
-	// resolved from ATTACH.flags (DESIGN.md §4.2): an empty request is
-	// treated as the full set. Gates frame flow — SUBSCRIBE for MESSAGE,
-	// PRESENCE_SUBSCRIBE for PRESENCE/SYNC. Capability intersection
-	// (effective = requested ∩ permitted) is a later task (TASK-12).
+	// modes is the effective channel-mode set for this attachment: the
+	// requested modes intersected with the capability-permitted set,
+	// resolved by the connection before the attachment is created
+	// (DESIGN.md §3.1, §4.2). Gates frame flow — SUBSCRIBE for MESSAGE,
+	// PRESENCE_SUBSCRIBE for PRESENCE/SYNC.
 	modes     int64
 	replayCap int
 	out       chan<- *protocol.ProtocolMessage
@@ -57,11 +57,12 @@ type attachment struct {
 }
 
 // newAttachment derives a cancellable context from parent and returns
-// an attachment ready to be run. resumeFrom may be empty for a fresh
-// attach; if non-empty, run() will replay the gap before entering the
-// live Stream loop. rewindParam takes effect only when resumeFrom is
-// empty — channelSerial wins (DESIGN §4.3).
-func newAttachment(parent context.Context, name string, channel *core.Channel, stream *core.Stream, resumeFrom string, flags int64, params map[string]string, out chan<- *protocol.ProtocolMessage, connID string, echo bool, logger *slog.Logger) *attachment {
+// an attachment ready to be run. modes is the already-resolved effective
+// channel-mode set (requested ∩ capability-permitted). resumeFrom may be
+// empty for a fresh attach; if non-empty, run() will replay the gap
+// before entering the live Stream loop. rewindParam takes effect only
+// when resumeFrom is empty — channelSerial wins (DESIGN §4.3).
+func newAttachment(parent context.Context, name string, channel *core.Channel, stream *core.Stream, resumeFrom string, modes int64, params map[string]string, out chan<- *protocol.ProtocolMessage, connID string, echo bool, logger *slog.Logger) *attachment {
 	ctx, cancel := context.WithCancel(parent)
 	rewind := ""
 	if resumeFrom == "" {
@@ -74,7 +75,7 @@ func newAttachment(parent context.Context, name string, channel *core.Channel, s
 		resumeFrom:  resumeFrom,
 		rewindParam: rewind,
 		params:      params,
-		modes:       resolveModes(flags),
+		modes:       modes,
 		replayCap:   defaultReplayCap,
 		out:         out,
 		connID:      connID,
@@ -132,9 +133,11 @@ func (a *attachment) run() {
 		}
 	}
 
-	flags := int64(0)
+	// ATTACHED.flags carries the effective channel-mode set (DESIGN.md
+	// §4.2), plus the status flags below.
+	flags := a.modes
 	if resumed {
-		flags = protocol.FlagResumed
+		flags |= protocol.FlagResumed
 	}
 	if len(syncMembers) > 0 {
 		flags |= protocol.FlagHasPresence

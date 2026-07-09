@@ -54,6 +54,14 @@ func (k APIKey) Name() string {
 	return k.AppID + "." + k.KeyID
 }
 
+// Capability returns the key's capability. In this single-key model keys
+// are not individually scoped, so every key carries the full capability
+// {"*":["*"]} — the ceiling a token minted from it can be narrowed to
+// (DESIGN.md §3.1, §3.3).
+func (k APIKey) Capability() Capability {
+	return AllowAllCapability()
+}
+
 // ParseAPIKey validates and decomposes an Ably-format API key. All
 // three components must be non-empty.
 func ParseAPIKey(s string) (APIKey, error) {
@@ -112,6 +120,16 @@ type Principal struct {
 	// preserved verbatim). Always empty/false for Basic auth.
 	ClientID    string
 	HasClientID bool
+
+	// cap is the resolved capability set enforced for this principal
+	// (DESIGN.md §3.1): the permissive all-access set for Basic auth or a
+	// token with no capability claim, otherwise the parsed claim.
+	cap Capability
+}
+
+// Capabilities returns the principal's resolved capability set (§3.1).
+func (p *Principal) Capabilities() Capability {
+	return p.cap
 }
 
 // Authenticator verifies presented credentials against one or more
@@ -170,7 +188,7 @@ func (a *Authenticator) Authenticate(r *http.Request) (*Principal, error) {
 		if !a.matchKey(k) {
 			return nil, ErrInvalidKey
 		}
-		return &Principal{Method: MethodBasic}, nil
+		return &Principal{Method: MethodBasic, cap: AllowAllCapability()}, nil
 	}
 	return nil, ErrNoCredentials
 }
@@ -203,9 +221,16 @@ func (a *Authenticator) verifyToken(tokenString string) (*Principal, error) {
 		return nil, fmt.Errorf("%w: missing iat claim", ErrInvalidToken)
 	}
 
-	p := &Principal{Method: MethodToken}
+	p := &Principal{Method: MethodToken, cap: AllowAllCapability()}
 	if c, ok := claims["x-ably-capability"].(string); ok {
 		p.Capability = c
+		// A present capability claim narrows access (§3.1); a malformed
+		// one makes the token unusable.
+		cap, err := ParseCapability(c)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
+		}
+		p.cap = cap
 	}
 	if cid, ok := claims["x-ably-clientId"].(string); ok {
 		p.ClientID = cid
@@ -341,9 +366,12 @@ func (a *Authenticator) ValidateTokenRequest(tr *TokenRequest, r *http.Request) 
 
 // MintToken issues an HS256 JWT for a validated TokenRequest, signed with
 // the key's secret and carrying its name as the kid header. The token's
-// capability and clientId claims come from the request (constrained by the
-// key's capability once enforcement lands, TASK-12). Returns the signed
-// token and its expiry.
+// clientId claim comes from the request; its capability is the requested
+// capability narrowed against (intersected with) the signing key's
+// capability (DESIGN.md §3.3) — for this single-key model the key carries
+// the full `{"*":["*"]}` capability, so a requested capability passes
+// through unchanged but a syntactically invalid one is rejected. Returns
+// the signed token and its expiry.
 func (a *Authenticator) MintToken(tr *TokenRequest) (token string, issued, expires time.Time, err error) {
 	key, ok := a.byName[tr.KeyName]
 	if !ok {
@@ -361,7 +389,15 @@ func (a *Authenticator) MintToken(tr *TokenRequest) (token string, issued, expir
 		"exp": expires.Unix(),
 	}
 	if tr.Capability != "" {
-		claims["x-ably-capability"] = tr.Capability
+		requested, perr := ParseCapability(tr.Capability)
+		if perr != nil {
+			return "", time.Time{}, time.Time{}, fmt.Errorf("%w: %v", ErrInvalidToken, perr)
+		}
+		narrowed := requested.Intersect(key.Capability())
+		if narrowed.IsEmpty() {
+			return "", time.Time{}, time.Time{}, fmt.Errorf("%w: requested capability is not permitted by the key", ErrInvalidToken)
+		}
+		claims["x-ably-capability"] = narrowed.String()
 	}
 	if tr.ClientID != "" {
 		claims["x-ably-clientId"] = tr.ClientID

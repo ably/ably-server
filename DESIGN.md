@@ -262,9 +262,15 @@ request `nonce` as `jti` (so distinct requests yield distinct tokens), and
 `TokenDetails` response body (`token` holds the JWT), which the SDK then
 presents as an `access_token` verified by the path above.
 
-> The requested `capability` is recorded on the token but not yet
-> *narrowed* against the key — capability enforcement is TASK-12. Nonce
-> replay tracking is not implemented; the mac alone guarantees integrity.
+The requested `capability` is *narrowed* against the signing key's
+capability before it is stamped on the token (§3.1): the token grants
+only the intersection of what was requested and what the key permits. For
+this single-key model the key carries the full `{"*":["*"]}` capability,
+so a requested capability passes through unchanged, but a request whose
+capability the key cannot grant at all is rejected.
+
+> Nonce replay tracking is not implemented; the mac alone guarantees
+> integrity.
 
 ## 4. Attachments
 

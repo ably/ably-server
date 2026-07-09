@@ -240,6 +240,25 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 	if _, exists := c.attachments[name]; exists {
 		return
 	}
+
+	// Effective mode set = requested ∩ capability-permitted (DESIGN.md
+	// §3.1, §4.2). An empty intersection means the credential grants no
+	// mode on this channel: reject with ERROR 40160 and create no
+	// attachment.
+	effective := resolveModes(msg.Flags) & c.permittedModes(name)
+	if effective == 0 {
+		c.queue(ctx, &protocol.ProtocolMessage{
+			Action:  protocol.ActionError,
+			Channel: name,
+			Error: &protocol.ErrorInfo{
+				Message:    "insufficient capability to attach to channel",
+				Code:       40160,
+				StatusCode: 401,
+			},
+		})
+		return
+	}
+
 	ch, err := c.manager.GetChannel(ctx, name)
 	if err != nil {
 		c.logger.Warn("GetChannel failed", "channel", name, "err", err)
@@ -250,9 +269,28 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 		c.logger.Warn("Attach failed", "channel", name, "err", err)
 		return
 	}
-	a := newAttachment(ctx, name, ch, stream, msg.ChannelSerial, msg.Flags, msg.Params, c.outbound, c.id, c.echo, c.logger.With("channel", name))
+	a := newAttachment(ctx, name, ch, stream, msg.ChannelSerial, effective, msg.Params, c.outbound, c.id, c.echo, c.logger.With("channel", name))
 	c.attachments[name] = a
 	go a.run()
+}
+
+// permittedModes maps the connection's capability to the channel-mode
+// bits it is allowed on channel (DESIGN.md §3.1, §4.2): subscribe grants
+// SUBSCRIBE and PRESENCE_SUBSCRIBE, publish grants PUBLISH, presence
+// grants PRESENCE.
+func (c *connection) permittedModes(channel string) int64 {
+	cap := c.principal.Capabilities()
+	var m int64
+	if cap.Permits(channel, auth.OpSubscribe) {
+		m |= protocol.FlagSubscribe | protocol.FlagPresenceSubscribe
+	}
+	if cap.Permits(channel, auth.OpPublish) {
+		m |= protocol.FlagPublish
+	}
+	if cap.Permits(channel, auth.OpPresence) {
+		m |= protocol.FlagPresence
+	}
+	return m
 }
 
 // handleDetach stops the matching attachment (waiting for its goroutine
@@ -302,6 +340,19 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 			c.handleMutation(ctx, msg)
 			return
 		}
+	}
+
+	// A create publish requires the `publish` capability on the channel
+	// (DESIGN.md §3.1). Insufficient capability → NACK 40160.
+	if !c.principal.Capabilities().Permits(msg.Channel, auth.OpPublish) {
+		c.logger.Warn("publish rejected: insufficient capability",
+			"channel", msg.Channel, "msgSerial", msgSerial)
+		c.enqueueNack(ctx, msgSerial, &protocol.ErrorInfo{
+			Message:    "insufficient capability to publish",
+			Code:       40160,
+			StatusCode: 401,
+		})
+		return
 	}
 
 	// Resolve and stamp each message's clientId against the connection's
