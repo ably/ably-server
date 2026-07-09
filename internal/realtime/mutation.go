@@ -31,10 +31,11 @@ import (
 // framework (TASK-12); applying it to mutations alone would diverge from
 // the create path.
 func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolMessage) {
+	msgSerial := msg.MsgSerial
 	if len(msg.Messages) != 1 {
 		c.logger.Warn("mutation must carry exactly one message; rejecting",
-			"channel", msg.Channel, "count", len(msg.Messages), "msgSerial", msg.MsgSerial)
-		c.nack(ctx, msg.MsgSerial, &protocol.ErrorInfo{
+			"channel", msg.Channel, "count", len(msg.Messages), "msgSerial", msgSerial)
+		c.enqueueNack(ctx, msgSerial, &protocol.ErrorInfo{
 			Message:    "a mutation must carry exactly one message",
 			Code:       40000,
 			StatusCode: 400,
@@ -44,19 +45,12 @@ func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolM
 	m := msg.Messages[0]
 	if !m.Action.IsMutation() || m.Serial == "" {
 		c.logger.Warn("mutation missing action or target serial; rejecting",
-			"channel", msg.Channel, "action", m.Action.String(), "msgSerial", msg.MsgSerial)
-		c.nack(ctx, msg.MsgSerial, &protocol.ErrorInfo{
+			"channel", msg.Channel, "action", m.Action.String(), "msgSerial", msgSerial)
+		c.enqueueNack(ctx, msgSerial, &protocol.ErrorInfo{
 			Message:    "a mutation requires an action and a target serial",
 			Code:       40000,
 			StatusCode: 400,
 		})
-		return
-	}
-
-	ch, err := c.manager.GetChannel(ctx, msg.Channel)
-	if err != nil {
-		c.logger.Warn("mutation failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerial, "err", err)
-		c.nack(ctx, msg.MsgSerial, nil)
 		return
 	}
 
@@ -67,30 +61,41 @@ func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolM
 		m.ClientID = c.clientID
 	}
 
-	cm, _, err := ch.Mutate(ctx, m)
-	if err != nil {
-		if errors.Is(err, storage.ErrTargetNotFound) {
-			c.logger.Warn("mutation target not found; NACKing",
-				"channel", msg.Channel, "target", m.Serial, "msgSerial", msg.MsgSerial)
-			c.nack(ctx, msg.MsgSerial, &protocol.ErrorInfo{
-				Message:    "target message not found",
-				Code:       40400,
-				StatusCode: 404,
-			})
+	// The mutation store runs on the publish worker, off the read
+	// goroutine, ACKing only after a durable commit and preserving this
+	// connection's ACK ordering (TASK-20).
+	channel := msg.Channel
+	c.enqueuePublish(ctx, func() {
+		ch, err := c.manager.GetChannel(ctx, channel)
+		if err != nil {
+			c.logger.Warn("mutation failed; NACKing", "channel", channel, "msgSerial", msgSerial, "err", err)
+			c.nack(ctx, msgSerial, nil)
 			return
 		}
-		c.logger.Warn("mutation failed; NACKing",
-			"channel", msg.Channel, "target", m.Serial, "msgSerial", msg.MsgSerial, "err", err)
-		c.nack(ctx, msg.MsgSerial, nil)
-		return
-	}
-
-	// The ACK carries the new version serial so the SDK can return it as
-	// the operation's VersionSerial (DESIGN.md §13.1).
-	c.queue(ctx, &protocol.ProtocolMessage{
-		Action:    protocol.ActionAck,
-		MsgSerial: msg.MsgSerial,
-		Count:     1,
-		Res:       []*protocol.PublishResult{{Serials: []string{storage.VersionSerial(cm.Messages[0])}}},
+		cm, _, err := ch.Mutate(ctx, m)
+		if err != nil {
+			if errors.Is(err, storage.ErrTargetNotFound) {
+				c.logger.Warn("mutation target not found; NACKing",
+					"channel", channel, "target", m.Serial, "msgSerial", msgSerial)
+				c.nack(ctx, msgSerial, &protocol.ErrorInfo{
+					Message:    "target message not found",
+					Code:       40400,
+					StatusCode: 404,
+				})
+				return
+			}
+			c.logger.Warn("mutation failed; NACKing",
+				"channel", channel, "target", m.Serial, "msgSerial", msgSerial, "err", err)
+			c.nack(ctx, msgSerial, nil)
+			return
+		}
+		// The ACK carries the new version serial so the SDK can return it
+		// as the operation's VersionSerial (DESIGN.md §13.1).
+		c.queue(ctx, &protocol.ProtocolMessage{
+			Action:    protocol.ActionAck,
+			MsgSerial: msgSerial,
+			Count:     1,
+			Res:       []*protocol.PublishResult{{Serials: []string{storage.VersionSerial(cm.Messages[0])}}},
+		})
 	})
 }

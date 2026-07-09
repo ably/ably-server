@@ -25,9 +25,10 @@ const teardownLeaveTimeout = 5 * time.Second
 // (§12.3), stamps the connectionId, publishes via the channel, and
 // ACK/NACKs on the msgSerial.
 func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolMessage) {
+	msgSerial := msg.MsgSerial
 	if msg.Channel == "" || len(msg.Presence) == 0 {
-		c.logger.Warn("PRESENCE with empty channel or no payload; rejecting", "msgSerial", msg.MsgSerial)
-		c.nack(ctx, msg.MsgSerial, nil)
+		c.logger.Warn("PRESENCE with empty channel or no payload; rejecting", "msgSerial", msgSerial)
+		c.enqueueNack(ctx, msgSerial, nil)
 		return
 	}
 
@@ -35,8 +36,8 @@ func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolM
 	a, ok := c.attachments[msg.Channel]
 	if !ok || !a.hasMode(protocol.FlagPresence) {
 		c.logger.Warn("PRESENCE without an attached PRESENCE-mode channel; rejecting",
-			"channel", msg.Channel, "msgSerial", msg.MsgSerial)
-		c.nack(ctx, msg.MsgSerial, &protocol.ErrorInfo{
+			"channel", msg.Channel, "msgSerial", msgSerial)
+		c.enqueueNack(ctx, msgSerial, &protocol.ErrorInfo{
 			Message:    "presence requires an attachment with the presence mode",
 			Code:       40160,
 			StatusCode: 401,
@@ -49,8 +50,8 @@ func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolM
 		cid, ok := resolvePresenceClientID(c.clientID, p.ClientID)
 		if !ok {
 			c.logger.Warn("PRESENCE clientId rejected", "channel", msg.Channel,
-				"connClientId", c.clientID, "msgClientId", p.ClientID, "msgSerial", msg.MsgSerial)
-			c.nack(ctx, msg.MsgSerial, &protocol.ErrorInfo{
+				"connClientId", c.clientID, "msgClientId", p.ClientID, "msgSerial", msgSerial)
+			c.enqueueNack(ctx, msgSerial, &protocol.ErrorInfo{
 				Message:    "invalid clientId for presence",
 				Code:       91000,
 				StatusCode: 400,
@@ -61,23 +62,34 @@ func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolM
 		p.ConnectionID = c.id
 	}
 
-	if _, _, err := a.channel.PublishPresence(ctx, msg.Presence); err != nil {
-		c.logger.Warn("presence publish failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerial, "err", err)
-		c.nack(ctx, msg.MsgSerial, nil)
-		return
-	}
-
-	// Track membership for teardown LEAVE (DESIGN.md §12.5).
+	// Track membership for teardown LEAVE (DESIGN.md §12.5) on the read
+	// goroutine, which is the only writer of the entered set. This is done
+	// optimistically before the store completes; a rare store failure
+	// would leave a spurious entry whose only effect is a harmless
+	// synthesised LEAVE for a member that never durably entered.
 	for _, p := range msg.Presence {
 		c.recordPresence(msg.Channel, p.ClientID, p.Action)
 	}
 
-	// Count is 1: an ACK acknowledges one protocol message (this PRESENCE
-	// frame), not the members it carries.
-	c.queue(ctx, &protocol.ProtocolMessage{
-		Action:    protocol.ActionAck,
-		MsgSerial: msg.MsgSerial,
-		Count:     1,
+	// The presence store runs on the publish worker so its ACK stays
+	// ordered with this connection's message/mutation ACKs (msgSerial is
+	// shared across all publish kinds) and is emitted only after a durable
+	// commit (TASK-20). Count is 1: an ACK acknowledges one protocol
+	// message (this PRESENCE frame), not the members it carries.
+	channel := msg.Channel
+	presence := msg.Presence
+	ch := a.channel
+	c.enqueuePublish(ctx, func() {
+		if _, _, err := ch.PublishPresence(ctx, presence); err != nil {
+			c.logger.Warn("presence publish failed; NACKing", "channel", channel, "msgSerial", msgSerial, "err", err)
+			c.nack(ctx, msgSerial, nil)
+			return
+		}
+		c.queue(ctx, &protocol.ProtocolMessage{
+			Action:    protocol.ActionAck,
+			MsgSerial: msgSerial,
+			Count:     1,
+		})
 	})
 }
 

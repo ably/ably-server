@@ -514,15 +514,27 @@ Each WebSocket connection has:
 - A heartbeat ticker that sends `HEARTBEAT` if idle.
 - An `attachments map[string]*Attachment` keyed by channel name.
 
-Inbound `MESSAGE` is routed to the matching attachment, which
-authorises the publish and calls `channel.Publish(ctx, msgs)`. That
-returns once storage has committed; the link onto the local linked
-list happens asynchronously via the Appender callback the storage
-holds (synchronous in memory/bbolt, NOTIFY-driven in Postgres — see
-§7). The connection
-then replies with `ACK` / `NACK`. Inbound `ATTACH` / `DETACH` are
-handled by the connection itself, calling into `ChannelManager` to
-get/release a Channel.
+Inbound `MESSAGE` / `PRESENCE` is validated on the read goroutine
+(clientId resolution, connectionId stamping, presence attachment/mode
+checks) and then handed to a per-connection **publish worker** — a single
+goroutine draining a FIFO queue of publish tasks — so the storage write
+happens off the read goroutine and never blocks decoding of the next
+frame. The worker calls `channel.Publish(ctx, msgs)` (or `Mutate` /
+`PublishPresence`), which returns once storage has committed; the link
+onto the local linked list happens asynchronously via the Appender
+callback the storage holds (synchronous in memory/bbolt, NOTIFY-driven in
+Postgres — see §7). Only then does the worker emit the frame's `ACK` (or
+`NACK` on failure), echoing the publish `msgSerial`.
+
+A single FIFO worker per connection is deliberate: it keeps this
+connection's channel appends in publish order and emits `ACK` / `NACK` in
+`msgSerial` order (the SDK correlates acknowledgements positionally, so an
+out-of-order or premature ack corrupts its pending-publish accounting).
+Validation rejections are enqueued through the same worker so their `NACK`
+stays ordered behind any still-in-flight publishes.
+
+Inbound `ATTACH` / `DETACH` are handled by the connection itself on the
+read goroutine, calling into `ChannelManager` to get/release a Channel.
 
 ## 6. Storage
 

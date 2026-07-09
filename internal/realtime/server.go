@@ -92,6 +92,7 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		outbound:          make(chan *protocol.ProtocolMessage, 16),
 		attachments:       make(map[string]*attachment),
 		entered:           make(map[string]map[string]struct{}),
+		publishQ:          make(chan func(), 16),
 	}
 	conn.run(r.Context())
 }

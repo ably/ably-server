@@ -35,6 +35,16 @@ type connection struct {
 	outbound    chan *protocol.ProtocolMessage
 	attachments map[string]*attachment
 
+	// publishQ is the per-connection publish pipeline: one buffered
+	// channel of tasks drained in FIFO order by a single publishLoop
+	// goroutine (DESIGN.md §5.2). Each inbound MESSAGE/mutation/PRESENCE
+	// frame enqueues exactly one task; the worker performs the storage
+	// write off the read goroutine and emits the frame's ACK/NACK on
+	// completion. A single FIFO worker keeps ACKs in msgSerial order and
+	// keeps this connection's channel appends in publish order, while the
+	// read loop stays free to decode the next frame (TASK-20).
+	publishQ chan func()
+
 	// entered tracks the presence members this connection has entered,
 	// per channel: channel -> set of clientIds. Used to synthesise LEAVE
 	// on DETACH and on connection teardown (DESIGN.md §12.5). Only
@@ -82,18 +92,67 @@ func (c *connection) run(ctx context.Context) {
 		c.writeLoop(ctx)
 	}()
 
+	publishDone := make(chan struct{})
+	go func() {
+		defer close(publishDone)
+		c.publishLoop(ctx)
+	}()
+
 	c.readLoop(ctx)
 
 	// The read loop has exited — the connection is terminating (client
 	// disconnect, network error, or the socket being closed under us on
-	// shutdown). Synthesise LEAVE for every presence member this
-	// connection still holds, so other subscribers see the departures
-	// (DESIGN.md §12.5). Uses a fresh context since ctx is about to be
-	// cancelled.
+	// shutdown). Cancel the context and drain the publish worker first so
+	// no in-flight task races the teardown below and no further ACKs are
+	// queued for a dying connection.
+	cancel()
+	<-publishDone
+
+	// Synthesise LEAVE for every presence member this connection still
+	// holds, so other subscribers see the departures (DESIGN.md §12.5).
+	// The worker has stopped and only the read goroutine ever touches the
+	// entered set, so this runs race-free on a fresh, bounded context.
 	c.emitTeardownLeaves()
 
-	cancel()
 	<-writeDone
+}
+
+// publishLoop drains the connection's publish pipeline in FIFO order,
+// running one task at a time until the context is cancelled. Serialising
+// the tasks keeps this connection's channel appends in publish order and
+// its ACK/NACK frames in msgSerial order, while the read goroutine is free
+// to decode the next frame (DESIGN.md §5.2, TASK-20).
+func (c *connection) publishLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case task := <-c.publishQ:
+			task()
+		}
+	}
+}
+
+// enqueuePublish hands a task to the publish worker, blocking only under
+// backpressure (the buffer is full because earlier writes are still in
+// flight) — never on the storage write itself. Returns false if the
+// connection's context is cancelled before the task is accepted.
+func (c *connection) enqueuePublish(ctx context.Context, task func()) bool {
+	select {
+	case c.publishQ <- task:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// enqueueNack routes a validation-rejection NACK through the publish
+// worker so it is emitted in msgSerial order behind any publishes still
+// in flight on this connection — a directly-queued NACK could otherwise
+// overtake an earlier publish's ACK and corrupt the SDK's ack accounting
+// (TASK-20, TASK-33).
+func (c *connection) enqueueNack(ctx context.Context, msgSerial int64, errInfo *protocol.ErrorInfo) {
+	c.enqueuePublish(ctx, func() { c.nack(ctx, msgSerial, errInfo) })
 }
 
 // connectionDetails builds the ConnectionDetails advertised on CONNECTED
@@ -218,17 +277,21 @@ func (c *connection) handleDetach(ctx context.Context, name string) {
 	})
 }
 
-// handleMessage publishes the inbound payload to its channel and ACKs
-// (or NACKs) the publisher.
+// handleMessage validates and stamps the inbound payload on the read
+// goroutine, then hands the storage write to the publish worker, which
+// ACKs after a durable commit (or NACKs on failure). Validation
+// rejections are also enqueued so their NACK stays ordered behind any
+// still-pending publishes on this connection (TASK-20).
 func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMessage) {
+	msgSerial := msg.MsgSerial
 	if msg.Channel == "" {
-		c.logger.Warn("MESSAGE with empty channel name; rejecting", "msgSerial", msg.MsgSerial)
-		c.nack(ctx, msg.MsgSerial, nil)
+		c.logger.Warn("MESSAGE with empty channel name; rejecting", "msgSerial", msgSerial)
+		c.enqueueNack(ctx, msgSerial, nil)
 		return
 	}
 	if len(msg.Messages) == 0 {
-		c.logger.Warn("MESSAGE with no payload; rejecting", "msgSerial", msg.MsgSerial)
-		c.nack(ctx, msg.MsgSerial, nil)
+		c.logger.Warn("MESSAGE with no payload; rejecting", "msgSerial", msgSerial)
+		c.enqueueNack(ctx, msgSerial, nil)
 		return
 	}
 	// Mutations (update/delete/append) reuse the MESSAGE frame,
@@ -249,8 +312,8 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 		cid, ok := auth.MessageClientID(c.clientID, m.ClientID)
 		if !ok {
 			c.logger.Warn("message clientId not permitted; NACKing",
-				"channel", msg.Channel, "msgSerial", msg.MsgSerial, "msgClientId", m.ClientID)
-			c.nack(ctx, msg.MsgSerial, nil)
+				"channel", msg.Channel, "msgSerial", msgSerial, "msgClientId", m.ClientID)
+			c.enqueueNack(ctx, msgSerial, nil)
 			return
 		}
 		m.ClientID = cid
@@ -260,28 +323,33 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 		m.ConnectionID = c.id
 	}
 
-	ch, err := c.manager.GetChannel(ctx, msg.Channel)
-	if err != nil {
-		c.logger.Warn("publish failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerial, "err", err)
-		c.nack(ctx, msg.MsgSerial, nil)
-		return
-	}
-	cm, _, err := ch.Publish(ctx, msg.Messages)
-	if err != nil {
-		c.logger.Warn("publish failed; NACKing", "channel", msg.Channel, "msgSerial", msg.MsgSerial, "err", err)
-		c.nack(ctx, msg.MsgSerial, nil)
-		return
-	}
-	// Count is 1: an ACK acknowledges protocol messages (one msgSerial per
-	// frame), not the inner messages. We emit one ACK per inbound frame
-	// and never batch-ack, so it is always 1. The per-message serials ride
-	// the single Res entry (Ably's TR4s) so the publisher still learns
-	// every serial it was assigned (DESIGN.md §8).
-	c.queue(ctx, &protocol.ProtocolMessage{
-		Action:    protocol.ActionAck,
-		MsgSerial: msg.MsgSerial,
-		Count:     1,
-		Res:       []*protocol.PublishResult{{Serials: messageSerials(cm.Messages)}},
+	channel := msg.Channel
+	messages := msg.Messages
+	c.enqueuePublish(ctx, func() {
+		ch, err := c.manager.GetChannel(ctx, channel)
+		if err != nil {
+			c.logger.Warn("publish failed; NACKing", "channel", channel, "msgSerial", msgSerial, "err", err)
+			c.nack(ctx, msgSerial, nil)
+			return
+		}
+		cm, _, err := ch.Publish(ctx, messages)
+		if err != nil {
+			c.logger.Warn("publish failed; NACKing", "channel", channel, "msgSerial", msgSerial, "err", err)
+			c.nack(ctx, msgSerial, nil)
+			return
+		}
+		// Count is 1: an ACK acknowledges protocol messages (one msgSerial
+		// per frame), not the inner messages. We emit one ACK per inbound
+		// frame and never batch-ack, so it is always 1. The per-message
+		// serials ride the single Res entry (Ably's TR4s) so the publisher
+		// still learns every serial it was assigned (DESIGN.md §8). The ACK
+		// is emitted only now, after storage has durably committed.
+		c.queue(ctx, &protocol.ProtocolMessage{
+			Action:    protocol.ActionAck,
+			MsgSerial: msgSerial,
+			Count:     1,
+			Res:       []*protocol.PublishResult{{Serials: messageSerials(cm.Messages)}},
+		})
 	})
 }
 
