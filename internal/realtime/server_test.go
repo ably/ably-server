@@ -55,7 +55,7 @@ func newTestServer(t *testing.T, hb time.Duration) (*httptest.Server, *testHarne
 		t.Fatalf("parse api key: %v", err)
 	}
 	manager := core.NewManager(memory.New(memory.Options{}))
-	rt := NewServer([]auth.APIKey{parsed}, manager, hb, slog.New(slog.DiscardHandler), nil)
+	rt := NewServer([]auth.APIKey{parsed}, manager, hb, slog.New(slog.DiscardHandler), nil, nil)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", rt.HandleWebSocket)
 	srv := httptest.NewServer(mux)

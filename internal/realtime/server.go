@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/core"
@@ -31,6 +32,7 @@ type Server struct {
 	heartbeatInterval time.Duration
 	logger            *slog.Logger
 	metrics           *metrics.Metrics
+	tracer            trace.Tracer
 	upgrader          websocket.Upgrader
 
 	// mu guards conns, the registry of live connections used by Shutdown
@@ -42,13 +44,14 @@ type Server struct {
 // NewServer constructs a Server. The Manager pairs each Channel with
 // its storage facet — publishes go through Channel.Publish, which
 // delegates to the storage backend.
-func NewServer(keys []auth.APIKey, manager *core.Manager, heartbeatInterval time.Duration, logger *slog.Logger, m *metrics.Metrics) *Server {
+func NewServer(keys []auth.APIKey, manager *core.Manager, heartbeatInterval time.Duration, logger *slog.Logger, m *metrics.Metrics, tracer trace.Tracer) *Server {
 	return &Server{
 		authn:             auth.NewAuthenticator(keys...),
 		manager:           manager,
 		heartbeatInterval: heartbeatInterval,
 		logger:            logger,
 		metrics:           m,
+		tracer:            tracer,
 		conns:             make(map[*connection]struct{}),
 		upgrader: websocket.Upgrader{
 			// Tests use httptest.Server which sets up a same-origin
@@ -104,6 +107,7 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		logger:            s.logger.With("connId", connID),
 		manager:           s.manager,
 		metrics:           s.metrics,
+		tracer:            s.tracer,
 		outbound:          make(chan *protocol.ProtocolMessage, 16),
 		attachments:       make(map[string]*attachment),
 		entered:           make(map[string]map[string]struct{}),

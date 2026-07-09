@@ -18,6 +18,9 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/config"
 	"github.com/ably/ably-server/internal/core"
@@ -28,6 +31,7 @@ import (
 	"github.com/ably/ably-server/internal/storage/bbolt"
 	"github.com/ably/ably-server/internal/storage/memory"
 	"github.com/ably/ably-server/internal/storage/postgres"
+	"github.com/ably/ably-server/internal/tracing"
 )
 
 const (
@@ -157,6 +161,31 @@ func run(ctx context.Context, opts runOpts) int {
 		}
 	}
 
+	// OpenTelemetry tracing is off unless the standard OTEL_* env asks for
+	// it (DESIGN.md §10). Setup uses a background context so a SIGTERM
+	// cancelling ctx does not tear the exporter down before graceful
+	// shutdown flushes it. When disabled this installs no exporter and
+	// starts no goroutine.
+	tp, err := tracing.Setup(context.Background(), opts.Getenv)
+	if err != nil {
+		logger.Error("setup tracing", "err", err)
+		return 1
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tp.Shutdown(shutdownCtx); err != nil {
+			logger.Error("shutdown tracing", "err", err)
+		}
+	}()
+	// Only hand the servers a tracer when export is on, so the disabled
+	// path skips span creation (and its context allocations) entirely.
+	var tracer trace.Tracer
+	if tp.Enabled {
+		tracer = tp.Tracer
+		logger.Info("tracing enabled")
+	}
+
 	store, err := openStorage(ctx, *mode, *dataDir, *dbDSN)
 	if err != nil {
 		logger.Error("open storage", "mode", *mode, "err", err)
@@ -175,17 +204,26 @@ func run(ctx context.Context, opts runOpts) int {
 
 	m := metrics.New()
 	manager := core.NewManager(store)
-	rt := realtime.NewServer(parsedKeys, manager, *hbInterval, logger, m)
+	rt := realtime.NewServer(parsedKeys, manager, *hbInterval, logger, m, tracer)
 	// ready is non-nil only for backends with an external dependency
 	// worth probing (currently postgres.Storage); memory/disk leave it
 	// nil and /readyz reports 200 unconditionally (TASK-62).
 	ready, _ := store.(storage.Pinger)
-	rs := rest.NewServer(parsedKeys, manager, logger, ready, m)
+	rs := rest.NewServer(parsedKeys, manager, logger, ready, m, tracer)
 
 	mux := newMux(rt, rs, m)
 
+	// When tracing is enabled, otelhttp wraps the whole mux so every HTTP
+	// request (including the REST handlers) gets a server span; the WS
+	// upgrade request's span then spans the connection handler too. When
+	// disabled the mux is served directly with no wrapping overhead.
+	var handler http.Handler = mux
+	if tp.Enabled {
+		handler = otelhttp.NewHandler(mux, "http.server")
+	}
+
 	srv := &http.Server{
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

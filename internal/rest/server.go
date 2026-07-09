@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/vmihailenco/msgpack/v5"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/core"
@@ -35,6 +37,8 @@ type Server struct {
 	logger  *slog.Logger
 	ready   storage.Pinger
 	metrics *metrics.Metrics
+	// tracer is nil unless OTEL tracing is enabled; guarded on every use.
+	tracer trace.Tracer
 }
 
 // NewServer constructs a Server. The Manager pairs each Channel with
@@ -42,13 +46,14 @@ type Server struct {
 // delegates to the storage backend. ready, if non-nil, is consulted by
 // HandleReadyz on every request (see DESIGN.md §2.2); callers pass nil
 // for backends with no external dependency to check (memory, bbolt).
-func NewServer(keys []auth.APIKey, manager *core.Manager, logger *slog.Logger, ready storage.Pinger, m *metrics.Metrics) *Server {
+func NewServer(keys []auth.APIKey, manager *core.Manager, logger *slog.Logger, ready storage.Pinger, m *metrics.Metrics, tracer trace.Tracer) *Server {
 	return &Server{
 		authn:   auth.NewAuthenticator(keys...),
 		manager: manager,
 		logger:  logger,
 		ready:   ready,
 		metrics: m,
+		tracer:  tracer,
 	}
 }
 
@@ -117,14 +122,22 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ch, err := s.manager.GetChannel(r.Context(), name)
+	ctx := r.Context()
+	if s.tracer != nil {
+		var span trace.Span
+		ctx, span = s.tracer.Start(ctx, "channel.publish",
+			trace.WithAttributes(attribute.String("ably.channel", name)))
+		defer span.End()
+	}
+
+	ch, err := s.manager.GetChannel(ctx, name)
 	if err != nil {
 		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
 		http.Error(w, "channel unavailable", http.StatusInternalServerError)
 		return
 	}
 	accepted := time.Now()
-	cm, _, err := ch.Publish(r.Context(), msgs)
+	cm, _, err := ch.Publish(ctx, msgs)
 	if errors.Is(err, storage.ErrInvalidMessageID) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

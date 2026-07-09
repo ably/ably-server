@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/core"
@@ -35,6 +37,9 @@ type connection struct {
 	logger  *slog.Logger
 	manager *core.Manager
 	metrics *metrics.Metrics
+	// tracer is nil unless OTEL tracing is enabled; guarded on every use
+	// so the disabled path creates no spans and no context allocations.
+	tracer trace.Tracer
 
 	outbound    chan *protocol.ProtocolMessage
 	attachments map[string]*attachment
@@ -93,6 +98,16 @@ func (c *connection) run(ctx context.Context) {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// One span per connection covers its whole lifecycle (DESIGN.md §10);
+	// publish spans nest under it via the context. Skipped entirely when
+	// tracing is disabled (c.tracer nil) so the hot path is untouched.
+	if c.tracer != nil {
+		var span trace.Span
+		ctx, span = c.tracer.Start(ctx, "ws.connection",
+			trace.WithAttributes(attribute.String("ably.connection_id", c.id)))
+		defer span.End()
+	}
 
 	// CONNECTED is the first frame we emit; buffer is empty here.
 	if !c.queue(ctx, &protocol.ProtocolMessage{
@@ -411,13 +426,20 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 	// storage commit, i.e. inbound publish to ACK (DESIGN.md §10).
 	accepted := time.Now()
 	c.enqueuePublish(ctx, func() {
-		ch, err := c.manager.GetChannel(ctx, channel)
+		pubCtx := ctx
+		if c.tracer != nil {
+			var span trace.Span
+			pubCtx, span = c.tracer.Start(ctx, "publish",
+				trace.WithAttributes(attribute.String("ably.channel", channel)))
+			defer span.End()
+		}
+		ch, err := c.manager.GetChannel(pubCtx, channel)
 		if err != nil {
 			c.logger.Warn("publish failed; NACKing", "channel", channel, "msgSerial", msgSerial, "err", err)
 			c.nack(ctx, msgSerial, nil)
 			return
 		}
-		cm, _, err := ch.Publish(ctx, messages)
+		cm, _, err := ch.Publish(pubCtx, messages)
 		if err != nil {
 			c.logger.Warn("publish failed; NACKing", "channel", channel, "msgSerial", msgSerial, "err", err)
 			c.nack(ctx, msgSerial, nil)

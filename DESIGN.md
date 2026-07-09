@@ -1095,7 +1095,13 @@ supplies a value nothing more specific set.
     by matched route pattern, method, and response status.
 
   Standard Go runtime and process collectors are also registered.
-- **Tracing**: OpenTelemetry, off by default, enabled by `OTEL_*` env.
+- **Tracing**: OpenTelemetry, off by default and configured entirely through
+  the standard `OTEL_*` environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`,
+  `OTEL_SERVICE_NAME`, `OTEL_TRACES_EXPORTER`, …). With no `OTEL_*` present no
+  exporter is built and no goroutine is started — the no-op tracer carries no
+  export overhead. When enabled, spans are exported over OTLP/HTTP and cover
+  the WebSocket connection lifecycle (`ws.connection`), the publish path
+  (`publish` / `channel.publish`), and — via otelhttp — REST request handling.
 - **pprof**: behind `--debug-listen` on a separate port.
 
 ## 11. Lifecycle & operations
