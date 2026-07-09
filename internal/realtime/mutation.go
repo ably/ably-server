@@ -115,7 +115,7 @@ func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolM
 // -own op — the -any op waives it.
 func (c *connection) authorizeMutation(ctx context.Context, ch *core.Channel, channel string, m *protocol.Message) *protocol.ErrorInfo {
 	ownOp, anyOp := mutationOps(m.Action)
-	switch c.principal.Capabilities().MutationGrant(channel, ownOp, anyOp) {
+	switch c.capability().MutationGrant(channel, ownOp, anyOp) {
 	case auth.MutationAllowed:
 		return nil
 	case auth.MutationDeniedCapability:

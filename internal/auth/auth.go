@@ -125,6 +125,11 @@ type Principal struct {
 	// (DESIGN.md §3.1): the permissive all-access set for Basic auth or a
 	// token with no capability claim, otherwise the parsed claim.
 	cap Capability
+
+	// ExpiresAt is the token's expiry (from the `exp` claim), used to
+	// drive inband re-auth (DESIGN.md §3, TASK-17). Zero for Basic auth,
+	// which never expires.
+	ExpiresAt time.Time
 }
 
 // Capabilities returns the principal's resolved capability set (§3.1).
@@ -236,7 +241,18 @@ func (a *Authenticator) verifyToken(tokenString string) (*Principal, error) {
 		p.ClientID = cid
 		p.HasClientID = true
 	}
+	if exp, err := claims.GetExpirationTime(); err == nil && exp != nil {
+		p.ExpiresAt = exp.Time
+	}
 	return p, nil
+}
+
+// VerifyToken verifies a raw JWT string and returns its principal, used
+// for inband re-authentication on an established connection (DESIGN.md
+// §3, TASK-17) where the token arrives in an AUTH frame rather than an
+// HTTP request. It is the token half of Authenticate.
+func (a *Authenticator) VerifyToken(tokenString string) (*Principal, error) {
+	return a.verifyToken(tokenString)
 }
 
 // ResolveClientID derives a connection's (or REST request's) clientId

@@ -93,6 +93,9 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		id:                connID,
 		clientID:          clientID,
 		principal:         principal,
+		authn:             s.authn,
+		cap:               principal.Capabilities(),
+		tokenExpiry:       principal.ExpiresAt,
 		heartbeatInterval: s.heartbeatInterval,
 		echo:              echoFromQuery(r.URL.Query().Get("echo")),
 		logger:            s.logger.With("connId", connID),
@@ -101,6 +104,7 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		attachments:       make(map[string]*attachment),
 		entered:           make(map[string]map[string]struct{}),
 		publishQ:          make(chan func(), 16),
+		reauth:            make(chan time.Time, 1),
 	}
 
 	s.register(conn)

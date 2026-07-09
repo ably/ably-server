@@ -86,6 +86,7 @@ Supported `Action` values:
 | `PRESENCE` (14) | ✓ | ✓ | presence enter/update/leave + delivery (see §12) |
 | `MESSAGE` (15) | ✓ | ✓ | publish + delivery |
 | `SYNC` (16) | | ✓ | presence set sync after attach (see §12) |
+| `AUTH` (17) | ✓ | ✓ | inband re-auth: the server prompts near token expiry; the client supplies a fresh token (see §3) |
 
 ### 2.2 REST
 
@@ -148,6 +149,19 @@ JWT claims:
 | `exp` | ✓ | expiry |
 | `x-ably-capability` | | JSON object granting per-channel ops (see §3.1). Absent → token inherits the signing key's capability, which for our single-key model is `{"*":["*"]}` (i.e. permissive by default; the claim is only needed to *narrow* access) |
 | `x-ably-clientId` | | string; controls the connection's `clientId` (see §3.2) |
+
+**Inband re-authentication.** A token-authenticated WebSocket tracks its
+token's `exp`. Shortly before expiry the server sends an `AUTH` frame
+prompting the client to renew; the client replies with an `AUTH` frame
+carrying a fresh token in `auth.accessToken`. The server verifies it and
+requires the new credential to be **compatible** with the connection — the
+resolved `clientId` (§3.2) must be unchanged — then swaps in the new
+capability set and expiry and replies with a `CONNECTED` frame carrying
+updated `connectionDetails`, all without dropping the connection. An
+invalid or incompatible token, or no valid token by `exp`, ends the
+connection with a `DISCONNECTED` frame: the token-expired code `40142`
+when the token lapsed, otherwise a token/credential error — each with
+status `401` so the SDK reconnects.
 
 ### 3.1 Capabilities
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -22,8 +23,9 @@ type connection struct {
 	ws                *websocket.Conn
 	format            protocol.Format
 	id                string
-	clientID          string // resolved clientId for this connection ("" = anonymous, "*" = wildcard); see DESIGN.md §3.2
-	principal         *auth.Principal // verified credential + token claims; clientId resolution (TASK-11) consumes this
+	clientID          string              // resolved clientId for this connection ("" = anonymous, "*" = wildcard); see DESIGN.md §3.2
+	principal         *auth.Principal     // verified credential + token claims; clientId resolution (TASK-11) consumes this
+	authn             *auth.Authenticator // verifies tokens supplied via inband AUTH (DESIGN.md §3, TASK-17)
 	heartbeatInterval time.Duration
 	// echo is the connection's `echo` upgrade param (default true). When
 	// false, the fan-out skips delivering this connection's own published
@@ -50,6 +52,19 @@ type connection struct {
 	// on DETACH and on connection teardown (DESIGN.md §12.5). Only
 	// touched from the single read-loop goroutine (dispatch + teardown).
 	entered map[string]map[string]struct{}
+
+	// authMu guards the mutable authorisation state that inband re-auth
+	// (DESIGN.md §3, TASK-17) updates — the capability set and token
+	// expiry — since it is read from the read goroutine and the publish
+	// worker but written by the read goroutine on an AUTH frame.
+	authMu      sync.Mutex
+	cap         auth.Capability
+	tokenExpiry time.Time
+
+	// reauth signals the authLoop with a new token expiry after a
+	// successful inband re-auth, so it reschedules its prompt/expiry
+	// timers. Buffered (cap 1) so the read goroutine never blocks on it.
+	reauth chan time.Time
 }
 
 // Connection limits advertised in ConnectionDetails on CONNECTED
@@ -98,6 +113,15 @@ func (c *connection) run(ctx context.Context) {
 		c.publishLoop(ctx)
 	}()
 
+	// authLoop enforces token expiry and prompts inband re-auth
+	// (DESIGN.md §3, TASK-17). For a Basic connection (zero expiry) it is
+	// idle until a re-auth supplies one.
+	authDone := make(chan struct{})
+	go func() {
+		defer close(authDone)
+		c.authLoop(ctx, c.tokenExpiry)
+	}()
+
 	c.readLoop(ctx)
 
 	// The read loop has exited — the connection is terminating (client
@@ -107,6 +131,7 @@ func (c *connection) run(ctx context.Context) {
 	// queued for a dying connection.
 	cancel()
 	<-publishDone
+	<-authDone
 
 	// Synthesise LEAVE for every presence member this connection still
 	// holds, so other subscribers see the departures (DESIGN.md §12.5).
@@ -212,6 +237,8 @@ func (c *connection) dispatch(ctx context.Context, msg *protocol.ProtocolMessage
 		c.handleMessage(ctx, msg)
 	case protocol.ActionPresence:
 		c.handlePresence(ctx, msg)
+	case protocol.ActionAuth:
+		c.handleAuth(ctx, msg)
 	case protocol.ActionClose:
 		c.handleClose(ctx)
 	default:
@@ -279,7 +306,7 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 // SUBSCRIBE and PRESENCE_SUBSCRIBE, publish grants PUBLISH, presence
 // grants PRESENCE.
 func (c *connection) permittedModes(channel string) int64 {
-	cap := c.principal.Capabilities()
+	cap := c.capability()
 	var m int64
 	if cap.Permits(channel, auth.OpSubscribe) {
 		m |= protocol.FlagSubscribe | protocol.FlagPresenceSubscribe
@@ -344,7 +371,7 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 
 	// A create publish requires the `publish` capability on the channel
 	// (DESIGN.md §3.1). Insufficient capability → NACK 40160.
-	if !c.principal.Capabilities().Permits(msg.Channel, auth.OpPublish) {
+	if !c.capability().Permits(msg.Channel, auth.OpPublish) {
 		c.logger.Warn("publish rejected: insufficient capability",
 			"channel", msg.Channel, "msgSerial", msgSerial)
 		c.enqueueNack(ctx, msgSerial, &protocol.ErrorInfo{

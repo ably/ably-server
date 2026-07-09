@@ -96,6 +96,17 @@ type ProtocolMessage struct {
 	// ConnectionDetails carries the resolved identity and connection
 	// limits on the CONNECTED frame (DESIGN.md §2.1, §8).
 	ConnectionDetails *ConnectionDetails `json:"connectionDetails,omitempty" msgpack:"connectionDetails,omitempty"`
+	// Auth carries a fresh token on an inbound AUTH frame for inband
+	// re-authentication (DESIGN.md §2.1, §3); field name/tags match
+	// ably-go's authDetails so SDKs encode it unchanged.
+	Auth *AuthDetails `json:"auth,omitempty" msgpack:"auth,omitempty"`
+}
+
+// AuthDetails carries the token supplied on an inband AUTH ProtocolMessage
+// (Ably AD2). AccessToken is the JWT the client presents to re-authenticate
+// an established connection (DESIGN.md §3).
+type AuthDetails struct {
+	AccessToken string `json:"accessToken,omitempty" msgpack:"accessToken,omitempty"`
 }
 
 // ConnectionDetails is sent inside the CONNECTED ProtocolMessage and
