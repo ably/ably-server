@@ -402,6 +402,53 @@ func TestPublishRejectsEmptyBody(t *testing.T) {
 	}
 }
 
+// TestPublishRejectsNonConformingBatchIDs pins RSL1k3 (TASK-79): a
+// multi-message publish whose client-supplied ids don't follow the
+// "<batchID>:<idx>" shape is rejected with an Ably 40031 error body, so the
+// SDK surfaces the code rather than defaulting a bare 400 to 40000.
+func TestPublishRejectsNonConformingBatchIDs(t *testing.T) {
+	srv, _ := newTestServer(t)
+	body, _ := json.Marshal([]*protocol.Message{
+		{ID: "dup", Data: "a"},
+		{ID: "dup", Data: "b"},
+		{ID: "dup", Data: "c"},
+	})
+	resp := request(t, srv, http.MethodPost, "/channels/foo/messages", "application/json", body, true)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Ably-Errorcode"); got != "40031" {
+		t.Errorf("X-Ably-Errorcode = %q, want 40031", got)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	var body2 errorResponse
+	if err := json.Unmarshal(raw, &body2); err != nil {
+		t.Fatalf("decode error body %q: %v", raw, err)
+	}
+	if body2.Error == nil || body2.Error.Code != 40031 {
+		t.Errorf("error body = %+v, want code 40031", body2.Error)
+	}
+}
+
+// TestPublishIdempotentDuplicateReturnsOnce pins that a repeated publish
+// carrying the same batch id is de-duplicated: the second POST does not add
+// a second message to history (server-side idempotency, §6/§8).
+func TestPublishIdempotentDuplicateReturnsOnce(t *testing.T) {
+	srv, _ := newTestServer(t)
+	body, _ := json.Marshal(&protocol.Message{ID: "fixed-batch-id", Data: "hello"})
+	for i := 0; i < 3; i++ {
+		resp := request(t, srv, http.MethodPost, "/channels/idem/messages", "application/json", body, true)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("publish %d: status = %d, want 201", i, resp.StatusCode)
+		}
+	}
+	resp := historyGet(t, srv, "idem", "limit=100", "")
+	got := decodeHistoryJSON(t, resp)
+	if len(got) != 1 {
+		t.Fatalf("history = %d messages, want 1 (idempotent de-dup)", len(got))
+	}
+}
+
 func TestPublishRejectsUnsupportedContentType(t *testing.T) {
 	srv, _ := newTestServer(t)
 	resp := request(t, srv, http.MethodPost, "/channels/foo/messages", "text/xml", []byte("<x/>"), true)

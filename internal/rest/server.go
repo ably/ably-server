@@ -140,7 +140,12 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 	accepted := time.Now()
 	cm, _, err := ch.Publish(ctx, msgs)
 	if errors.Is(err, storage.ErrInvalidMessageID) {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		// Ably 40031 — "invalid publish request (invalid client-specified
+		// id)": a multi-message publish whose client-supplied ids don't
+		// follow the required "<batchID>:<idx>" shape (RSL1k3, §8). Emit the
+		// Ably error envelope so the SDK surfaces the 40031 code, not a bare
+		// 400 the SDK defaults to 40000.
+		s.writeErrorInfo(w, r, http.StatusBadRequest, 40031, err.Error())
 		return
 	}
 	if err != nil {
