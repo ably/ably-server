@@ -63,3 +63,62 @@ func TestRunFallsBackToEnv(t *testing.T) {
 		t.Errorf("output = %q, want substring %q", out.String(), "invalid api key")
 	}
 }
+
+func TestRunRejectsUnknownLogFormat(t *testing.T) {
+	var out bytes.Buffer
+	code := run(context.Background(), runOpts{
+		Args:   []string{"--log-format=xml"},
+		Getenv: emptyEnv,
+		Out:    &out,
+	})
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(out.String(), `unknown --log-format "xml"`) {
+		t.Errorf("output = %q, want substring about unknown --log-format", out.String())
+	}
+}
+
+func TestRunLogFormatEnvFallback(t *testing.T) {
+	// No --log-format flag; the env value must be picked up. An
+	// invalid env value surfaces the same startup error as an invalid
+	// flag value would, proving the env was read.
+	var out bytes.Buffer
+	code := run(context.Background(), runOpts{
+		Args:   nil,
+		Getenv: envWith(map[string]string{logFormatEnv: "xml"}),
+		Out:    &out,
+	})
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(out.String(), `unknown --log-format "xml"`) {
+		t.Errorf("output = %q, want substring about unknown --log-format", out.String())
+	}
+}
+
+func TestNewLoggerSelectsHandler(t *testing.T) {
+	var out bytes.Buffer
+	logger, err := newLogger("info", "json", &out)
+	if err != nil {
+		t.Fatalf("newLogger(json) error: %v", err)
+	}
+	logger.Info("hello")
+	if !strings.HasPrefix(strings.TrimSpace(out.String()), "{") {
+		t.Errorf("json output = %q, want a JSON object", out.String())
+	}
+
+	out.Reset()
+	logger, err = newLogger("info", "text", &out)
+	if err != nil {
+		t.Fatalf("newLogger(text) error: %v", err)
+	}
+	logger.Info("hello")
+	if strings.HasPrefix(strings.TrimSpace(out.String()), "{") {
+		t.Errorf("text output = %q, want slog's key=value form", out.String())
+	}
+
+	if _, err := newLogger("info", "yaml", &out); err == nil {
+		t.Error("newLogger(yaml) error = nil, want an error for an unrecognised format")
+	}
+}

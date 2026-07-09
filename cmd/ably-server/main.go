@@ -27,8 +27,9 @@ import (
 )
 
 const (
-	apiKeyEnv = "ABLY_SERVER_API_KEY"
-	dbDSNEnv  = "ABLY_SERVER_DB_DSN"
+	apiKeyEnv    = "ABLY_SERVER_API_KEY"
+	dbDSNEnv     = "ABLY_SERVER_DB_DSN"
+	logFormatEnv = "ABLY_SERVER_LOG_FORMAT"
 )
 
 func main() {
@@ -75,11 +76,16 @@ func run(ctx context.Context, opts runOpts) int {
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
 	shutdownGrace := fs.Duration("shutdown-grace", 10*time.Second, "window to disconnect existing connections on SIGTERM")
 	logLevel := fs.String("log-level", "info", "log level: debug, info, warn, error")
+	logFormat := fs.String("log-format", envOr(opts.Getenv, logFormatEnv, "text"), "log format: text or json (env: "+logFormatEnv+")")
 	if err := fs.Parse(opts.Args); err != nil {
 		return 2
 	}
 
-	logger := newLogger(*logLevel, opts.Out)
+	logger, err := newLogger(*logLevel, *logFormat, opts.Out)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
 
 	if *apiKey == "" {
 		logger.Error("api key is required", "flag", "--api-key", "env", apiKeyEnv)
@@ -207,7 +213,10 @@ func openStorage(ctx context.Context, mode, dataDir, dbDSN string) (storage.Stor
 	}
 }
 
-func newLogger(level string, w io.Writer) *slog.Logger {
+// newLogger builds the process logger. format selects the slog
+// handler: "text" (the default) or "json"; any other value is a
+// startup error.
+func newLogger(level, format string, w io.Writer) (*slog.Logger, error) {
 	var lvl slog.Level
 	switch level {
 	case "debug":
@@ -219,5 +228,24 @@ func newLogger(level string, w io.Writer) *slog.Logger {
 	default:
 		lvl = slog.LevelInfo
 	}
-	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: lvl}))
+	opts := &slog.HandlerOptions{Level: lvl}
+	switch format {
+	case "text":
+		return slog.New(slog.NewTextHandler(w, opts)), nil
+	case "json":
+		return slog.New(slog.NewJSONHandler(w, opts)), nil
+	default:
+		return nil, fmt.Errorf("unknown --log-format %q (valid: text, json)", format)
+	}
+}
+
+// envOr returns getenv(key) if non-empty, otherwise fallback. Used to
+// seed a flag's default from its ABLY_SERVER_* env equivalent before
+// flag.Parse runs, so --flag=... > env > this default all resolve
+// correctly from a single fs.String call.
+func envOr(getenv func(string) string, key, fallback string) string {
+	if v := getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
