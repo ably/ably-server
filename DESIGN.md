@@ -15,7 +15,11 @@ This document describes how it works, section by section. The task list in
 - Multi-region / global distribution.
 - Ably-cloud-only product surface: integrations / rules, push notifications,
   Spaces, Chat, LiveObjects/LiveSync, message queues, account/app management
-  APIs, statistics endpoints, the `/keys` admin API.
+  APIs, the `/keys` admin API.
+- Statistics collection. `GET /stats` exists purely as a compatibility
+  stub — authenticated like any other REST read, gated by the app-wide
+  `stats` op (§3.1), always returning an empty array — so SDK flows that
+  call it succeed against this server. No statistics are collected.
 - Hard durability or HA guarantees beyond what the chosen database provides.
 - Backwards compatibility with arbitrary historical Ably protocol versions —
   we target v2 and later.
@@ -104,6 +108,7 @@ All REST endpoints live under the root and accept either `application/json` or
 | GET | `/channels/{channel}/presence` | current presence members (see §12) |
 | GET | `/channels/{channel}/presence/history` | presence history (paginated) |
 | POST | `/keys/{keyName}/requestToken` | mint a token (JWT) from a signed `TokenRequest` (see §3) |
+| GET | `/stats` | compatibility stub: always an empty array (see §1) |
 | GET | `/time` | server time (ms since epoch) |
 | GET | `/healthz` | liveness — no auth, dependency-free, 200 once serving |
 | GET | `/readyz` | readiness — no auth; 200 in `memory`/`disk` mode; in `cluster` mode pings Postgres and returns 503 if unreachable |
@@ -179,8 +184,11 @@ status `401` so the SDK reconnects.
   The `[queue]*` / `[meta]*` resource prefixes do not apply since neither
   queues nor metachannels are in scope.
 - `<op>` is one of `publish`, `subscribe`, `presence`, `history`,
-  `message-update-own`, `message-update-any`, `message-delete-own`,
-  `message-delete-any`. `*` matches any op. `subscribe` covers both
+  `stats`, `message-update-own`, `message-update-any`,
+  `message-delete-own`, `message-delete-any`. `*` matches any op.
+  `stats` gates the `/stats` stub (§1) and is app-wide rather than
+  per-channel, so it must be granted on the `*` resource.
+  `subscribe` covers both
   receiving messages and receiving presence (events + sync + the current
   set); `presence` covers registering presence (enter/update/leave);
   `history` covers message history, message version history, and
@@ -209,6 +217,7 @@ operation is rejected:
 | REST `GET .../messages`, `GET .../messages/{serial}[/versions]` | `history` |
 | REST `GET .../presence` | `subscribe` |
 | REST `GET .../presence/history` | `history` |
+| REST `GET /stats` | `stats` — app-wide, so it must be granted on the `*` resource |
 
 `ATTACH` mode resolution: the effective mode set delivered in `ATTACHED.flags`
 is `requested ∩ capability-permitted`. Empty intersection → `ERROR` with

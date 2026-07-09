@@ -39,9 +39,9 @@ func TestMuxWebSocketOnlyAtRoot(t *testing.T) {
 	}
 
 	// An unknown path is not swallowed by the WS handler — it 404s.
-	if resp := get("/stats"); resp.StatusCode != http.StatusNotFound {
+	if resp := get("/nonexistent"); resp.StatusCode != http.StatusNotFound {
 		resp.Body.Close()
-		t.Errorf("GET /stats = %d, want 404", resp.StatusCode)
+		t.Errorf("GET /nonexistent = %d, want 404", resp.StatusCode)
 	} else {
 		resp.Body.Close()
 	}

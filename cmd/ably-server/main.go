@@ -383,6 +383,7 @@ func newMux(rt *realtime.Server, rs *rest.Server, m *metrics.Metrics) *http.Serv
 	rest("GET /channels/{name}/presence", rs.HandlePresence)
 	rest("GET /channels/{name}/presence/history", rs.HandlePresenceHistory)
 	rest("POST /keys/{keyName}/requestToken", rs.HandleRequestToken)
+	rest("GET /stats", rs.HandleStats)
 	rest("GET /time", rs.HandleTime)
 	rest("GET /healthz", rs.HandleHealthz)
 	rest("GET /readyz", rs.HandleReadyz)

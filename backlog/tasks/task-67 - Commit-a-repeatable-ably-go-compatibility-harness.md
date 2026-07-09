@@ -4,6 +4,7 @@ title: Commit a repeatable ably-go compatibility harness
 status: To Do
 assignee: []
 created_date: '2026-07-09 11:06'
+updated_date: '2026-07-09 19:23'
 labels: []
 dependencies: []
 priority: high
@@ -22,3 +23,9 @@ PDR-090's experimental release requires client-SDK test coverage via ably-go and
 - [ ] #2 Known failures are recorded in an allowlist; the run exits nonzero on new failures
 - [ ] #3 Documented so anyone can reproduce COMPAT_REPORT.md-style results
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Update 2026-07-09: the harness substance now exists, committed on ably-go branch server-testing (commit 5c7a727) — the ablytest hook is gated behind ABLY_LOCAL_KEY and scripts/ably-server-compat.sh boots the server and runs each test in its own process (see COMPAT_REPORT_2026-07-09.md 'How it was run'). Remaining scope for this task: the known-failure allowlist, nonzero exit on NEW failures only, and docs for reproducing a report.
+<!-- SECTION:NOTES:END -->

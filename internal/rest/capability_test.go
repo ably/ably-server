@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/vmihailenco/msgpack/v5"
 
 	"github.com/ably/ably-server/internal/protocol"
 )
@@ -174,5 +176,84 @@ func assertCapabilityError(t *testing.T, resp *http.Response) {
 	}
 	if body.Error == nil || body.Error.Code != 40160 {
 		t.Errorf("error body = %+v, want code 40160", body.Error)
+	}
+}
+
+// TestStatsStub covers the /stats compatibility stub (DESIGN.md §1):
+// authenticated + app-wide `stats` op → an empty array; a narrowed
+// token without the op → 401/40160; no credentials → 401.
+func TestStatsStub(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	// No credentials: 401.
+	resp, err := srv.Client().Get(srv.URL + "/stats")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("unauthenticated status = %d, want 401", resp.StatusCode)
+	}
+
+	// Basic auth (full key capability): 200 with an empty JSON array.
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/stats", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.SetBasicAuth("app.key", "secret")
+	resp, err = srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("basic status = %d, want 200", resp.StatusCode)
+	}
+	var got []json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("stats body has %d elements, want empty array", len(got))
+	}
+
+	// Token granting stats app-wide: 200.
+	stats := bearerToken(t, `{"*":["stats"]}`)
+	if resp := tokenRequest(t, srv, http.MethodGet, "/stats", stats, nil); resp.StatusCode != http.StatusOK {
+		t.Errorf("stats-cap status = %d, want 200", resp.StatusCode)
+	}
+	// Channel-scoped stats grant is not app-wide: 401/40160.
+	narrow := bearerToken(t, `{"news:*":["stats"]}`)
+	resp = tokenRequest(t, srv, http.MethodGet, "/stats", narrow, nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("narrow-cap status = %d, want 401", resp.StatusCode)
+	}
+	assertCapabilityError(t, resp)
+
+	// msgpack Accept: an empty msgpack array.
+	req, err = http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/stats", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.SetBasicAuth("app.key", "secret")
+	req.Header.Set("Accept", "application/x-msgpack")
+	resp, err = srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); ct != "application/x-msgpack" {
+		t.Errorf("msgpack Content-Type = %q", ct)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	var arr []any
+	if err := msgpack.Unmarshal(raw, &arr); err != nil {
+		t.Fatalf("msgpack decode: %v", err)
+	}
+	if len(arr) != 0 {
+		t.Errorf("msgpack stats body has %d elements, want empty array", len(arr))
 	}
 }

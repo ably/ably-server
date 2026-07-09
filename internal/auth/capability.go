@@ -17,6 +17,11 @@ const (
 	OpPresence  Op = "presence"
 	OpHistory   Op = "history"
 
+	// OpStats gates the /stats endpoint (DESIGN.md §3.1). Stats are
+	// app-wide rather than per-channel, so the op must be granted on
+	// the `*` resource.
+	OpStats Op = "stats"
+
 	// Ownership-scoped mutation ops (DESIGN.md §3.1, §13.5). The -own /
 	// -any distinction is resolved at enforcement time (TASK-51): -own
 	// requires the caller's clientId to equal the target message's

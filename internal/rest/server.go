@@ -598,6 +598,35 @@ func (s *Server) HandleTime(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(out)
 }
 
+// HandleStats serves GET /stats. Statistics collection is a non-goal
+// (DESIGN.md §1): the endpoint exists so SDK flows that call Stats()
+// against this server succeed, and it always returns an empty page.
+// The request is authenticated like any other REST read and requires
+// the app-wide `stats` op — granted on the `*` resource (DESIGN.md
+// §3.1).
+func (s *Server) HandleStats(w http.ResponseWriter, r *http.Request) {
+	principal, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	if !principal.Capabilities().Permits("*", auth.OpStats) {
+		s.writeCapabilityError(w, r, `insufficient capability: "stats" required`)
+		return
+	}
+	format, err := acceptFormat(r.Header.Get("Accept"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotAcceptable)
+		return
+	}
+	body, err := marshalValue([]struct{}{}, format)
+	if err != nil {
+		http.Error(w, "encode failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeFor(format))
+	_, _ = w.Write(body)
+}
+
 // readyzTimeout bounds the dependency check HandleReadyz performs on
 // every request, so a wedged database can't hang the probe.
 const readyzTimeout = 2 * time.Second
