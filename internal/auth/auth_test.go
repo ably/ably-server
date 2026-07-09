@@ -261,6 +261,64 @@ func TestAuthenticateJWT(t *testing.T) {
 	})
 }
 
+func TestAuthenticateMultipleKeys(t *testing.T) {
+	k1, _ := ParseAPIKey("app.key1:secret1")
+	k2, _ := ParseAPIKey("app.key2:secret2")
+	a := NewAuthenticator(k1, k2)
+
+	// Either key authenticates via Basic / ?key=.
+	for _, spec := range []string{"app.key1:secret1", "app.key2:secret2"} {
+		r := httptest.NewRequest(http.MethodGet, "/?key="+spec, nil)
+		if _, err := a.Authenticate(r); err != nil {
+			t.Errorf("Authenticate(key=%s): %v", spec, err)
+		}
+	}
+
+	// A key that is not configured is rejected.
+	r := httptest.NewRequest(http.MethodGet, "/?key=app.key3:secret3", nil)
+	if _, err := a.Authenticate(r); !errors.Is(err, ErrInvalidKey) {
+		t.Errorf("unconfigured key err = %v, want ErrInvalidKey", err)
+	}
+
+	now := time.Now()
+	claims := jwt.MapClaims{"iat": now.Unix(), "exp": now.Add(time.Hour).Unix()}
+
+	// A JWT is verified against the key its kid header names.
+	t.Run("kid selects the signing key", func(t *testing.T) {
+		tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		tok.Header["kid"] = "app.key2"
+		s, err := tok.SignedString([]byte("secret2"))
+		if err != nil {
+			t.Fatalf("sign: %v", err)
+		}
+		r := httptest.NewRequest(http.MethodGet, "/?access_token="+s, nil)
+		if _, err := a.Authenticate(r); err != nil {
+			t.Errorf("Authenticate kid=app.key2 token: %v", err)
+		}
+	})
+
+	// A kid naming key2 but signed with key1's secret must NOT verify.
+	t.Run("kid mismatch fails", func(t *testing.T) {
+		tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		tok.Header["kid"] = "app.key2"
+		s, _ := tok.SignedString([]byte("secret1"))
+		r := httptest.NewRequest(http.MethodGet, "/?access_token="+s, nil)
+		if _, err := a.Authenticate(r); !errors.Is(err, ErrInvalidToken) {
+			t.Errorf("err = %v, want ErrInvalidToken", err)
+		}
+	})
+
+	// With no kid, verification falls back to trying every key's secret.
+	t.Run("no kid tries all keys", func(t *testing.T) {
+		tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		s, _ := tok.SignedString([]byte("secret2"))
+		r := httptest.NewRequest(http.MethodGet, "/?access_token="+s, nil)
+		if _, err := a.Authenticate(r); err != nil {
+			t.Errorf("Authenticate no-kid token signed with key2: %v", err)
+		}
+	})
+}
+
 func TestResolveClientID(t *testing.T) {
 	basic := &Principal{Method: MethodBasic}
 	tokenNoClaim := &Principal{Method: MethodToken}

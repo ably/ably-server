@@ -40,9 +40,9 @@ type Server struct {
 // delegates to the storage backend. ready, if non-nil, is consulted by
 // HandleReadyz on every request (see DESIGN.md §2.2); callers pass nil
 // for backends with no external dependency to check (memory, bbolt).
-func NewServer(key auth.APIKey, manager *core.Manager, logger *slog.Logger, ready storage.Pinger) *Server {
+func NewServer(keys []auth.APIKey, manager *core.Manager, logger *slog.Logger, ready storage.Pinger) *Server {
 	return &Server{
-		authn:   auth.NewAuthenticator(key),
+		authn:   auth.NewAuthenticator(keys...),
 		manager: manager,
 		logger:  logger,
 		ready:   ready,

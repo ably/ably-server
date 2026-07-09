@@ -23,8 +23,8 @@ func TestMuxWebSocketOnlyAtRoot(t *testing.T) {
 	}
 	mgr := core.NewManager(memory.New(memory.Options{}))
 	logger := slog.New(slog.DiscardHandler)
-	rt := realtime.NewServer(key, mgr, time.Hour, logger)
-	rs := rest.NewServer(key, mgr, logger, nil)
+	rt := realtime.NewServer([]auth.APIKey{key}, mgr, time.Hour, logger)
+	rs := rest.NewServer([]auth.APIKey{key}, mgr, logger, nil)
 	srv := httptest.NewServer(newMux(rt, rs))
 	t.Cleanup(srv.Close)
 

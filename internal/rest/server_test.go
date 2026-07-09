@@ -36,7 +36,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *core.Manager) {
 		t.Fatalf("parse api key: %v", err)
 	}
 	manager := core.NewManager(memory.New(memory.Options{}))
-	rs := NewServer(parsed, manager, slog.New(slog.DiscardHandler), nil)
+	rs := NewServer([]auth.APIKey{parsed}, manager, slog.New(slog.DiscardHandler), nil)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /channels/{name}/messages", rs.HandlePublish)
 	mux.HandleFunc("GET /channels/{name}/messages", rs.HandleHistory)
@@ -459,7 +459,7 @@ func newTestServerWithReady(t *testing.T, ready storage.Pinger) *httptest.Server
 		t.Fatalf("parse api key: %v", err)
 	}
 	manager := core.NewManager(memory.New(memory.Options{}))
-	rs := NewServer(parsed, manager, slog.New(slog.DiscardHandler), ready)
+	rs := NewServer([]auth.APIKey{parsed}, manager, slog.New(slog.DiscardHandler), ready)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", rs.HandleHealthz)
 	mux.HandleFunc("GET /readyz", rs.HandleReadyz)

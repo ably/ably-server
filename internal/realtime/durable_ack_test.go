@@ -78,7 +78,7 @@ func newControlServer(t *testing.T, hb time.Duration) (*httptest.Server, *contro
 	}
 	cs := &controlStorage{inner: memory.New(memory.Options{})}
 	manager := core.NewManager(cs)
-	rt := NewServer(parsed, manager, hb, slog.New(slog.DiscardHandler))
+	rt := NewServer([]auth.APIKey{parsed}, manager, hb, slog.New(slog.DiscardHandler))
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", rt.HandleWebSocket)
 	srv := httptest.NewServer(mux)

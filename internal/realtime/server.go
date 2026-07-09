@@ -40,9 +40,9 @@ type Server struct {
 // NewServer constructs a Server. The Manager pairs each Channel with
 // its storage facet — publishes go through Channel.Publish, which
 // delegates to the storage backend.
-func NewServer(key auth.APIKey, manager *core.Manager, heartbeatInterval time.Duration, logger *slog.Logger) *Server {
+func NewServer(keys []auth.APIKey, manager *core.Manager, heartbeatInterval time.Duration, logger *slog.Logger) *Server {
 	return &Server{
-		authn:             auth.NewAuthenticator(key),
+		authn:             auth.NewAuthenticator(keys...),
 		manager:           manager,
 		heartbeatInterval: heartbeatInterval,
 		logger:            logger,

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -110,7 +111,8 @@ func run(ctx context.Context, opts runOpts) int {
 	fs.SetOutput(opts.Out)
 	fs.String("config", configPath, "path to an optional TOML config file (env: "+configPathEnv+")")
 	listen := fs.String("listen", config.Default(opts.Getenv(listenEnv), file.Listen, ":8080"), "address for HTTP/WS listener (env: "+listenEnv+")")
-	apiKey := fs.String("api-key", config.Default(opts.Getenv(apiKeyEnv), file.APIKey, ""), "API key in appId.keyId:keySecret format (env: "+apiKeyEnv+")")
+	var apiKeyFlags multiFlag
+	fs.Var(&apiKeyFlags, "api-key", "API key in appId.keyId:keySecret format; repeatable (env: "+apiKeyEnv+", comma-separated)")
 	mode := fs.String("mode", config.Default(opts.Getenv(modeEnv), file.Mode, "memory"), "storage backend: memory, disk, or cluster (env: "+modeEnv+")")
 	dataDir := fs.String("data-dir", config.Default(opts.Getenv(dataDirEnv), file.DataDir, "./data"), "data directory for disk mode (holds the bbolt file) (env: "+dataDirEnv+")")
 	dbDSN := fs.String("db-dsn", config.Default(opts.Getenv(dbDSNEnv), file.DBDSN, ""), "libpq DSN for cluster mode, e.g. postgres://user:pw@host:5432/db?sslmode=disable (env: "+dbDSNEnv+")")
@@ -129,14 +131,29 @@ func run(ctx context.Context, opts runOpts) int {
 		return 1
 	}
 
-	if *apiKey == "" {
-		logger.Error("api key is required", "flag", "--api-key", "env", apiKeyEnv)
+	keySpecs := resolveAPIKeys([]string(apiKeyFlags), opts.Getenv(apiKeyEnv), file)
+	if len(keySpecs) == 0 {
+		logger.Error("at least one api key is required", "flag", "--api-key", "env", apiKeyEnv)
 		return 1
 	}
-	parsedKey, err := auth.ParseAPIKey(*apiKey)
-	if err != nil {
-		logger.Error("invalid api key", "err", err)
-		return 1
+	parsedKeys := make([]auth.APIKey, 0, len(keySpecs))
+	for _, spec := range keySpecs {
+		k, err := auth.ParseAPIKey(spec)
+		if err != nil {
+			logger.Error("invalid api key", "err", err)
+			return 1
+		}
+		parsedKeys = append(parsedKeys, k)
+	}
+	// All keys must belong to the same app: the server owns one channel
+	// namespace, so keys spanning multiple appIds are a misconfiguration
+	// (DESIGN.md §3).
+	appID := parsedKeys[0].AppID
+	for _, k := range parsedKeys[1:] {
+		if k.AppID != appID {
+			logger.Error("all api keys must share the same appId", "appId", appID, "conflicting", k.AppID)
+			return 1
+		}
 	}
 
 	store, err := openStorage(ctx, *mode, *dataDir, *dbDSN)
@@ -156,12 +173,12 @@ func run(ctx context.Context, opts runOpts) int {
 	logger.Info("storage ready", "mode", *mode)
 
 	manager := core.NewManager(store)
-	rt := realtime.NewServer(parsedKey, manager, *hbInterval, logger)
+	rt := realtime.NewServer(parsedKeys, manager, *hbInterval, logger)
 	// ready is non-nil only for backends with an external dependency
 	// worth probing (currently postgres.Storage); memory/disk leave it
 	// nil and /readyz reports 200 unconditionally (TASK-62).
 	ready, _ := store.(storage.Pinger)
-	rs := rest.NewServer(parsedKey, manager, logger, ready)
+	rs := rest.NewServer(parsedKeys, manager, logger, ready)
 
 	mux := newMux(rt, rs)
 
@@ -243,6 +260,50 @@ func run(ctx context.Context, opts runOpts) int {
 		return 1
 	}
 	return 0
+}
+
+// multiFlag collects a repeatable string flag (each --api-key occurrence
+// appends one value), so multiple keys can be configured on the command
+// line (DESIGN.md §3, §9).
+type multiFlag []string
+
+func (m *multiFlag) String() string { return strings.Join(*m, ",") }
+
+func (m *multiFlag) Set(v string) error {
+	*m = append(*m, v)
+	return nil
+}
+
+// resolveAPIKeys resolves the configured API key specs with precedence
+// flag > env > file, applied as whole sets (DESIGN.md §3, §9): repeated
+// --api-key flags win outright; otherwise a comma-separated
+// ABLY_SERVER_API_KEY; otherwise the config file's api-keys array plus
+// its singular api-key. Whitespace around each spec is trimmed and empty
+// entries dropped.
+func resolveAPIKeys(flagKeys []string, env string, file config.File) []string {
+	if len(flagKeys) > 0 {
+		return splitTrim(flagKeys)
+	}
+	if env != "" {
+		return splitTrim(strings.Split(env, ","))
+	}
+	var fromFile []string
+	fromFile = append(fromFile, file.APIKeys...)
+	if file.APIKey != "" {
+		fromFile = append(fromFile, file.APIKey)
+	}
+	return splitTrim(fromFile)
+}
+
+// splitTrim trims whitespace from each entry and drops empties.
+func splitTrim(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // openStorage constructs the storage.Storage selected by mode:

@@ -61,6 +61,39 @@ func TestRunRejectsMalformedKeyFromFlag(t *testing.T) {
 	}
 }
 
+func TestRunRejectsKeysSpanningAppIds(t *testing.T) {
+	var out bytes.Buffer
+	code := run(context.Background(), runOpts{
+		Args:   []string{"--api-key=app1.k1:s1", "--api-key=app2.k2:s2"},
+		Getenv: emptyEnv,
+		Out:    &out,
+	})
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(out.String(), "share the same appId") {
+		t.Errorf("output = %q, want substring %q", out.String(), "share the same appId")
+	}
+}
+
+func TestRunAcceptsCommaSeparatedEnvKeys(t *testing.T) {
+	// A comma-separated env value contributes multiple keys; a malformed
+	// second entry proves the whole set is parsed (without starting the
+	// server).
+	var out bytes.Buffer
+	code := run(context.Background(), runOpts{
+		Args:   nil,
+		Getenv: envWith(map[string]string{apiKeyEnv: "app.k1:s1, bogus"}),
+		Out:    &out,
+	})
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(out.String(), "invalid api key") {
+		t.Errorf("output = %q, want substring %q", out.String(), "invalid api key")
+	}
+}
+
 func TestRunFallsBackToEnv(t *testing.T) {
 	// Flag is absent; the env value must be picked up. We supply a
 	// malformed env value so the parse error proves the env was read

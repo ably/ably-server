@@ -24,15 +24,20 @@ import (
 // DefaultDuration the same way the --shutdown-grace flag's value is
 // parsed.
 type File struct {
-	Mode          string `toml:"mode"`
-	Listen        string `toml:"listen"`
-	APIKey        string `toml:"api-key"`
-	DataDir       string `toml:"data-dir"`
-	DBDSN         string `toml:"db-dsn"`
-	ShutdownGrace string `toml:"shutdown-grace"`
-	LogLevel      string `toml:"log-level"`
-	LogFormat     string `toml:"log-format"`
-	DebugListen   string `toml:"debug-listen"`
+	Mode   string `toml:"mode"`
+	Listen string `toml:"listen"`
+	// APIKey and APIKeys both configure API keys (DESIGN.md §3, §9): the
+	// singular key is retained for backwards compatibility and combined
+	// with the api-keys array (both are used when both are present). At
+	// least one key must be configured across all sources.
+	APIKey        string   `toml:"api-key"`
+	APIKeys       []string `toml:"api-keys"`
+	DataDir       string   `toml:"data-dir"`
+	DBDSN         string   `toml:"db-dsn"`
+	ShutdownGrace string   `toml:"shutdown-grace"`
+	LogLevel      string   `toml:"log-level"`
+	LogFormat     string   `toml:"log-format"`
+	DebugListen   string   `toml:"debug-listen"`
 }
 
 // Load parses the TOML file at path into a File.

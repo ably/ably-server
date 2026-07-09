@@ -117,11 +117,19 @@ Pagination follows Ably's `Link` header convention (`first`, `next`).
 
 ## 3. Authentication & authorisation
 
-A single API key is configured via `ABLY_SERVER_API_KEY` in the canonical
-Ably format `appId.keyId:keySecret` (so SDKs that parse the key work
-unchanged). The server **verifies** tokens presented on connect/request and
-also **issues** them on demand via `POST /keys/{keyName}/requestToken`
-(§3.3).
+One or more API keys are configured (via repeated `--api-key`, a
+comma-separated `ABLY_SERVER_API_KEY`, or the config file — §9), each in
+the canonical Ably format `appId.keyId:keySecret` (so SDKs that parse the
+key work unchanged). At least one key is required; the server refuses to
+start with none. All configured keys must share the same `appId`: the
+server owns one channel namespace (mirroring how one Ably app owns one
+namespace), so keys spanning multiple appIds are a misconfiguration and
+startup fails. A request authenticates against **any** configured key,
+and JWT verification selects the signing key by the token's `kid` header
+(falling back to trying every key's secret when `kid` is absent or names
+no configured key). The server **verifies** tokens presented on
+connect/request and also **issues** them on demand via
+`POST /keys/{keyName}/requestToken` (§3.3).
 
 Two accepted credential forms:
 
@@ -1008,7 +1016,7 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 ```
 --mode {memory|disk|cluster}  default: memory
 --listen :8080                HTTP/WS bind
---api-key                     appId.keyId:keySecret
+--api-key                     appId.keyId:keySecret (repeatable; ABLY_SERVER_API_KEY is comma-separated)
 --data-dir ./data             disk mode only
 --db-dsn  postgres://…        cluster mode only
 --shutdown-grace 10s          window to disconnect existing connections on SIGTERM
@@ -1022,7 +1030,9 @@ Configuration may also be supplied via an optional TOML config file
 (`--config ably-server.toml`), covering the same keys as the flags above
 (`mode`, `listen`, `api-key`, `data-dir`, `db-dsn`, `shutdown-grace`,
 `log-level`, `log-format`, `debug-listen` — `shutdown-grace` as a
-duration string, e.g. `"10s"`). Every key is optional. Resolution order,
+duration string, e.g. `"10s"`). API keys may also be given as an
+`api-keys` array; the file's `api-keys` and singular `api-key` are
+combined. Every key is optional. Resolution order,
 highest priority first: flag > env > config file > hardcoded default —
 so a flag always wins, an env var beats the file, and the file only
 supplies a value nothing more specific set.

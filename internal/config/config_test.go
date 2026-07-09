@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -45,8 +46,26 @@ debug-listen = "127.0.0.1:6060"
 		LogFormat:     "json",
 		DebugListen:   "127.0.0.1:6060",
 	}
-	if *f != want {
+	if !reflect.DeepEqual(*f, want) {
 		t.Errorf("Load() = %+v, want %+v", *f, want)
+	}
+}
+
+func TestLoadParsesAPIKeysArray(t *testing.T) {
+	path := writeTOML(t, `
+api-key = "app.key0:secret0"
+api-keys = ["app.key1:secret1", "app.key2:secret2"]
+`)
+	f, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if f.APIKey != "app.key0:secret0" {
+		t.Errorf("APIKey = %q", f.APIKey)
+	}
+	want := []string{"app.key1:secret1", "app.key2:secret2"}
+	if !reflect.DeepEqual(f.APIKeys, want) {
+		t.Errorf("APIKeys = %v, want %v", f.APIKeys, want)
 	}
 }
 

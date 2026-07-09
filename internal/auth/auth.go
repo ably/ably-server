@@ -114,26 +114,47 @@ type Principal struct {
 	HasClientID bool
 }
 
-// Authenticator verifies presented credentials against a configured API
-// key.
+// Authenticator verifies presented credentials against one or more
+// configured API keys. All keys share a single appId (enforced at
+// startup, DESIGN.md §3): the server owns one channel namespace, so the
+// keys differ only in keyId/secret and capability. A request
+// authenticates against ANY configured key.
 type Authenticator struct {
-	key      APIKey
-	expected []byte // raw `appId.keyId:keySecret` for constant-time compare
-	parser   *jwt.Parser
+	keys   []APIKey
+	byName map[string]APIKey // appId.keyId -> key, for kid / keyName lookup
+	parser *jwt.Parser
 }
 
-// NewAuthenticator constructs an Authenticator for the given key.
-func NewAuthenticator(key APIKey) *Authenticator {
+// NewAuthenticator constructs an Authenticator accepting any of the
+// given keys. At least one key is required; the caller (cmd/ably-server)
+// enforces that and the shared-appId invariant at startup.
+func NewAuthenticator(keys ...APIKey) *Authenticator {
+	byName := make(map[string]APIKey, len(keys))
+	for _, k := range keys {
+		byName[k.Name()] = k
+	}
 	return &Authenticator{
-		key:      key,
-		expected: []byte(key.raw),
+		keys:   keys,
+		byName: byName,
 		parser: jwt.NewParser(
 			jwt.WithValidMethods([]string{"HS256"}),
 			jwt.WithLeeway(clockSkewLeeway),
-			jwt.WithIssuedAt(),         // reject iat in the future (beyond leeway)
+			jwt.WithIssuedAt(),           // reject iat in the future (beyond leeway)
 			jwt.WithExpirationRequired(), // exp must be present
 		),
 	}
+}
+
+// matchKey reports whether presented equals any configured key, in
+// constant time. Every key is compared (no early return) so the timing
+// does not reveal which key, if any, matched.
+func (a *Authenticator) matchKey(presented string) bool {
+	pb := []byte(presented)
+	matched := 0
+	for _, k := range a.keys {
+		matched |= subtle.ConstantTimeCompare(pb, []byte(k.raw))
+	}
+	return matched == 1
 }
 
 // Authenticate extracts and verifies the request's credentials. A bearer
@@ -146,7 +167,7 @@ func (a *Authenticator) Authenticate(r *http.Request) (*Principal, error) {
 		return a.verifyToken(tok)
 	}
 	if k, ok := extractKey(r); ok {
-		if subtle.ConstantTimeCompare([]byte(k), a.expected) != 1 {
+		if !a.matchKey(k) {
 			return nil, ErrInvalidKey
 		}
 		return &Principal{Method: MethodBasic}, nil
@@ -154,14 +175,26 @@ func (a *Authenticator) Authenticate(r *http.Request) (*Principal, error) {
 	return nil, ErrNoCredentials
 }
 
-// verifyToken verifies an HS256 JWT against the configured key's secret
-// and extracts the Ably claims. With a single configured key there is no
-// kid-based key selection (that arrives with multiple-key support,
-// TASK-5); the signature is checked against the one secret.
+// verifyToken verifies an HS256 JWT against the configured keys' secrets
+// and extracts the Ably claims. The JWT `kid` header selects the signing
+// key (§3): a token minted by this server carries its key's name as kid.
+// When kid is absent or names no configured key, verification falls back
+// to trying every configured key's secret (jwt tries each in the
+// VerificationKeySet), so a token minted elsewhere with the same secret
+// still verifies.
 func (a *Authenticator) verifyToken(tokenString string) (*Principal, error) {
 	claims := jwt.MapClaims{}
-	_, err := a.parser.ParseWithClaims(tokenString, claims, func(*jwt.Token) (any, error) {
-		return []byte(a.key.KeySecret), nil
+	_, err := a.parser.ParseWithClaims(tokenString, claims, func(t *jwt.Token) (any, error) {
+		if kid, ok := t.Header["kid"].(string); ok {
+			if k, ok := a.byName[kid]; ok {
+				return []byte(k.KeySecret), nil
+			}
+		}
+		set := jwt.VerificationKeySet{Keys: make([]jwt.VerificationKey, len(a.keys))}
+		for i, k := range a.keys {
+			set.Keys[i] = []byte(k.KeySecret)
+		}
+		return set, nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
@@ -288,18 +321,19 @@ func (tr *TokenRequest) tokenRequestText() string {
 // for the same key (the key holder is explicitly authenticated). Returns
 // ErrInvalidToken on any failure.
 func (a *Authenticator) ValidateTokenRequest(tr *TokenRequest, r *http.Request) error {
-	if tr.KeyName != a.key.Name() {
+	key, ok := a.byName[tr.KeyName]
+	if !ok {
 		return fmt.Errorf("%w: unknown key %q", ErrInvalidToken, tr.KeyName)
 	}
 	if tr.MAC != "" {
-		expected := base64.StdEncoding.EncodeToString(a.hmac(tr.tokenRequestText()))
+		expected := base64.StdEncoding.EncodeToString(hmacOf(key, tr.tokenRequestText()))
 		if subtle.ConstantTimeCompare([]byte(tr.MAC), []byte(expected)) != 1 {
 			return fmt.Errorf("%w: request mac does not match", ErrInvalidToken)
 		}
 		return nil
 	}
 	// Unsigned: only a Basic-auth request for the same key is trusted.
-	if k, ok := extractKey(r); ok && subtle.ConstantTimeCompare([]byte(k), a.expected) == 1 {
+	if k, ok := extractKey(r); ok && subtle.ConstantTimeCompare([]byte(k), []byte(key.raw)) == 1 {
 		return nil
 	}
 	return fmt.Errorf("%w: request mac not provided", ErrInvalidToken)
@@ -311,6 +345,10 @@ func (a *Authenticator) ValidateTokenRequest(tr *TokenRequest, r *http.Request) 
 // key's capability once enforcement lands, TASK-12). Returns the signed
 // token and its expiry.
 func (a *Authenticator) MintToken(tr *TokenRequest) (token string, issued, expires time.Time, err error) {
+	key, ok := a.byName[tr.KeyName]
+	if !ok {
+		return "", time.Time{}, time.Time{}, fmt.Errorf("%w: unknown key %q", ErrInvalidToken, tr.KeyName)
+	}
 	issued = time.Now()
 	ttl := time.Duration(tr.TTL) * time.Millisecond
 	if ttl <= 0 {
@@ -334,15 +372,15 @@ func (a *Authenticator) MintToken(tr *TokenRequest) (token string, issued, expir
 		claims["jti"] = tr.Nonce
 	}
 	t := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	t.Header["kid"] = a.key.Name()
-	token, err = t.SignedString([]byte(a.key.KeySecret))
+	t.Header["kid"] = key.Name()
+	token, err = t.SignedString([]byte(key.KeySecret))
 	return token, issued, expires, err
 }
 
-// hmac returns the HMAC-SHA256 of text keyed with the configured key's
+// hmacOf returns the HMAC-SHA256 of text keyed with the given key's
 // secret.
-func (a *Authenticator) hmac(text string) []byte {
-	h := hmac.New(sha256.New, []byte(a.key.KeySecret))
+func hmacOf(key APIKey, text string) []byte {
+	h := hmac.New(sha256.New, []byte(key.KeySecret))
 	h.Write([]byte(text))
 	return h.Sum(nil)
 }
