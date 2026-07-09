@@ -2,10 +2,12 @@
 package realtime
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -28,6 +30,11 @@ type Server struct {
 	heartbeatInterval time.Duration
 	logger            *slog.Logger
 	upgrader          websocket.Upgrader
+
+	// mu guards conns, the registry of live connections used by Shutdown
+	// to disconnect them gracefully on SIGTERM (DESIGN.md §11).
+	mu    sync.Mutex
+	conns map[*connection]struct{}
 }
 
 // NewServer constructs a Server. The Manager pairs each Channel with
@@ -39,6 +46,7 @@ func NewServer(key auth.APIKey, manager *core.Manager, heartbeatInterval time.Du
 		manager:           manager,
 		heartbeatInterval: heartbeatInterval,
 		logger:            logger,
+		conns:             make(map[*connection]struct{}),
 		upgrader: websocket.Upgrader{
 			// Tests use httptest.Server which sets up a same-origin
 			// connection; production deployments terminate TLS at a
@@ -94,7 +102,79 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		entered:           make(map[string]map[string]struct{}),
 		publishQ:          make(chan func(), 16),
 	}
+
+	s.register(conn)
+	defer s.deregister(conn)
 	conn.run(r.Context())
+}
+
+// register adds a live connection to the shutdown registry.
+func (s *Server) register(c *connection) {
+	s.mu.Lock()
+	s.conns[c] = struct{}{}
+	s.mu.Unlock()
+}
+
+// deregister removes a connection from the shutdown registry once its
+// run loop has returned.
+func (s *Server) deregister(c *connection) {
+	s.mu.Lock()
+	delete(s.conns, c)
+	s.mu.Unlock()
+}
+
+// Shutdown gracefully disconnects every live WebSocket connection,
+// pacing the closures evenly across the window implied by ctx's deadline
+// to avoid a thundering-herd reconnect against the next node (DESIGN.md
+// §11). Each connection is sent a DISCONNECTED frame and then closed,
+// which drives its normal teardown (including synthesised presence
+// LEAVEs). When ctx's deadline is reached, any remaining stragglers are
+// force-closed at once. Shutdown returns once every connection has been
+// disconnected (or the deadline forced them closed).
+func (s *Server) Shutdown(ctx context.Context) {
+	s.mu.Lock()
+	conns := make([]*connection, 0, len(s.conns))
+	for c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+	if len(conns) == 0 {
+		return
+	}
+
+	interval := pacingInterval(ctx, len(conns))
+	for i, c := range conns {
+		c.disconnect()
+		if i == len(conns)-1 {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			// Deadline hit: force-close the remaining stragglers now
+			// rather than continuing to pace past the window.
+			for _, straggler := range conns[i+1:] {
+				straggler.forceClose()
+			}
+			return
+		case <-time.After(interval):
+		}
+	}
+}
+
+// pacingInterval spreads n closures evenly across the window implied by
+// ctx's deadline: closures fire at 0, interval, 2*interval, …, leaving a
+// 1/n slice of headroom before the deadline. With no deadline (or none
+// left) it returns 0, closing everything promptly.
+func pacingInterval(ctx context.Context, n int) time.Duration {
+	dl, ok := ctx.Deadline()
+	if !ok || n <= 0 {
+		return 0
+	}
+	window := time.Until(dl)
+	if window <= 0 {
+		return 0
+	}
+	return window / time.Duration(n)
 }
 
 // echoFromQuery resolves the `echo` upgrade param. Ably defaults echo to

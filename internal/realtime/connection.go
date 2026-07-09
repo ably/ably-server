@@ -390,6 +390,15 @@ func (c *connection) writeLoop(ctx context.Context) {
 				c.logger.Debug("write error", "err", err)
 				return
 			}
+			// A server-initiated DISCONNECTED (shutdown, DESIGN.md §11) is
+			// the connection's last frame: once it is on the wire, close the
+			// socket so the read loop unblocks and normal teardown runs
+			// (synthesising presence LEAVEs). Closing here — after the write
+			// — guarantees the client receives the frame before the close.
+			if msg.Action == protocol.ActionDisconnected {
+				_ = c.ws.Close()
+				return
+			}
 			ticker.Reset(c.heartbeatInterval)
 
 		case <-ticker.C:
@@ -411,6 +420,34 @@ func (c *connection) write(msg *protocol.ProtocolMessage) error {
 		wsType = websocket.BinaryMessage
 	}
 	return c.ws.WriteMessage(wsType, data)
+}
+
+// disconnect initiates a graceful, server-side close (DESIGN.md §11): it
+// enqueues a DISCONNECTED frame, which the write loop flushes before
+// closing the socket. If the outbound buffer cannot accept the frame
+// (the writer is gone or backed up), the socket is force-closed directly
+// so the connection still tears down. Safe to call from the shutdown
+// goroutine — it never touches per-connection state owned by the read
+// loop.
+func (c *connection) disconnect() {
+	select {
+	case c.outbound <- &protocol.ProtocolMessage{
+		Action: protocol.ActionDisconnected,
+		Error: &protocol.ErrorInfo{
+			Message:    "server is shutting down; please reconnect",
+			Code:       80003, // ErrDisconnected — a retryable disconnect
+			StatusCode: 503,
+		},
+	}:
+	default:
+		c.forceClose()
+	}
+}
+
+// forceClose closes the underlying socket immediately, unblocking the
+// read loop. Used for stragglers still open at the shutdown deadline.
+func (c *connection) forceClose() {
+	_ = c.ws.Close()
 }
 
 func isExpectedClose(err error) bool {

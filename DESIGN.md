@@ -1048,12 +1048,16 @@ nodes so only one applies migrations, the rest observe the
 On SIGTERM the server enters a graceful shutdown:
 
 1. Stop accepting new WebSocket and HTTP connections.
-2. Send `DISCONNECTED` to every existing WebSocket so SDKs reconnect
-   elsewhere.
-3. Wait up to `--shutdown-grace` (default `10s`) for connections to close
-   themselves; after the window, any remaining connections are forcibly
-   closed.
-4. Drain in-flight REST handlers, then close storage.
+2. Walk the registry of live WebSocket connections and, for each, send a
+   `DISCONNECTED` frame (so SDKs reconnect elsewhere) and then close the
+   socket — which drives the connection's normal teardown, including the
+   synthesised presence `LEAVE`s (§12.5). These closures are **paced
+   evenly across the `--shutdown-grace` window** (default `10s`) rather
+   than fired all at once, so reconnects arrive at the next node
+   staggered rather than as a thundering herd. Any connection still open
+   at the deadline is force-closed immediately.
+3. Concurrently, drain in-flight REST handlers.
+4. Close storage.
 
 In `cluster` mode each node is fungible. Rolling restart works because
 clients are told to reconnect; the next node accepts the new connection

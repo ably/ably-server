@@ -229,7 +229,16 @@ func run(ctx context.Context, opts runOpts) int {
 			logger.Error("debug shutdown error", "err", err)
 		}
 	}
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	// srv.Shutdown stops accepting new connections and drains in-flight
+	// HTTP handlers — but a WebSocket handler blocks in the connection
+	// loop until its socket closes, so it would otherwise hang until the
+	// deadline. Run it concurrently with rt.Shutdown, which sends
+	// DISCONNECTED to every live WebSocket and paces the closures across
+	// the grace window (DESIGN.md §11), unblocking those handlers.
+	srvErr := make(chan error, 1)
+	go func() { srvErr <- srv.Shutdown(shutdownCtx) }()
+	rt.Shutdown(shutdownCtx)
+	if err := <-srvErr; err != nil {
 		logger.Error("shutdown error", "err", err)
 		return 1
 	}
