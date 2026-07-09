@@ -261,6 +261,37 @@ func TestVersionsListPaginates(t *testing.T) {
 	}
 }
 
+// TestVersionsDefaultOrderIsForwards pins the SDK contract: with no
+// direction param the versions read returns oldest-first (create, then
+// each edit), so the SDK's GetMessageVersions — which sends no direction —
+// sees the create at index 0 (DESIGN.md §13.4).
+func TestVersionsDefaultOrderIsForwards(t *testing.T) {
+	srv, _ := newTestServer(t)
+	serial := publishOne(t, srv, "room", &protocol.Message{Data: "v1", ClientID: "alice"})
+	for _, d := range []string{"v2", "v3"} {
+		if resp := patch(t, srv, "room", serial, &protocol.Message{Action: protocol.MessageUpdate, Data: d}); resp.StatusCode != http.StatusOK {
+			t.Fatalf("patch %s: status %d", d, resp.StatusCode)
+		}
+	}
+
+	// No direction query param — the endpoint must default to forwards.
+	resp := versionsGet(t, srv, "room", serial, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("versions status = %d, want 200", resp.StatusCode)
+	}
+	var all []*protocol.Message
+	decodeJSON(t, resp, &all)
+	if len(all) != 3 {
+		t.Fatalf("versions = %d, want 3 (create + 2 updates)", len(all))
+	}
+	if all[0].Action != protocol.MessageCreate {
+		t.Errorf("versions[0].Action = %v, want create (oldest-first default)", all[0].Action)
+	}
+	if all[2].Action != protocol.MessageUpdate || all[2].Data != "v3" {
+		t.Errorf("versions[2] = {action:%v data:%v}, want {update v3} (newest last)", all[2].Action, all[2].Data)
+	}
+}
+
 func TestVersionsNotFound(t *testing.T) {
 	srv, _ := newTestServer(t)
 	resp := versionsGet(t, srv, "room", "00000000000001-000@nope000000:000", "")

@@ -119,10 +119,14 @@ All REST endpoints live under the root and accept either `application/json` or
 | GET | `/readyz` | readiness — no auth; 200 in `memory`/`disk` mode; in `cluster` mode pings Postgres and returns 503 if unreachable |
 
 A successful publish returns `201` with a `{"channel": "<name>",
-"messageId": "<id>"}` body (msgpack when the `Accept` header requests
-it). `messageId` is the stamped id of the publish's first message —
-`"<batchID>:0"` (§8) — the same id carried on the delivered `MESSAGE`
-frame.
+"messageId": "<id>", "serials": ["<serial>", …]}` body (msgpack when the
+`Accept` header requests it). `messageId` is the stamped id of the
+publish's first message — `"<batchID>:0"` (§8) — the same id carried on
+the delivered `MESSAGE` frame. `serials` carries one entry per published
+message, in batch order, each the message's stable identity `serial` (§8)
+— the value a client uses to address the message via `PATCH` / `GET
+.../messages/{serial}` (§13), and what the SDK's `PublishWithResult`
+surfaces.
 
 Pagination follows Ably's `Link` header convention (`first`, `next`), each
 rel emitted as its own `Link` header line with a URL relative to the
@@ -1543,8 +1547,11 @@ set:
   tombstone.
 - **the `serial → versions` index** over the log. Backs
   `GET .../messages/{serial}/versions`, which returns the versions of a
-  message ordered by `version`, paginated with the same `Link` convention
-  as message history (§2.2). It is also what an update / delete consults
+  message ordered by `version` — oldest-first (create then edits) by
+  default, since a version chain reads naturally forwards and the SDK
+  requests it without a direction; an explicit `direction` param still
+  wins. Paginated with the same `Link` convention as message history
+  (§2.2). It is also what an update / delete consults
   to validate and merge against its target. Appends are the exception to
   "every version": the log keeps each append cm for live and resume
   fan-out, but the versions read-path collapses a run of appends to its

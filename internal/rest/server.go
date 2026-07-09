@@ -156,12 +156,19 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 	}
 	s.metrics.MessagePublished(time.Since(accepted).Seconds())
 
-	// Ably's publish response (RSL1): 201 with {channel, messageId}. The
+	// Ably's publish response (RSL1): 201 with {channel, messageId} plus a
+	// serials array (RSL1n / PBR2a) the SDK's PublishWithResult reads. The
 	// messageId is the server-stamped id of the publish's first message —
 	// "<batchID>:0" (DESIGN.md §8) — which is exactly the id carried on the
 	// delivered MESSAGE frame for this publish, and matches Ably's observed
-	// shape (e.g. "TojWzTkLiH:0").
-	respBody, err := marshalValue(publishResponse{Channel: name, MessageID: publishMessageID(cm)}, respFormat)
+	// shape (e.g. "TojWzTkLiH:0"). serials carries the stable identity Serial
+	// of each published message in batch order, which the client then uses to
+	// address the message via PATCH/GET .../messages/{serial} (§8, §13).
+	respBody, err := marshalValue(publishResponse{
+		Channel:   name,
+		MessageID: publishMessageID(cm),
+		Serials:   publishSerials(cm),
+	}, respFormat)
 	if err != nil {
 		s.logger.Warn("publish encode failed", "channel", name, "err", err)
 		http.Error(w, "encode failed", http.StatusInternalServerError)
@@ -173,10 +180,12 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 }
 
 // publishResponse is the REST POST /messages response body (Ably RSL1):
-// the channel name and the publish's messageId.
+// the channel name, the publish's messageId, and the per-message serials
+// (RSL1n) the SDK's PublishWithResult decodes to address each message.
 type publishResponse struct {
-	Channel   string `json:"channel"   msgpack:"channel"`
-	MessageID string `json:"messageId" msgpack:"messageId"`
+	Channel   string   `json:"channel"           msgpack:"channel"`
+	MessageID string   `json:"messageId"         msgpack:"messageId"`
+	Serials   []string `json:"serials,omitempty" msgpack:"serials,omitempty"`
 }
 
 // publishMessageID returns the messageId for a publish response: the
@@ -187,6 +196,17 @@ func publishMessageID(cm *protocol.ChannelMessage) string {
 		return cm.ID
 	}
 	return cm.Messages[0].ID
+}
+
+// publishSerials returns the stable identity Serial of each message in the
+// publish, in batch order — the serials the client uses to address a
+// message via PATCH/GET .../messages/{serial} (DESIGN.md §8, §13).
+func publishSerials(cm *protocol.ChannelMessage) []string {
+	serials := make([]string, len(cm.Messages))
+	for i, m := range cm.Messages {
+		serials[i] = m.Serial
+	}
+	return serials
 }
 
 // updateDeleteResponse is the REST PATCH /messages/{serial} response
@@ -451,6 +471,14 @@ func (s *Server) HandleMessageVersions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+	// Versions read oldest-first (ascending version) by default: a version
+	// chain reads naturally create-then-edits, and the SDK's
+	// GetMessageVersions sends no direction yet expects the create first
+	// (DESIGN.md §13.4). Message history defaults backwards; versions
+	// default forwards, and an explicit direction param still wins.
+	if r.URL.Query().Get("direction") == "" {
+		q.Direction = storage.DirectionForwards
 	}
 	format, err := acceptFormat(r.Header.Get("Accept"))
 	if err != nil {

@@ -176,10 +176,12 @@ func TestPublishJSONArrayBody(t *testing.T) {
 
 // publishResponseBody is a local decode target mirroring the server's
 // publishResponse — the tests decode the wire body independently to pin
-// the {channel, messageId} shape (Ably RSL1) for both formats.
+// the {channel, messageId, serials} shape (Ably RSL1/RSL1n) for both
+// formats.
 type publishResponseBody struct {
-	Channel   string `json:"channel"   msgpack:"channel"`
-	MessageID string `json:"messageId" msgpack:"messageId"`
+	Channel   string   `json:"channel"   msgpack:"channel"`
+	MessageID string   `json:"messageId" msgpack:"messageId"`
+	Serials   []string `json:"serials"   msgpack:"serials"`
 }
 
 func TestPublishResponseBodyJSON(t *testing.T) {
@@ -297,6 +299,53 @@ func TestPublishResponseMessageIDIsFirstOfBatch(t *testing.T) {
 	}
 	if got.MessageID != cm.Messages[0].ID {
 		t.Errorf("messageId = %q, want first message id %q", got.MessageID, cm.Messages[0].ID)
+	}
+
+	// RSL1n: serials carries one entry per published message, in batch
+	// order, each the message's stable identity Serial (the value the SDK's
+	// PublishWithResult surfaces and then uses to address the message).
+	if len(got.Serials) != 3 {
+		t.Fatalf("serials = %d, want 3 (one per message)", len(got.Serials))
+	}
+	for i, s := range got.Serials {
+		if s == "" {
+			t.Errorf("serials[%d] is empty", i)
+		}
+		if s != cm.Messages[i].Serial {
+			t.Errorf("serials[%d] = %q, want delivered Message.Serial %q", i, s, cm.Messages[i].Serial)
+		}
+	}
+}
+
+// TestPublishSerialAddressesMessage pins the end-to-end contract the SDK's
+// PublishWithResult relies on: the serial returned in the publish response
+// is the value that addresses that message via GET .../messages/{serial}.
+func TestPublishSerialAddressesMessage(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	body, _ := json.Marshal(&protocol.Message{Name: "greet", Data: "hi"})
+	resp := request(t, srv, http.MethodPost, "/channels/foo/messages", "application/json", body, true)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("publish status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	var got publishResponseBody
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Serials) != 1 || got.Serials[0] == "" {
+		t.Fatalf("serials = %v, want a single non-empty serial", got.Serials)
+	}
+
+	// The returned serial must be directly addressable.
+	mr := request(t, srv, http.MethodGet, "/channels/foo/messages/"+got.Serials[0], "", nil, true)
+	if mr.StatusCode != http.StatusOK {
+		t.Fatalf("GET by returned serial status = %d, want 200", mr.StatusCode)
+	}
+	var m protocol.Message
+	decodeJSON(t, mr, &m)
+	if m.Serial != got.Serials[0] || m.Data != "hi" {
+		t.Errorf("read message = {serial:%q data:%v}, want {serial:%q data:hi}", m.Serial, m.Data, got.Serials[0])
 	}
 }
 
