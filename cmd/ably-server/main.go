@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/ably/ably-server/internal/auth"
+	"github.com/ably/ably-server/internal/config"
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/realtime"
 	"github.com/ably/ably-server/internal/rest"
@@ -28,10 +29,16 @@ import (
 )
 
 const (
-	apiKeyEnv      = "ABLY_SERVER_API_KEY"
-	dbDSNEnv       = "ABLY_SERVER_DB_DSN"
-	logFormatEnv   = "ABLY_SERVER_LOG_FORMAT"
-	debugListenEnv = "ABLY_SERVER_DEBUG_LISTEN"
+	apiKeyEnv        = "ABLY_SERVER_API_KEY"
+	dbDSNEnv         = "ABLY_SERVER_DB_DSN"
+	logFormatEnv     = "ABLY_SERVER_LOG_FORMAT"
+	debugListenEnv   = "ABLY_SERVER_DEBUG_LISTEN"
+	modeEnv          = "ABLY_SERVER_MODE"
+	listenEnv        = "ABLY_SERVER_LISTEN"
+	dataDirEnv       = "ABLY_SERVER_DATA_DIR"
+	shutdownGraceEnv = "ABLY_SERVER_SHUTDOWN_GRACE"
+	logLevelEnv      = "ABLY_SERVER_LOG_LEVEL"
+	configPathEnv    = "ABLY_SERVER_CONFIG"
 )
 
 func main() {
@@ -74,18 +81,44 @@ type runOpts struct {
 // inputs are passed via runOpts so the function is testable without
 // touching package-level state.
 func run(ctx context.Context, opts runOpts) int {
+	// The config file's path must be known before the flags it seeds
+	// are defined below, so it's resolved by hand (flag > env) ahead
+	// of the real flag.Parse pass. --config is still registered as a
+	// flag further down purely so fs.Parse recognises it and --help
+	// lists it; its value there is unused.
+	configPath := opts.Getenv(configPathEnv)
+	if p := config.PathFromArgs(opts.Args); p != "" {
+		configPath = p
+	}
+	var file config.File
+	if configPath != "" {
+		f, err := config.Load(configPath)
+		if err != nil {
+			fmt.Fprintln(opts.Out, err)
+			return 1
+		}
+		file = *f
+	}
+
+	shutdownGraceDefault, err := config.DefaultDuration(opts.Getenv(shutdownGraceEnv), file.ShutdownGrace, 10*time.Second)
+	if err != nil {
+		fmt.Fprintln(opts.Out, err)
+		return 1
+	}
+
 	fs := flag.NewFlagSet("ably-server", flag.ContinueOnError)
 	fs.SetOutput(opts.Out)
-	listen := fs.String("listen", ":8080", "address for HTTP/WS listener")
-	apiKey := fs.String("api-key", opts.Getenv(apiKeyEnv), "API key in appId.keyId:keySecret format (env: "+apiKeyEnv+")")
-	mode := fs.String("mode", "memory", "storage backend: memory, disk, or cluster")
-	dataDir := fs.String("data-dir", "./data", "data directory for disk mode (holds the bbolt file)")
-	dbDSN := fs.String("db-dsn", opts.Getenv(dbDSNEnv), "libpq DSN for cluster mode, e.g. postgres://user:pw@host:5432/db?sslmode=disable (env: "+dbDSNEnv+")")
+	fs.String("config", configPath, "path to an optional TOML config file (env: "+configPathEnv+")")
+	listen := fs.String("listen", config.Default(opts.Getenv(listenEnv), file.Listen, ":8080"), "address for HTTP/WS listener (env: "+listenEnv+")")
+	apiKey := fs.String("api-key", config.Default(opts.Getenv(apiKeyEnv), file.APIKey, ""), "API key in appId.keyId:keySecret format (env: "+apiKeyEnv+")")
+	mode := fs.String("mode", config.Default(opts.Getenv(modeEnv), file.Mode, "memory"), "storage backend: memory, disk, or cluster (env: "+modeEnv+")")
+	dataDir := fs.String("data-dir", config.Default(opts.Getenv(dataDirEnv), file.DataDir, "./data"), "data directory for disk mode (holds the bbolt file) (env: "+dataDirEnv+")")
+	dbDSN := fs.String("db-dsn", config.Default(opts.Getenv(dbDSNEnv), file.DBDSN, ""), "libpq DSN for cluster mode, e.g. postgres://user:pw@host:5432/db?sslmode=disable (env: "+dbDSNEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
-	shutdownGrace := fs.Duration("shutdown-grace", 10*time.Second, "window to disconnect existing connections on SIGTERM")
-	logLevel := fs.String("log-level", "info", "log level: debug, info, warn, error")
-	logFormat := fs.String("log-format", envOr(opts.Getenv, logFormatEnv, "text"), "log format: text or json (env: "+logFormatEnv+")")
-	debugListen := fs.String("debug-listen", opts.Getenv(debugListenEnv), "address for the pprof debug listener; disabled if empty (env: "+debugListenEnv+")")
+	shutdownGrace := fs.Duration("shutdown-grace", shutdownGraceDefault, "window to disconnect existing connections on SIGTERM (env: "+shutdownGraceEnv+")")
+	logLevel := fs.String("log-level", config.Default(opts.Getenv(logLevelEnv), file.LogLevel, "info"), "log level: debug, info, warn, error (env: "+logLevelEnv+")")
+	logFormat := fs.String("log-format", config.Default(opts.Getenv(logFormatEnv), file.LogFormat, "text"), "log format: text or json (env: "+logFormatEnv+")")
+	debugListen := fs.String("debug-listen", config.Default(opts.Getenv(debugListenEnv), file.DebugListen, ""), "address for the pprof debug listener; disabled if empty (env: "+debugListenEnv+")")
 	if err := fs.Parse(opts.Args); err != nil {
 		return 2
 	}
@@ -283,15 +316,4 @@ func newLogger(level, format string, w io.Writer) (*slog.Logger, error) {
 	default:
 		return nil, fmt.Errorf("unknown --log-format %q (valid: text, json)", format)
 	}
-}
-
-// envOr returns getenv(key) if non-empty, otherwise fallback. Used to
-// seed a flag's default from its ABLY_SERVER_* env equivalent before
-// flag.Parse runs, so --flag=... > env > this default all resolve
-// correctly from a single fs.String call.
-func envOr(getenv func(string) string, key, fallback string) string {
-	if v := getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }

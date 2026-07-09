@@ -932,22 +932,31 @@ surface the discontinuity.
 
 ## 9. Configuration
 
-CLI flags (each with an `ABLY_SERVER_*` env var equivalent):
+CLI flags (each with an `ABLY_SERVER_*` env var equivalent, named by
+upper-casing and underscoring the flag — e.g. `--log-format` is
+`ABLY_SERVER_LOG_FORMAT`):
 
 ```
---mode {memory|disk|cluster}      default: memory
---listen :8080                    HTTP/WS bind
---api-key                         appId.keyId:keySecret
---data-dir ./data                 disk mode only
---db-dsn  postgres://…            cluster mode only
---shutdown-grace 10s              window to disconnect existing connections on SIGTERM
+--mode {memory|disk|cluster}  default: memory
+--listen :8080                HTTP/WS bind
+--api-key                     appId.keyId:keySecret
+--data-dir ./data             disk mode only
+--db-dsn  postgres://…        cluster mode only
+--shutdown-grace 10s          window to disconnect existing connections on SIGTERM
 --log-level info
 --log-format {text|json}
+--debug-listen                pprof on a separate port; disabled if unset
+--config ably-server.toml     optional TOML file, see below
 ```
 
 Configuration may also be supplied via an optional TOML config file
-(`--config ably-server.toml`) covering the same keys as the flags above.
-Loaded in priority order: flag > env > config file > defaults.
+(`--config ably-server.toml`), covering the same keys as the flags above
+(`mode`, `listen`, `api-key`, `data-dir`, `db-dsn`, `shutdown-grace`,
+`log-level`, `log-format`, `debug-listen` — `shutdown-grace` as a
+duration string, e.g. `"10s"`). Every key is optional. Resolution order,
+highest priority first: flag > env > config file > hardcoded default —
+so a flag always wins, an env var beats the file, and the file only
+supplies a value nothing more specific set.
 
 ## 10. Observability
 

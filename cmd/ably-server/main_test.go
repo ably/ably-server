@@ -3,9 +3,24 @@ package main
 import (
 	"bytes"
 	"context"
+	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+// writeConfigFile writes contents to a fresh ably-server.toml under a
+// t.TempDir() and returns its path.
+func writeConfigFile(t *testing.T, contents string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ably-server.toml")
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+	return path
+}
 
 // emptyEnv is a getenv stub that returns "" for every key.
 func emptyEnv(string) string { return "" }
@@ -120,5 +135,142 @@ func TestNewLoggerSelectsHandler(t *testing.T) {
 
 	if _, err := newLogger("info", "yaml", &out); err == nil {
 		t.Error("newLogger(yaml) error = nil, want an error for an unrecognised format")
+	}
+}
+
+func TestRunConfigFileSuppliesDefaults(t *testing.T) {
+	// Nothing on the command line or in the environment; an invalid
+	// log-format in the file surfaces the same startup error a flag or
+	// env value would, proving the file was read for a flag with
+	// neither set.
+	path := writeConfigFile(t, `log-format = "xml"`)
+	var out bytes.Buffer
+	code := run(context.Background(), runOpts{
+		Args:   []string{"--config=" + path},
+		Getenv: emptyEnv,
+		Out:    &out,
+	})
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(out.String(), `unknown --log-format "xml"`) {
+		t.Errorf("output = %q, want substring about unknown --log-format", out.String())
+	}
+}
+
+func TestRunEnvOverridesConfigFile(t *testing.T) {
+	// The file's log-format is valid; the env value is not. Env must
+	// win, so the invalid env value is what surfaces.
+	path := writeConfigFile(t, `log-format = "json"`)
+	var out bytes.Buffer
+	code := run(context.Background(), runOpts{
+		Args:   []string{"--config=" + path},
+		Getenv: envWith(map[string]string{logFormatEnv: "xml"}),
+		Out:    &out,
+	})
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(out.String(), `unknown --log-format "xml"`) {
+		t.Errorf("output = %q, want substring about unknown --log-format", out.String())
+	}
+}
+
+func TestRunFlagOverridesEnvAndConfigFile(t *testing.T) {
+	// Both the file and the env supply an invalid log-format; an
+	// explicit --log-format flag must still win. With a valid format
+	// resolved, the run proceeds past logger construction and fails
+	// later for the (deliberately) missing api key — proving the flag,
+	// not the file or env, decided the format.
+	path := writeConfigFile(t, `log-format = "xml"`)
+	var out bytes.Buffer
+	code := run(context.Background(), runOpts{
+		Args:   []string{"--config=" + path, "--log-format=text"},
+		Getenv: envWith(map[string]string{logFormatEnv: "xml"}),
+		Out:    &out,
+	})
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if strings.Contains(out.String(), "log-format") {
+		t.Errorf("output = %q, should not mention log-format (the flag should have resolved it)", out.String())
+	}
+	if !strings.Contains(out.String(), "api key is required") {
+		t.Errorf("output = %q, want substring %q", out.String(), "api key is required")
+	}
+}
+
+func TestRunConfigFileShutdownGraceMalformed(t *testing.T) {
+	path := writeConfigFile(t, `shutdown-grace = "not-a-duration"`)
+	var out bytes.Buffer
+	code := run(context.Background(), runOpts{
+		Args:   []string{"--config=" + path},
+		Getenv: emptyEnv,
+		Out:    &out,
+	})
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(out.String(), "invalid duration") {
+		t.Errorf("output = %q, want substring %q", out.String(), "invalid duration")
+	}
+}
+
+func TestRunConfigFileMissingPathIsAnError(t *testing.T) {
+	var out bytes.Buffer
+	code := run(context.Background(), runOpts{
+		Args:   []string{"--config=/nonexistent/ably-server.toml"},
+		Getenv: emptyEnv,
+		Out:    &out,
+	})
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(out.String(), "/nonexistent/ably-server.toml") {
+		t.Errorf("output = %q, want it to name the missing config path", out.String())
+	}
+}
+
+func TestRunConfigFileListenAndAPIKeyEndToEnd(t *testing.T) {
+	// The file alone (no flags, no env) supplies both --listen and
+	// --api-key; the server must actually start and bind, proving the
+	// file's values reached the real flags rather than just being
+	// parsed and discarded.
+	path := writeConfigFile(t, `
+listen = "127.0.0.1:0"
+api-key = "app.key:secret"
+`)
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan net.Addr, 1)
+	done := make(chan int, 1)
+	var out bytes.Buffer
+	go func() {
+		done <- run(ctx, runOpts{
+			Args:   []string{"--config=" + path},
+			Getenv: emptyEnv,
+			Out:    &out,
+			Ready:  ready,
+		})
+	}()
+
+	select {
+	case addr := <-ready:
+		if addr == nil {
+			t.Error("Ready sent a nil address")
+		}
+	case code := <-done:
+		t.Fatalf("server exited before ready (code=%d), output: %s", code, out.String())
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not become ready within 5s")
+	}
+
+	cancel()
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Errorf("exit code = %d, want 0; output: %s", code, out.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not shut down within 5s")
 	}
 }
