@@ -230,6 +230,26 @@ func MemberKey(connectionID, clientID string) string {
 	return connectionID + ":" + clientID
 }
 
+// staticPresenceKey marks a StorePresence call as seeding static fixture
+// members (DESIGN.md §9, §12.5): members that belong to no connection
+// and must never lapse. Threaded via the context so the interface stays
+// unchanged; only backends with a liveness reaper (postgres) need act on
+// it — memory and bbolt hold the set in memory and never reap.
+type staticPresenceKey struct{}
+
+// WithStaticPresence marks ctx so that presence stored under it is
+// treated as a static fixture: exempt from the cluster liveness reaper
+// (a non-expiring lease). Used by the --fixtures seed path.
+func WithStaticPresence(ctx context.Context) context.Context {
+	return context.WithValue(ctx, staticPresenceKey{}, true)
+}
+
+// IsStaticPresence reports whether ctx was marked by WithStaticPresence.
+func IsStaticPresence(ctx context.Context) bool {
+	v, _ := ctx.Value(staticPresenceKey{}).(bool)
+	return v
+}
+
 // StampMessageIDs resolves the ChannelMessage batch id for a create
 // publish and stamps the contained Message.IDs (DESIGN.md §8). It is
 // called by every backend's Store before minting the channelSerial, so

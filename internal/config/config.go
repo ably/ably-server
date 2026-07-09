@@ -38,6 +38,10 @@ type File struct {
 	LogLevel      string   `toml:"log-level"`
 	LogFormat     string   `toml:"log-format"`
 	DebugListen   string   `toml:"debug-listen"`
+	// Fixtures is the path to an Ably test-app-setup-shaped JSON file
+	// whose channels' presence members are pre-seeded at startup — for
+	// SDK test-suite compatibility only (DESIGN.md §9).
+	Fixtures string `toml:"fixtures"`
 }
 
 // Load parses the TOML file at path into a File.

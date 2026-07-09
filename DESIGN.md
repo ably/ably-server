@@ -1133,7 +1133,19 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --log-format {text|json}
 --debug-listen                pprof on a separate port; disabled if unset
 --config ably-server.toml     optional TOML file, see below
+--fixtures path.json          pre-seed presence members from a test-app-setup spec (test-suite compat)
 ```
+
+`--fixtures` points at an Ably *test-app-setup*-shaped JSON file (the
+`post_apps` object, or a bare `{channels:[…]}`). At startup, before the
+listener opens, each channel's `presence[]` members are entered through
+the normal `StorePresence` path so they land in both the membership set
+and presence history, with server-synthesized `connectionId`s;
+`clientId`/`data`/`encoding` round-trip verbatim (encoding is opaque —
+cipher payloads are never decoded). It exists purely so the ably-go
+presence suite, which the cloud sandbox provisions these members for, can
+run against a local server; seeded members are static (§12.5). An
+unreadable path or a malformed spec is a startup error.
 
 Configuration may also be supplied via an optional TOML config file
 (`--config ably-server.toml`), covering the same keys as the flags above
@@ -1349,6 +1361,14 @@ into it transactionally and `Members` reads it (§6). Per backend:
   authoritative across nodes. A node serves sync and `GET .../presence`
   straight from `Members` (a `SELECT` against this table); it need never
   have witnessed the original ENTERs.
+
+**Static fixture members.** Members seeded via `--fixtures` (§9) are the
+one exception to connection-scoped liveness: they belong to no
+connection, so no teardown ever synthesises a LEAVE for them, and in
+cluster mode they are stored with a sentinel owner and a non-expiring
+(`'infinity'`) lease so neither the lease-bump loop nor the reaper ever
+touches them. They persist for the process's lifetime. This exists only
+for SDK test-suite compatibility.
 
 **Liveness.** A member lives exactly as long as the connection that
 entered it. There is no presence grace period — consistent with §4.3 the

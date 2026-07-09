@@ -24,6 +24,7 @@ import (
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/config"
 	"github.com/ably/ably-server/internal/core"
+	"github.com/ably/ably-server/internal/fixtures"
 	"github.com/ably/ably-server/internal/metrics"
 	"github.com/ably/ably-server/internal/realtime"
 	"github.com/ably/ably-server/internal/rest"
@@ -45,6 +46,7 @@ const (
 	shutdownGraceEnv = "ABLY_SERVER_SHUTDOWN_GRACE"
 	logLevelEnv      = "ABLY_SERVER_LOG_LEVEL"
 	configPathEnv    = "ABLY_SERVER_CONFIG"
+	fixturesEnv      = "ABLY_SERVER_FIXTURES"
 )
 
 func main() {
@@ -126,6 +128,7 @@ func run(ctx context.Context, opts runOpts) int {
 	logLevel := fs.String("log-level", config.Default(opts.Getenv(logLevelEnv), file.LogLevel, "info"), "log level: debug, info, warn, error (env: "+logLevelEnv+")")
 	logFormat := fs.String("log-format", config.Default(opts.Getenv(logFormatEnv), file.LogFormat, "text"), "log format: text or json (env: "+logFormatEnv+")")
 	debugListen := fs.String("debug-listen", config.Default(opts.Getenv(debugListenEnv), file.DebugListen, ""), "address for the pprof debug listener; disabled if empty (env: "+debugListenEnv+")")
+	fixturesPath := fs.String("fixtures", config.Default(opts.Getenv(fixturesEnv), file.Fixtures, ""), "path to a test-app-setup-shaped JSON file whose presence members are pre-seeded at startup, for SDK test-suite compatibility (env: "+fixturesEnv+")")
 	if err := fs.Parse(opts.Args); err != nil {
 		return 2
 	}
@@ -204,6 +207,21 @@ func run(ctx context.Context, opts runOpts) int {
 
 	m := metrics.New()
 	manager := core.NewManager(store)
+
+	// Pre-seed presence fixtures before serving traffic (DESIGN.md §9).
+	// An unreadable path or malformed spec is a startup error.
+	if *fixturesPath != "" {
+		spec, err := fixtures.Load(*fixturesPath)
+		if err != nil {
+			logger.Error("load fixtures", "path", *fixturesPath, "err", err)
+			return 1
+		}
+		if err := fixtures.Seed(ctx, manager, spec, logger); err != nil {
+			logger.Error("seed fixtures", "path", *fixturesPath, "err", err)
+			return 1
+		}
+	}
+
 	rt := realtime.NewServer(parsedKeys, manager, *hbInterval, logger, m, tracer)
 	// ready is non-nil only for backends with an external dependency
 	// worth probing (currently postgres.Storage); memory/disk leave it

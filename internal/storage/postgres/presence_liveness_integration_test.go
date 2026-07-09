@@ -90,6 +90,64 @@ func TestCrashedNodePresenceReaped(t *testing.T) {
 	}
 }
 
+// TestStaticFixturePresenceSurvivesReaper enters a static fixture member
+// (storage.WithStaticPresence) on node A, then closes node A so its
+// lease-bump loop stops. A normal member would lapse and be reaped, but a
+// fixture member carries an 'infinity' lease and a sentinel owner, so
+// node B's reaper never removes it (TASK-89 AC #3).
+func TestStaticFixturePresenceSurvivesReaper(t *testing.T) {
+	defer swapPresenceTimings(1*time.Second, 200*time.Millisecond, 200*time.Millisecond)()
+
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	ctx := context.Background()
+
+	sa, err := Open(ctx, Options{DSN: dsn})
+	if err != nil {
+		t.Fatalf("Open node A: %v", err)
+	}
+	defer func() { _ = sa.Close() }()
+	chA, err := sa.Channel(ctx, "room", nil)
+	if err != nil {
+		t.Fatalf("Channel node A: %v", err)
+	}
+
+	sb, err := Open(ctx, Options{DSN: dsn})
+	if err != nil {
+		t.Fatalf("Open node B: %v", err)
+	}
+	defer func() { _ = sb.Close() }()
+	chB, err := sb.Channel(ctx, "room", nil)
+	if err != nil {
+		t.Fatalf("Channel node B: %v", err)
+	}
+
+	// Seed a static fixture member on node A.
+	if _, _, err := chA.StorePresence(storage.WithStaticPresence(ctx), []*protocol.PresenceMessage{{
+		Action:       protocol.PresenceEnter,
+		ClientID:     "fixture_client",
+		ConnectionID: "connFixture",
+		Data:         "true",
+	}}); err != nil {
+		t.Fatalf("seed fixture presence: %v", err)
+	}
+
+	waitFor(t, 10*time.Second, "node B to see the fixture member", func() bool {
+		return memberPresent(t, ctx, chB, "fixture_client")
+	})
+
+	// Node A "crashes": its bump loop stops. A normal member would lapse
+	// within a lease window; wait several reaper cycles and assert the
+	// fixture member is still present on node B.
+	if err := sa.Close(); err != nil {
+		t.Fatalf("Close node A: %v", err)
+	}
+	time.Sleep(presenceLeaseWindow + 10*presenceReaperInterval)
+	if !memberPresent(t, ctx, chB, "fixture_client") {
+		t.Fatal("static fixture member was reaped, want it to survive indefinitely")
+	}
+}
+
 // swapPresenceTimings overrides the presence lease/bump/reaper vars and
 // returns a restore func.
 func swapPresenceTimings(lease, bump, reap time.Duration) func() {

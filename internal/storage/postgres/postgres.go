@@ -94,6 +94,12 @@ var (
 	presenceReaperInterval    = 5 * time.Second
 )
 
+// fixtureNodeID is the sentinel owner recorded on static fixture presence
+// rows (DESIGN.md §9, §12.5). It is not a real node id, so no live node's
+// lease-bump loop (WHERE node_id = $node) ever touches these rows; paired
+// with an 'infinity' lease they are never reaped.
+const fixtureNodeID = "__fixtures__"
+
 // notifyPayload is the JSON-encoded NOTIFY body. Keeping it JSON
 // avoids ambiguity in the face of Ably channel names that contain
 // arbitrary characters (including ':' and '@').
@@ -1114,6 +1120,8 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 		return nil, false, err
 	}
 
+	static := storage.IsStaticPresence(ctx)
+
 	tx, err := cs.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, false, fmt.Errorf("storage/postgres: begin tx: %w", err)
@@ -1182,6 +1190,26 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 				return nil, false, fmt.Errorf("storage/postgres: presence leave: %w", err)
 			}
 		default: // Enter, Update, Present
+			if static {
+				// Static fixture member (DESIGN.md §9, §12.5): a sentinel
+				// owner and an 'infinity' lease so no lease-bump loop claims
+				// it and the reaper (WHERE expires_at < now()) never deletes
+				// it. It belongs to no connection, so nothing ever
+				// synthesises a LEAVE for it.
+				if _, err := tx.Exec(ctx,
+					`INSERT INTO presence (channel, connection_id, client_id, channel_serial, payload, node_id, expires_at)
+					 VALUES ($1, $2, $3, $4, $5, $6, 'infinity')
+					 ON CONFLICT (channel, connection_id, client_id)
+					 DO UPDATE SET channel_serial = EXCLUDED.channel_serial,
+					               payload = EXCLUDED.payload,
+					               node_id = EXCLUDED.node_id,
+					               expires_at = EXCLUDED.expires_at`,
+					cs.name, p.ConnectionID, p.ClientID, channelSerial, payload, fixtureNodeID,
+				); err != nil {
+					return nil, false, fmt.Errorf("storage/postgres: presence fixture upsert: %w", err)
+				}
+				break
+			}
 			// Stamp the owning node and a fresh lease (§12.5): this
 			// node's bump loop keeps expires_at ahead while it lives; if
 			// it crashes, the reaper on another node deletes the row once
