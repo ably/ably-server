@@ -1399,12 +1399,6 @@ func (a *capturingAppender) initialized() string {
 	return a.initCurrent
 }
 
-func (a *capturingAppender) initialInitial() string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.initInitial
-}
-
 func (a *capturingAppender) initializeCount() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
