@@ -783,17 +783,37 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, p *auth.Princ
 // writeCapabilityError writes a 401 carrying the Ably error shape with the
 // insufficient-capability code 40160 (DESIGN.md §3.1).
 func (s *Server) writeCapabilityError(w http.ResponseWriter, r *http.Request, msg string) {
+	s.writeErrorInfo(w, r, http.StatusUnauthorized, 40160, msg)
+}
+
+// HandleNotFound writes an Ably-shaped 404 for an unknown REST resource —
+// an unrecognised path, or a request whose method Ably would treat as a
+// missing resource rather than a method error (DESIGN.md §2.2). It is the
+// router's catch-all, so it also converts Go's ServeMux 405 for a known
+// path under a non-registered method into the 404 the SDK expects.
+func (s *Server) HandleNotFound(w http.ResponseWriter, r *http.Request) {
+	s.writeErrorInfo(w, r, http.StatusNotFound, 40400, "requested resource not found")
+}
+
+// writeErrorInfo writes an Ably error response: the `{"error":{...}}`
+// envelope in the Accept format, plus the X-Ably-Errorcode /
+// X-Ably-Errormessage headers Ably SDKs read for the error code and
+// message (HP6/HP7) — without them an HTTPPaginatedResponse reports no
+// code even when the body carries one.
+func (s *Server) writeErrorInfo(w http.ResponseWriter, r *http.Request, statusCode, code int, msg string) {
 	format, err := acceptFormat(r.Header.Get("Accept"))
 	if err != nil {
 		format = protocol.FormatJSON
 	}
 	body, _ := marshalValue(errorResponse{Error: &protocol.ErrorInfo{
 		Message:    msg,
-		Code:       40160,
-		StatusCode: http.StatusUnauthorized,
+		Code:       code,
+		StatusCode: statusCode,
 	}}, format)
 	w.Header().Set("Content-Type", contentTypeFor(format))
-	w.WriteHeader(http.StatusUnauthorized)
+	w.Header().Set("X-Ably-Errorcode", strconv.Itoa(code))
+	w.Header().Set("X-Ably-Errormessage", msg)
+	w.WriteHeader(statusCode)
 	_, _ = w.Write(body)
 }
 

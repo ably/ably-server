@@ -431,6 +431,61 @@ func TestTime(t *testing.T) {
 	}
 }
 
+// TestHandleNotFoundAblyError pins the unknown-resource 404 (TASK-77):
+// an Ably ErrorInfo body carrying code 40400 plus the X-Ably-Errorcode /
+// X-Ably-Errormessage headers SDKs read, in the Accept format.
+func TestHandleNotFoundAblyError(t *testing.T) {
+	parsed, err := auth.ParseAPIKey(testKey)
+	if err != nil {
+		t.Fatalf("parse api key: %v", err)
+	}
+	manager := core.NewManager(memory.New(memory.Options{}))
+	rs := NewServer([]auth.APIKey{parsed}, manager, slog.New(slog.DiscardHandler), nil, nil, nil)
+
+	for _, tc := range []struct {
+		name, accept, wantCT string
+		decode                func([]byte, *errorResponse) error
+	}{
+		{"json default", "", "application/json", func(b []byte, v *errorResponse) error { return json.Unmarshal(b, v) }},
+		{"msgpack", "application/x-msgpack", "application/x-msgpack", func(b []byte, v *errorResponse) error { return msgpack.Unmarshal(b, v) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/does/not/exist", nil)
+			if tc.accept != "" {
+				req.Header.Set("Accept", tc.accept)
+			}
+			rec := httptest.NewRecorder()
+			rs.HandleNotFound(rec, req)
+
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", rec.Code)
+			}
+			if ct := rec.Header().Get("Content-Type"); ct != tc.wantCT {
+				t.Errorf("Content-Type = %q, want %q", ct, tc.wantCT)
+			}
+			if got := rec.Header().Get("X-Ably-Errorcode"); got != "40400" {
+				t.Errorf("X-Ably-Errorcode = %q, want 40400", got)
+			}
+			if rec.Header().Get("X-Ably-Errormessage") == "" {
+				t.Error("X-Ably-Errormessage header is empty")
+			}
+			var body errorResponse
+			if err := tc.decode(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			if body.Error == nil {
+				t.Fatal("error envelope missing")
+			}
+			if body.Error.Code != 40400 {
+				t.Errorf("body error code = %d, want 40400", body.Error.Code)
+			}
+			if body.Error.StatusCode != http.StatusNotFound {
+				t.Errorf("body error statusCode = %d, want 404", body.Error.StatusCode)
+			}
+		})
+	}
+}
+
 func TestHealthzAndReadyzNoAuth(t *testing.T) {
 	srv, _ := newTestServer(t)
 	for _, path := range []string{"/healthz", "/readyz"} {

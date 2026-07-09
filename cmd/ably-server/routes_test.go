@@ -54,6 +54,26 @@ func TestMuxWebSocketOnlyAtRoot(t *testing.T) {
 		resp.Body.Close()
 	}
 
+	// An unknown path carries the Ably ErrorInfo shape (code 40400) and the
+	// X-Ably-Errorcode header the SDK reads — not a bare 404 (TASK-77).
+	if resp := get("/nonexistent"); resp.Header.Get("X-Ably-Errorcode") != "40400" {
+		resp.Body.Close()
+		t.Errorf("GET /nonexistent X-Ably-Errorcode = %q, want 40400", resp.Header.Get("X-Ably-Errorcode"))
+	} else {
+		resp.Body.Close()
+	}
+
+	// A known path under a non-registered method (GET on the POST-only
+	// requestToken) becomes a 40400 404, not Go's ServeMux 405 (TASK-77).
+	if resp := get("/keys/app.key/requestToken"); resp.StatusCode != http.StatusNotFound ||
+		resp.Header.Get("X-Ably-Errorcode") != "40400" {
+		resp.Body.Close()
+		t.Errorf("GET requestToken = %d / errcode %q, want 404 / 40400",
+			resp.StatusCode, resp.Header.Get("X-Ably-Errorcode"))
+	} else {
+		resp.Body.Close()
+	}
+
 	// The root still routes to the WS upgrader: a non-upgrade GET there is
 	// rejected by the upgrader with 400 and carries WS handshake headers,
 	// which distinguishes "reached the upgrader" from a plain 404.

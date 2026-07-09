@@ -119,7 +119,17 @@ it). `messageId` is the stamped id of the publish's first message —
 `"<batchID>:0"` (§8) — the same id carried on the delivered `MESSAGE`
 frame.
 
-Pagination follows Ably's `Link` header convention (`first`, `next`).
+Pagination follows Ably's `Link` header convention (`first`, `next`), each
+rel emitted as its own `Link` header line with a URL relative to the
+requested resource (its final path segment plus query), matching how Ably
+SDKs resolve continuation links.
+
+An unknown resource — an unrecognised path, or a known path under a method
+Ably treats as a missing resource rather than a method error (e.g. `GET` on
+the `POST`-only `requestToken`) — returns `404` with the Ably error body
+`{"error":{"code":40400,"statusCode":404,"message":...}}` in the `Accept`
+format, alongside the `X-Ably-Errorcode` / `X-Ably-Errormessage` headers
+SDKs read for the code and message.
 
 ## 3. Authentication & authorisation
 

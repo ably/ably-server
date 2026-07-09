@@ -388,6 +388,14 @@ func newMux(rt *realtime.Server, rs *rest.Server, m *metrics.Metrics) *http.Serv
 	rest("GET /healthz", rs.HandleHealthz)
 	rest("GET /readyz", rs.HandleReadyz)
 
+	// Catch-all fallback: any path/method not matched above gets an
+	// Ably-shaped 404 (code 40400) instead of ServeMux's bare 404, and —
+	// since a subtree "/" pattern also matches paths whose only registered
+	// method differs — the 405 Go would otherwise return (e.g. GET on the
+	// POST-only requestToken) becomes the 404 SDKs expect (DESIGN.md §2.2).
+	// "GET /{$}" stays more specific, so the WebSocket root is unaffected.
+	rest("/", rs.HandleNotFound)
+
 	// /metrics is served unauthenticated on the main listener, like
 	// /healthz (DESIGN.md §10). Skipped when no Metrics is configured
 	// (only tests pass nil; production always wires one).
