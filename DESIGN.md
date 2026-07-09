@@ -37,6 +37,30 @@ This document describes how it works, section by section. The task list in
 Each frame is a single `ProtocolMessage`. The server emits `CONNECTED` as
 the first frame after a successful upgrade.
 
+The `CONNECTED` frame carries a `connectionDetails` object alongside the
+top-level `connectionId`, telling the SDK its resolved identity and the
+limits to adopt for the connection:
+
+- `clientId` — the resolved `clientId` (§3.2): a concrete value, `*` for a
+  wildcard bearer, or omitted for an anonymous connection.
+- `connectionKey` — the opaque key an SDK resumes with. Connection-state
+  resume is a non-goal (§1, §11), so it is the process-local
+  `connectionId` and is not recoverable.
+- `maxMessageSize` — `65536` (64 KiB), the largest payload of a single
+  publish; SDKs reject oversize publishes client-side.
+- `maxFrameSize` — `524288` (512 KiB), the largest WebSocket frame / POST
+  body.
+- `maxInboundRate` — `1000`, the advisory per-connection publish ceiling
+  in messages/second.
+- `connectionStateTtl` — `120000` ms, how long an SDK treats the
+  connection state as recoverable after an abrupt disconnect.
+- `maxIdleInterval` — the server heartbeat cadence in milliseconds (the
+  longest the server leaves the server→client direction idle before
+  emitting `HEARTBEAT`).
+
+The limits are advisory: the server publishes them for SDK consumption but
+does not itself enforce them yet.
+
 Supported `Action` values:
 
 | Action | In | Out | Notes |
@@ -842,6 +866,11 @@ should use Ably or fork.
 
 - **connectionId**: 12-char base64 of random 9 bytes, generated on `CONNECTED`.
   Process-local; never persisted, never recoverable.
+- **connectionKey**: the opaque key carried in `CONNECTED`'s
+  `connectionDetails.connectionKey` for an SDK to resume with. Since
+  connection-state resume is a non-goal (§1, §11), it is the
+  `connectionId` — non-recoverable, and clients that present it on
+  reconnect simply start a fresh connection.
 - **clientId**: optional, resolved at auth time per §3.2. The server stamps
   it onto every outbound `Message.clientId` published by this connection,
   and rejects inbound frames that try to set a different value.

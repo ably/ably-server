@@ -38,6 +38,23 @@ type connection struct {
 	entered map[string]map[string]struct{}
 }
 
+// Connection limits advertised in ConnectionDetails on CONNECTED
+// (DESIGN.md §2.1, §8). They are advisory today — the server does not
+// enforce them yet — but SDKs adopt them (e.g. rejecting oversize
+// publishes client-side against maxMessageSize).
+const (
+	// defaultMaxMessageSize is Ably's 64 KiB single-publish payload cap.
+	defaultMaxMessageSize int64 = 65536
+	// defaultMaxFrameSize is Ably's 512 KiB frame / POST-body cap.
+	defaultMaxFrameSize int64 = 524288
+	// defaultMaxInboundRate is the advisory per-connection publish rate
+	// ceiling in messages/second.
+	defaultMaxInboundRate int64 = 1000
+	// defaultConnectionStateTTL is how long an SDK should treat a
+	// dropped connection's state as recoverable (Ably's DF1a default).
+	defaultConnectionStateTTL = 120 * time.Second
+)
+
 // run drives the connection until either side terminates. It returns
 // once both loops have exited.
 func (c *connection) run(ctx context.Context) {
@@ -47,7 +64,11 @@ func (c *connection) run(ctx context.Context) {
 	defer cancel()
 
 	// CONNECTED is the first frame we emit; buffer is empty here.
-	if !c.queue(ctx, &protocol.ProtocolMessage{Action: protocol.ActionConnected, ConnectionID: c.id}) {
+	if !c.queue(ctx, &protocol.ProtocolMessage{
+		Action:            protocol.ActionConnected,
+		ConnectionID:      c.id,
+		ConnectionDetails: c.connectionDetails(),
+	}) {
 		return
 	}
 
@@ -69,6 +90,24 @@ func (c *connection) run(ctx context.Context) {
 
 	cancel()
 	<-writeDone
+}
+
+// connectionDetails builds the ConnectionDetails advertised on CONNECTED
+// (DESIGN.md §2.1, §8): the resolved clientId (omitted when anonymous,
+// "*" for a wildcard bearer), the connectionKey (the opaque, non-resumable
+// connectionId — connection-state resume is a non-goal), the connection
+// limits, and maxIdleInterval aligned to the server heartbeat cadence so
+// the SDK knows how long a quiet server→client direction is expected.
+func (c *connection) connectionDetails() *protocol.ConnectionDetails {
+	return &protocol.ConnectionDetails{
+		ClientID:             c.clientID,
+		ConnectionKey:        c.id,
+		MaxMessageSize:       defaultMaxMessageSize,
+		MaxFrameSize:         defaultMaxFrameSize,
+		MaxInboundRate:       defaultMaxInboundRate,
+		ConnectionStateTTLMs: defaultConnectionStateTTL.Milliseconds(),
+		MaxIdleIntervalMs:    c.heartbeatInterval.Milliseconds(),
+	}
 }
 
 // readLoop decodes inbound frames and dispatches on Action.

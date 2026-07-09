@@ -93,6 +93,42 @@ type ProtocolMessage struct {
 	Presence      []*PresenceMessage `json:"presence,omitempty"      msgpack:"presence,omitempty"`
 	Error         *ErrorInfo         `json:"error,omitempty"         msgpack:"error,omitempty"`
 	Params        map[string]string  `json:"params,omitempty"        msgpack:"params,omitempty"`
+	// ConnectionDetails carries the resolved identity and connection
+	// limits on the CONNECTED frame (DESIGN.md §2.1, §8).
+	ConnectionDetails *ConnectionDetails `json:"connectionDetails,omitempty" msgpack:"connectionDetails,omitempty"`
+}
+
+// ConnectionDetails is sent inside the CONNECTED ProtocolMessage and
+// tells the SDK its resolved identity plus the limits/params it should
+// adopt for this connection (Ably's CD2* / DESIGN.md §2.1, §8). Field
+// names and wire tags match ably-go's connectionDetails so SDKs decode
+// it unchanged. The two duration fields are whole milliseconds on the
+// wire, as ably-go's durationFromMsecs encodes them.
+type ConnectionDetails struct {
+	// ClientID is the connection's resolved clientId (§3.2): a concrete
+	// value, "*" for a wildcard bearer, or omitted for an anonymous
+	// connection.
+	ClientID string `json:"clientId,omitempty" msgpack:"clientId,omitempty"`
+	// ConnectionKey is the opaque key an SDK would resume with. Since
+	// connection-state resume is a non-goal (§1, §11), it is the
+	// process-local connectionId and is not recoverable.
+	ConnectionKey string `json:"connectionKey,omitempty" msgpack:"connectionKey,omitempty"`
+	// MaxMessageSize is the largest permitted payload of a single publish
+	// (bytes). SDKs reject oversize publishes client-side.
+	MaxMessageSize int64 `json:"maxMessageSize,omitempty" msgpack:"maxMessageSize,omitempty"`
+	// MaxFrameSize is the largest permitted WebSocket frame / POST body
+	// (bytes).
+	MaxFrameSize int64 `json:"maxFrameSize,omitempty" msgpack:"maxFrameSize,omitempty"`
+	// MaxInboundRate is the advisory ceiling on messages per second from
+	// this connection.
+	MaxInboundRate int64 `json:"maxInboundRate,omitempty" msgpack:"maxInboundRate,omitempty"`
+	// ConnectionStateTTLMs is how long (ms) an SDK should treat the
+	// connection state as recoverable after an abrupt disconnect (DF1a).
+	ConnectionStateTTLMs int64 `json:"connectionStateTtl,omitempty" msgpack:"connectionStateTtl,omitempty"`
+	// MaxIdleIntervalMs is the maximum time (ms) the server will leave the
+	// server→client direction idle before sending a HEARTBEAT; it equals
+	// the server heartbeat cadence (CD2h).
+	MaxIdleIntervalMs int64 `json:"maxIdleInterval,omitempty" msgpack:"maxIdleInterval,omitempty"`
 }
 
 // PublishResult is one entry in an ACK's Res array (Ably's TR4s): the
