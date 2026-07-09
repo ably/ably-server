@@ -1,9 +1,10 @@
 ---
 id: TASK-54
-title: Append aggregation and incremental delivery (later phase)
+title: Append aggregation and incremental delivery (streamed appends)
 status: To Do
 assignee: []
 created_date: '2026-06-13 14:46'
+updated_date: '2026-07-09 11:07'
 labels:
   - mutable-messages
 dependencies:
@@ -12,6 +13,7 @@ dependencies:
   - TASK-53
 documentation:
   - DESIGN.md
+priority: high
 ordinal: 54000
 ---
 
