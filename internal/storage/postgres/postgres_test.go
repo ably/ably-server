@@ -109,7 +109,7 @@ func TestPostgresMigrateIsConcurrentSafe(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate: %v", err)
 	}
-	want := []string{"0001_initial", "0002_channels_and_serial_mint", "0003_channels_initial_serial", "0004_presence", "0005_mutable_messages", "0006_presence_liveness", "0007_append_versions"}
+	want := []string{"0001_initial", "0002_channels_and_serial_mint", "0003_channels_initial_serial", "0004_presence", "0005_mutable_messages", "0006_presence_liveness", "0007_append_versions", "0008_annotation_summaries"}
 	if !slices.Equal(versions, want) {
 		t.Errorf("schema_migrations rows = %v, want %v", versions, want)
 	}
@@ -287,6 +287,113 @@ func TestPostgresClusterSerialsAreStrictlyMonotonic(t *testing.T) {
 			t.Errorf("history serial %q seen %d times in publish outputs, want 1", cm.ChannelSerial, seen[cm.ChannelSerial])
 		}
 	}
+}
+
+// TestPostgresClusterSummarySnapshotIsCrossNodeDeterministic verifies that
+// the annotation summary snapshot travels with the annotation cm across the
+// NOTIFY path (DESIGN.md §14.2, TASK-66 AC#3): node2, which never computed
+// the fold, reconstructs the identical summary from the cm on its LISTEN
+// load. It also asserts the summary rides the messages projection so a read
+// on node2 returns the current summary.
+func TestPostgresClusterSummarySnapshotIsCrossNodeDeterministic(t *testing.T) {
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	ctx := context.Background()
+
+	s1, err := postgres.Open(ctx, postgres.Options{DSN: dsn})
+	if err != nil {
+		t.Fatalf("Open node1: %v", err)
+	}
+	t.Cleanup(func() { _ = s1.Close() })
+	s2, err := postgres.Open(ctx, postgres.Options{DSN: dsn})
+	if err != nil {
+		t.Fatalf("Open node2: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+
+	a1 := newRecordingAppender()
+	a2 := newRecordingAppender()
+	ch1, err := s1.Channel(ctx, "room", a1)
+	if err != nil {
+		t.Fatalf("Channel node1: %v", err)
+	}
+	ch2, err := s2.Channel(ctx, "room", a2)
+	if err != nil {
+		t.Fatalf("Channel node2: %v", err)
+	}
+
+	// Publish a target message via node1 and let both nodes observe it, so
+	// node2's projection has the target before the annotation lands.
+	target, _, err := ch1.Store(ctx, []*protocol.Message{{ID: "m1", Data: "post"}})
+	if err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	a1.waitAnnotationOrMessage(t, 3*time.Second)
+	a2.waitAnnotationOrMessage(t, 3*time.Second)
+	targetSerial := target.Messages[0].Serial
+
+	// Two annotations from distinct clients on node1: only node1 computes the
+	// fold; node2 must emit the identical snapshots off the cm.
+	for _, client := range []string{"alice", "bob"} {
+		if _, _, err := ch1.StoreAnnotation(ctx, []*protocol.Annotation{{
+			Action: protocol.AnnotationCreate, ClientID: client,
+			Type: "reaction:distinct.v1", Name: "👍", MessageSerial: targetSerial,
+		}}); err != nil {
+			t.Fatalf("StoreAnnotation %s: %v", client, err)
+		}
+	}
+
+	// node2 receives both annotation cms; the second carries the full fold.
+	var n1last, n2last *protocol.Annotation
+	for range 2 {
+		n1last = waitForAnnotation(t, a1, 3*time.Second)
+		n2last = waitForAnnotation(t, a2, 3*time.Second)
+	}
+	if n1last.Summary == nil || n2last.Summary == nil {
+		t.Fatalf("missing snapshot: node1=%#v node2=%#v", n1last.Summary, n2last.Summary)
+	}
+	agg := n2last.Summary["reaction:distinct.v1"]
+	if agg == nil || agg.Values["👍"] == nil || !slices.Equal(agg.Values["👍"].ClientIDs, []string{"alice", "bob"}) {
+		t.Errorf("node2 snapshot = %#v, want 👍:[alice,bob]", n2last.Summary)
+	}
+	if !slices.Equal(agg.Values["👍"].ClientIDs, n1last.Summary["reaction:distinct.v1"].Values["👍"].ClientIDs) {
+		t.Errorf("cross-node snapshot mismatch: node1=%#v node2=%#v", n1last.Summary, n2last.Summary)
+	}
+
+	// The projection carries the current summary for a read on node2.
+	m, err := ch2.LatestVersion(ctx, targetSerial)
+	if err != nil {
+		t.Fatalf("node2 LatestVersion: %v", err)
+	}
+	got := m.Summary["reaction:distinct.v1"]
+	if got == nil || got.Values["👍"] == nil || !slices.Equal(got.Values["👍"].ClientIDs, []string{"alice", "bob"}) {
+		t.Errorf("node2 projection summary = %#v, want 👍:[alice,bob]", m.Summary)
+	}
+}
+
+// waitForAnnotation drains the appender until an annotation cm arrives and
+// returns its first annotation.
+func waitForAnnotation(t *testing.T, a *recordingAppender, timeout time.Duration) *protocol.Annotation {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case cm := <-a.got:
+			if len(cm.Annotations) > 0 {
+				return cm.Annotations[0]
+			}
+		case <-deadline:
+			t.Fatalf("no annotation cm within %s", timeout)
+			return nil
+		}
+	}
+}
+
+// waitAnnotationOrMessage drains one cm of any kind (used to synchronise on
+// the target message's cross-node delivery).
+func (a *recordingAppender) waitAnnotationOrMessage(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	a.wait(t, timeout)
 }
 
 // recordingAppender captures every cm passed to Append, exposing

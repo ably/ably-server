@@ -495,15 +495,17 @@ func (s *Storage) loadChannelMessage(ctx context.Context, channel, channelSerial
 }
 
 const sqlLoadCM = `
-SELECT idx, kind, payload FROM channel_messages
+SELECT idx, kind, payload, summary FROM channel_messages
 WHERE channel = $1 AND channel_serial = $2
 ORDER BY idx
 `
 
 // decodeChannelMessageRows materialises a ChannelMessage from a rows
-// result of (idx, kind, payload). All rows of a cm share a kind; a
-// presence cm decodes into Presence, a message cm into Messages. Closes
-// rows on exit.
+// result of (idx, kind, payload, summary). All rows of a cm share a kind; a
+// presence cm decodes into Presence, a message cm into Messages, an
+// annotation cm into Annotations — the latter with its post-fold summary
+// snapshot reconstructed from the summary column so the delivery path has it
+// (DESIGN.md §14.2). Closes rows on exit.
 func decodeChannelMessageRows(rows pgx.Rows, queryErr error, channel, channelSerial string) (*protocol.ChannelMessage, error) {
 	if queryErr != nil {
 		return nil, fmt.Errorf("storage/postgres: load %s:%s: %w", channel, channelSerial, queryErr)
@@ -516,8 +518,9 @@ func decodeChannelMessageRows(rows pgx.Rows, queryErr error, channel, channelSer
 			idx     int
 			kind    string
 			payload []byte
+			summary []byte
 		)
-		if err := rows.Scan(&idx, &kind, &payload); err != nil {
+		if err := rows.Scan(&idx, &kind, &payload, &summary); err != nil {
 			return nil, fmt.Errorf("storage/postgres: scan %s:%s: %w", channel, channelSerial, err)
 		}
 		if kind == string(storage.KindPresence) {
@@ -532,6 +535,11 @@ func decodeChannelMessageRows(rows pgx.Rows, queryErr error, channel, channelSer
 			var a protocol.Annotation
 			if err := msgpack.Unmarshal(payload, &a); err != nil {
 				return nil, fmt.Errorf("storage/postgres: decode annotation payload %s:%s idx=%d: %w", channel, channelSerial, idx, err)
+			}
+			if len(summary) > 0 {
+				if err := msgpack.Unmarshal(summary, &a.Summary); err != nil {
+					return nil, fmt.Errorf("storage/postgres: decode annotation summary %s:%s idx=%d: %w", channel, channelSerial, idx, err)
+				}
 			}
 			cm.Annotations = append(cm.Annotations, &a)
 			continue
@@ -1329,6 +1337,15 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		if err != nil {
 			return nil, false, fmt.Errorf("storage/postgres: encode annotation %d: %w", i, err)
 		}
+		// Fold the annotation into its target's summary projection and encode
+		// the post-fold snapshot, atomically within this tx (DESIGN.md §14.2).
+		// The snapshot rides the summary column (never the annotation payload,
+		// which stays a raw annotation) so a remote node reconstructs the
+		// exact delivery summary from the cm on its LISTEN load.
+		summaryBlob, err := cs.foldSummaryTx(ctx, tx, a)
+		if err != nil {
+			return nil, false, err
+		}
 		var idArg any
 		if a.ID != "" {
 			idArg = a.ID
@@ -1337,9 +1354,9 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		// channel_messages_serial_idx serves the annotations-for-message
 		// scan (DESIGN.md §14.4).
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload, message_serial)
-			 VALUES ($1, $2, $3, $4, 'annotation', $5, $6)`,
-			cs.name, channelSerial, i, idArg, payload, a.MessageSerial,
+			`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload, message_serial, summary)
+			 VALUES ($1, $2, $3, $4, 'annotation', $5, $6, $7)`,
+			cs.name, channelSerial, i, idArg, payload, a.MessageSerial, summaryBlob,
 		); err != nil {
 			return nil, false, fmt.Errorf("storage/postgres: insert annotation %d: %w", i, err)
 		}
@@ -1357,6 +1374,47 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
 	}
 	return cm, false, nil
+}
+
+// foldSummaryTx folds one annotation into its target message's summary on
+// the messages projection and returns the msgpack-encoded post-fold snapshot
+// for the annotation's summary column (DESIGN.md §14.2). It runs inside the
+// StoreAnnotation tx with the target already validated to exist: it reads the
+// projection payload, folds, writes the merged Message back (so message reads
+// carry the current summary), and also stamps the snapshot onto the in-memory
+// annotation for the publisher-node delivery path.
+func (cs *channelStore) foldSummaryTx(ctx context.Context, tx pgx.Tx, a *protocol.Annotation) ([]byte, error) {
+	var payload []byte
+	if err := tx.QueryRow(ctx,
+		`SELECT payload FROM messages WHERE channel = $1 AND message_serial = $2`,
+		cs.name, a.MessageSerial,
+	).Scan(&payload); err != nil {
+		return nil, fmt.Errorf("storage/postgres: load projection for summary fold: %w", err)
+	}
+	var m protocol.Message
+	if err := msgpack.Unmarshal(payload, &m); err != nil {
+		return nil, fmt.Errorf("storage/postgres: decode projection for summary fold: %w", err)
+	}
+	m.Summary = m.Summary.Apply(a)
+	merged, err := msgpack.Marshal(&m)
+	if err != nil {
+		return nil, fmt.Errorf("storage/postgres: encode projection after summary fold: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE messages SET payload = $3 WHERE channel = $1 AND message_serial = $2`,
+		cs.name, a.MessageSerial, merged,
+	); err != nil {
+		return nil, fmt.Errorf("storage/postgres: update projection after summary fold: %w", err)
+	}
+	a.Summary = m.Summary.Clone()
+	if m.Summary == nil {
+		return nil, nil
+	}
+	summaryBlob, err := msgpack.Marshal(m.Summary)
+	if err != nil {
+		return nil, fmt.Errorf("storage/postgres: encode summary snapshot: %w", err)
+	}
+	return summaryBlob, nil
 }
 
 // Annotations returns the annotations attached to messageSerial in stream

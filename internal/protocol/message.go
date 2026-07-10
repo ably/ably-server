@@ -31,6 +31,12 @@ type Message struct {
 	Encoding     string          `json:"encoding,omitempty"     msgpack:"encoding,omitempty"`
 	Timestamp    int64           `json:"timestamp,omitempty"    msgpack:"timestamp,omitempty"`
 	Version      *MessageVersion `json:"version,omitempty"      msgpack:"version,omitempty"`
+	// Summary is the fold of this message's annotations (DESIGN.md §14.2),
+	// keyed by annotation type. It rides the latest-version projection so
+	// message reads (GET .../messages, .../messages/{serial}, history)
+	// carry the current summary, and it is the payload of the outbound
+	// MESSAGE/summary (action 4) delivery frame.
+	Summary Summary `json:"summary,omitempty" msgpack:"summary,omitempty"`
 	// Alt carries alternative in-band representations of this message,
 	// keyed by role (DESIGN.md §13.3). Its sole current use is the
 	// append delta: an append is persisted and fanned out as a full

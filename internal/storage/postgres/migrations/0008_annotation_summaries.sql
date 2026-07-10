@@ -1,0 +1,13 @@
+-- Annotation summaries (DESIGN.md §14.2). The per-message summary is
+-- folded transactionally at store time and stamped onto the annotation cm,
+-- so every node — including ones that never witnessed earlier annotations —
+-- delivers the identical summary from the cm itself, not by recomputing.
+--
+-- summary holds the msgpack-encoded post-fold summary SNAPSHOT for an
+-- annotation row (the fold of the target message's annotations as of that
+-- annotation). It is written only on kind = 'annotation' rows and is read
+-- back on the LISTEN load so a remote node's delivery path has the snapshot
+-- in hand. The current summary for message reads lives instead on the
+-- messages projection payload (a Message carries its summary), so this
+-- column is purely the cross-node delivery carrier.
+ALTER TABLE channel_messages ADD COLUMN summary BYTEA;

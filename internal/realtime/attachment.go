@@ -269,9 +269,31 @@ func (a *attachment) forward(cm *protocol.ChannelMessage, backlog bool) bool {
 		})
 	}
 	if len(cm.Annotations) > 0 {
-		// Raw annotation frames go only to attachments holding
-		// ANNOTATION_SUBSCRIBE (DESIGN.md §14.3); all others skip them, the
-		// way a SUBSCRIBE-only attachment skips presence.
+		// An annotation cm fans out two ways (DESIGN.md §14.3), both derived
+		// from this one cm so cluster nodes deliver identically:
+		//   - SUBSCRIBE: a MESSAGE with action summary (4) per annotation,
+		//     carrying the target's unchanged serial and the post-fold
+		//     snapshot the backend stamped on the annotation — this is how a
+		//     subscriber that knows nothing about annotations sees reactions
+		//     accumulate;
+		//   - ANNOTATION_SUBSCRIBE: the raw ANNOTATION frame, as today.
+		// A dual-mode attachment gets both.
+		if a.hasMode(protocol.FlagSubscribe) {
+			for _, an := range cm.Annotations {
+				if !a.send(&protocol.ProtocolMessage{
+					Action:        protocol.ActionMessage,
+					Channel:       a.channelName,
+					ChannelSerial: cm.ChannelSerial,
+					Messages: []*protocol.Message{{
+						Action:  protocol.MessageSummary,
+						Serial:  an.MessageSerial,
+						Summary: an.Summary,
+					}},
+				}) {
+					return false
+				}
+			}
+		}
 		if !a.hasMode(protocol.FlagAnnotationSubscribe) {
 			return true
 		}

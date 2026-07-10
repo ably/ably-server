@@ -601,6 +601,15 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		channelSerial := cs.gen.Mint()
 		for i, a := range annotations {
 			a.Serial = serial.MessageSerial(channelSerial, i)
+			// Fold the annotation into its target's summary projection (the
+			// latest bucket) and stamp the post-fold snapshot onto the
+			// annotation for delivery, atomically within this write tx
+			// (DESIGN.md §14.2). a.Summary is msgpack:"-", so it is not
+			// persisted in the cm/annotation blobs below — it rides only the
+			// in-memory resultCM to the appender.
+			if err := foldSummaryTx(latest, cs.name, a); err != nil {
+				return err
+			}
 		}
 		cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Annotations: annotations}
 		blob, err := msgpack.Marshal(cm)
@@ -636,6 +645,33 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		cs.appender.Append(resultCM)
 	}
 	return resultCM, idempotent, nil
+}
+
+// foldSummaryTx folds one annotation into its target message's summary on
+// the latest-version projection (the latest bucket) and stamps the post-fold
+// snapshot onto the annotation for delivery (DESIGN.md §14.2). It runs inside
+// the StoreAnnotation write tx with the target already validated to exist, so
+// the summary persists on the projection payload (message reads carry it) and
+// the snapshot rides the in-memory annotation to the appender.
+func foldSummaryTx(latest *bolt.Bucket, channel string, a *protocol.Annotation) error {
+	blob := latest.Get(channelKey(channel, a.MessageSerial))
+	if blob == nil {
+		return nil
+	}
+	var m protocol.Message
+	if err := msgpack.Unmarshal(blob, &m); err != nil {
+		return fmt.Errorf("storage/bbolt: decode projection for summary fold: %w", err)
+	}
+	m.Summary = m.Summary.Apply(a)
+	updated, err := msgpack.Marshal(&m)
+	if err != nil {
+		return fmt.Errorf("storage/bbolt: encode projection after summary fold: %w", err)
+	}
+	if err := latest.Put(channelKey(channel, a.MessageSerial), updated); err != nil {
+		return err
+	}
+	a.Summary = m.Summary.Clone()
+	return nil
 }
 
 // Annotations returns the annotations attached to messageSerial in stream

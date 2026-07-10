@@ -1696,17 +1696,22 @@ respectively (§3.1). When `ATTACH.flags` carries no mode bits, the
 default set does **not** include the annotation modes (matching SDK
 defaults); clients opt in via modes or channel params.
 
-Raw `ANNOTATION` frames are a **live** delivery: the attachment cursor
-walks every cm on the stream and forwards each annotation cm to
-`ANNOTATION_SUBSCRIBE` attachments in stream order. The resume gap
-replay (§4.3) is a `kind = message` history scan, so — exactly as it
-skips presence — it skips raw annotation cms; a resuming subscriber
-re-reads raw annotations via the REST endpoint (§14.4). The **summary**,
-by contrast, is an ordinary message cm and *is* gap-replayed, so a
-resuming subscriber still converges on the newest summary. History
-*reads* do not enumerate annotation cms — they return messages whose
-embedded `summary` is current (§14.4) — and a `kind = message` history
-scan skips annotation cms exactly as it skips presence.
+Both frames are a **live** delivery derived from the one annotation cm as
+the attachment cursor walks it: the raw `ANNOTATION` goes to
+`ANNOTATION_SUBSCRIBE` attachments, and the summary `MESSAGE` — built from
+the snapshot the cm carries, never recomputed — to `SUBSCRIBE` ones. The
+summary is not a separate persisted cm; it exists only on the projection
+row (for reads) and as the snapshot stamped on the annotation cm (for
+delivery). The resume gap replay (§4.3) is a `kind = message` history
+scan, so — exactly as it skips presence — it skips annotation cms
+entirely; neither the raw annotation nor its derived summary is replayed
+as a frame. A resuming subscriber re-reads raw annotations via the REST
+endpoint (§14.4) and reconverges on the current summary through the
+projection-backed message reads (§14.4) — the newest summary always rides
+the latest version of its message — and via any subsequent live
+annotation. History *reads* do not enumerate annotation cms: they return
+messages whose embedded `summary` is current, and a `kind = message`
+history scan skips annotation cms exactly as it skips presence.
 
 ### 14.4 Reads
 

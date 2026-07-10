@@ -79,6 +79,44 @@ func TestPublishAndListAnnotationsJSON(t *testing.T) {
 	}
 }
 
+// TestMessageReadCarriesSummary: after annotating a message, GET
+// .../messages/{serial} returns the message with its current folded summary
+// on the projection (DESIGN.md §14.4, TASK-66 AC#2).
+func TestMessageReadCarriesSummary(t *testing.T) {
+	srv, _ := newTestServer(t)
+	target := publishOne(t, srv, "foo", &protocol.Message{Name: "post", Data: "hello"})
+
+	for _, name := range []string{"👍", "👍", "👎"} {
+		body, _ := json.Marshal(&protocol.Annotation{
+			Action: protocol.AnnotationCreate, ClientID: "alice", Type: "reaction:distinct.v1", Name: name,
+		})
+		// distinct.v1 requires an identified client, so publish with a token
+		// via basic auth (the REST publish resolves clientId from the body).
+		resp := request(t, srv, http.MethodPost, annotationsURL("foo", target), "application/json", body, true)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("publish annotation %q status = %d, want 201", name, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+
+	mr := request(t, srv, http.MethodGet, "/channels/foo/messages/"+target, "", nil, true)
+	if mr.StatusCode != http.StatusOK {
+		t.Fatalf("GET message status = %d, want 200", mr.StatusCode)
+	}
+	var m protocol.Message
+	decodeJSON(t, mr, &m)
+	agg := m.Summary["reaction:distinct.v1"]
+	if agg == nil {
+		t.Fatalf("message read missing summary: %#v", m.Summary)
+	}
+	if agg.Values["👍"] == nil || agg.Values["👍"].Total != 1 {
+		t.Errorf("👍 summary = %#v, want total 1 (one distinct client)", agg.Values["👍"])
+	}
+	if agg.Values["👎"] == nil || agg.Values["👎"].Total != 1 {
+		t.Errorf("👎 summary = %#v, want total 1", agg.Values["👎"])
+	}
+}
+
 // TestPublishAndListAnnotationsMsgpack round-trips via msgpack (AC#3).
 func TestPublishAndListAnnotationsMsgpack(t *testing.T) {
 	srv, _ := newTestServer(t)

@@ -56,9 +56,12 @@ func TestAnnotationDeliveredToSubscriber(t *testing.T) {
 	attach(t, pub, "room", protocol.FlagPublish|protocol.FlagAnnotationPublish)
 	target := publishMessageForTarget(t, pub, "room", 1)
 
+	// ANNOTATION_SUBSCRIBE only — this isolates the raw ANNOTATION frame
+	// (a dual-mode subscriber would also get a summary MESSAGE; covered by
+	// TestDualModeSubscriberGetsSummaryAndRawAnnotation).
 	sub := dialClient(t, srv, "bob")
 	drainConnected(t, sub)
-	attach(t, sub, "room", protocol.FlagSubscribe|protocol.FlagAnnotationSubscribe)
+	attach(t, sub, "room", protocol.FlagAnnotationSubscribe)
 
 	sendAnnotation(t, pub, "room", target, 2)
 	if ack := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {
@@ -125,10 +128,11 @@ func TestAnnotationNackUnknownTarget(t *testing.T) {
 	}
 }
 
-// TestAnnotationNotDeliveredWithoutSubscribeMode: a subscriber without
-// ANNOTATION_SUBSCRIBE never sees ANNOTATION frames; a subsequent ordinary
-// message arrives first, proving the annotation was skipped (TASK-64 AC#2).
-func TestAnnotationNotDeliveredWithoutSubscribeMode(t *testing.T) {
+// TestSubscribeModeGetsSummaryNotRawAnnotation: a subscriber holding only
+// SUBSCRIBE never sees a raw ANNOTATION frame — instead it receives the
+// annotation as a MESSAGE with action summary (4) carrying the target's
+// unchanged serial and the folded summary (DESIGN.md §14.3, TASK-66 AC#1,#5).
+func TestSubscribeModeGetsSummaryNotRawAnnotation(t *testing.T) {
 	srv, _ := newTestServer(t, time.Hour)
 
 	pub := dialClient(t, srv, "alice")
@@ -145,22 +149,61 @@ func TestAnnotationNotDeliveredWithoutSubscribeMode(t *testing.T) {
 	if ack := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {
 		t.Fatalf("annotation ACK = %v", ack.Action)
 	}
-	// Now publish an ordinary message; the subscriber's first frame must be
-	// that MESSAGE, not the earlier ANNOTATION.
-	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
-		Action:    protocol.ActionMessage,
-		Channel:   "room",
-		MsgSerial: 3,
-		Messages:  []*protocol.Message{{Data: "after"}},
-	})
-	if ack := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {
-		t.Fatalf("message ACK = %v", ack.Action)
-	}
+
 	got := readFrame(t, sub, protocol.FormatJSON, 2*time.Second)
 	if got.Action != protocol.ActionMessage {
-		t.Fatalf("subscriber first frame = %v, want MESSAGE (annotation must be skipped)", got.Action)
+		t.Fatalf("subscriber frame = %v, want MESSAGE (summary), never a raw ANNOTATION", got.Action)
 	}
-	if len(got.Messages) == 0 || got.Messages[0].Data != "after" {
-		t.Errorf("subscriber got %+v, want the 'after' message", got.Messages)
+	if len(got.Messages) != 1 {
+		t.Fatalf("summary frame carried %d messages, want 1", len(got.Messages))
+	}
+	m := got.Messages[0]
+	if m.Action != protocol.MessageSummary {
+		t.Errorf("message action = %v, want summary (4)", m.Action)
+	}
+	if m.Serial != target {
+		t.Errorf("summary serial = %q, want target %q (unchanged)", m.Serial, target)
+	}
+	agg := m.Summary["reaction:multiple.v1"]
+	if agg == nil || agg.Counts["👍"] == nil || agg.Counts["👍"].Total != 1 {
+		t.Errorf("summary = %#v, want reaction:multiple.v1 👍 total 1", m.Summary)
+	}
+	if agg != nil && agg.Counts["👍"] != nil && agg.Counts["👍"].ClientIDs["alice"] != 1 {
+		t.Errorf("summary clientIds = %#v, want alice:1", agg.Counts["👍"].ClientIDs)
+	}
+}
+
+// TestDualModeSubscriberGetsSummaryAndRawAnnotation: an attachment holding
+// both SUBSCRIBE and ANNOTATION_SUBSCRIBE receives both frames from one
+// annotation — the summary MESSAGE and the raw ANNOTATION (DESIGN.md §14.3).
+func TestDualModeSubscriberGetsSummaryAndRawAnnotation(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+
+	pub := dialClient(t, srv, "alice")
+	drainConnected(t, pub)
+	attach(t, pub, "room", protocol.FlagPublish|protocol.FlagAnnotationPublish)
+	target := publishMessageForTarget(t, pub, "room", 1)
+
+	sub := dialClient(t, srv, "bob")
+	drainConnected(t, sub)
+	attach(t, sub, "room", protocol.FlagSubscribe|protocol.FlagAnnotationSubscribe)
+
+	sendAnnotation(t, pub, "room", target, 2)
+	if ack := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {
+		t.Fatalf("annotation ACK = %v", ack.Action)
+	}
+
+	// The summary MESSAGE is sent before the raw ANNOTATION (forward order).
+	first := readFrame(t, sub, protocol.FormatJSON, 2*time.Second)
+	if first.Action != protocol.ActionMessage || len(first.Messages) != 1 || first.Messages[0].Action != protocol.MessageSummary {
+		t.Fatalf("first frame = %+v, want a summary MESSAGE", first)
+	}
+	second := readFrame(t, sub, protocol.FormatJSON, 2*time.Second)
+	if second.Action != protocol.ActionAnnotation || len(second.Annotations) != 1 {
+		t.Fatalf("second frame = %+v, want a raw ANNOTATION", second)
+	}
+	// The raw annotation must NOT leak the server-internal summary snapshot.
+	if second.Annotations[0].Summary != nil {
+		t.Errorf("raw ANNOTATION leaked summary snapshot: %#v", second.Annotations[0].Summary)
 	}
 }

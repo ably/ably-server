@@ -323,6 +323,11 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 	channelSerial := cs.gen.Mint()
 	for i, a := range annotations {
 		a.Serial = serial.MessageSerial(channelSerial, i)
+		// Fold the annotation into its target's summary projection and stamp
+		// the post-fold snapshot onto the annotation for delivery (DESIGN.md
+		// §14.2). Both happen under the channel mutex, atomically with the
+		// log write, exactly like the presence membership fold.
+		cs.foldSummary(a)
 	}
 	cm := &protocol.ChannelMessage{
 		ChannelSerial: channelSerial,
@@ -342,6 +347,25 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		cs.appender.Append(cm)
 	}
 	return cm, false, nil
+}
+
+// foldSummary folds one annotation into its target message's summary on the
+// latest-version projection and stamps the post-fold snapshot onto the
+// annotation for delivery (DESIGN.md §14.2). It runs under cs.mu with the
+// target already validated to exist. The projection Message is replaced by a
+// shallow copy carrying the new summary so a reader holding the prior
+// pointer is unaffected, and the annotation's snapshot is a clone so a later
+// fold in the same batch cannot disturb it.
+func (cs *channelStore) foldSummary(a *protocol.Annotation) {
+	cur := cs.latest[a.MessageSerial]
+	if cur == nil {
+		return
+	}
+	folded := cur.Summary.Apply(a)
+	updated := *cur
+	updated.Summary = folded
+	cs.latest[a.MessageSerial] = &updated
+	a.Summary = folded.Clone()
 }
 
 // Annotations returns the annotations attached to messageSerial in stream

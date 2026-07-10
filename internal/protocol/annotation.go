@@ -58,6 +58,16 @@ type Annotation struct {
 	Data          any              `json:"data,omitempty"          msgpack:"data,omitempty"`
 	Encoding      string           `json:"encoding,omitempty"      msgpack:"encoding,omitempty"`
 	Timestamp     int64            `json:"timestamp,omitempty"     msgpack:"timestamp,omitempty"`
+	// Summary is the post-fold summary snapshot of this annotation's target
+	// message, stamped by StoreAnnotation for the MESSAGE/summary (action 4)
+	// delivery frame (DESIGN.md §14.2, §14.3). It is server-internal: never
+	// encoded to a client and never part of the persisted annotation
+	// payload (excluded from both json and msgpack). On the single-process
+	// backends it rides the in-memory cm to the appender; on the Postgres
+	// cluster path it is persisted in a dedicated channel_messages.summary
+	// column and reconstructed here on the LISTEN load, so a node that never
+	// witnessed earlier annotations emits the identical summary.
+	Summary Summary `json:"-" msgpack:"-"`
 }
 
 // AnnotationAggregations is the set of v1 summarisation methods an

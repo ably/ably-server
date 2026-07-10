@@ -59,9 +59,10 @@ func (a Action) String() string {
 // analogue of PresenceAction. Values are pinned to Ably's MessageAction
 // wire enum (ably-go's constants): a create is the default original
 // publish; update/delete/append are mutations of an existing message
-// (DESIGN.md §13.1). The values summary (3), meta (4) and others Ably
-// defines for object messages / annotations are intentionally omitted —
-// this server only models the mutable-message subset.
+// (DESIGN.md §13.1); summary (4) is the server-generated annotation
+// summary delivery (DESIGN.md §14.3). The value meta (3) and others Ably
+// defines for object messages are intentionally omitted — this server only
+// models the mutable-message and summary subset.
 type MessageAction int8
 
 const (
@@ -75,16 +76,22 @@ const (
 	// MessageDelete soft-deletes an existing message — a tombstone
 	// version (DESIGN.md §13.2).
 	MessageDelete MessageAction = 2
+	// MessageSummary is a server-generated annotation summary delivered to
+	// ordinary SUBSCRIBE attachments (DESIGN.md §14.3): a MESSAGE carrying
+	// the target message's unchanged serial and the fold of its
+	// annotations. Pinned to Ably's value 4.
+	MessageSummary MessageAction = 4
 	// MessageAppend concatenates onto an existing message's data
 	// (DESIGN.md §13.3). Pinned to Ably's value 5.
 	MessageAppend MessageAction = 5
 )
 
 var messageActionNames = map[MessageAction]string{
-	MessageCreate: "create",
-	MessageUpdate: "update",
-	MessageDelete: "delete",
-	MessageAppend: "append",
+	MessageCreate:  "create",
+	MessageUpdate:  "update",
+	MessageDelete:  "delete",
+	MessageSummary: "summary",
+	MessageAppend:  "append",
 }
 
 func (a MessageAction) String() string {

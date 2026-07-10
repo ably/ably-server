@@ -1545,6 +1545,117 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 		}
 	})
 
+	t.Run("SummaryFoldStampedOnCmAndProjection", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		target := mustCreate(t, ch, &protocol.Message{Data: "post", ClientID: "alice"})
+
+		// A create folds and stamps the snapshot on the returned cm.
+		cm, _, err := ch.StoreAnnotation(context.Background(), []*protocol.Annotation{
+			{Action: protocol.AnnotationCreate, ClientID: "bob", Type: "reaction:distinct.v1", Name: "👍", MessageSerial: target.Serial},
+		})
+		if err != nil {
+			t.Fatalf("StoreAnnotation: %v", err)
+		}
+		got := cm.Annotations[0].Summary
+		wantList := func(sum protocol.Summary, val string, clients ...string) bool {
+			agg := sum["reaction:distinct.v1"]
+			if agg == nil || agg.Values[val] == nil {
+				return false
+			}
+			return equalStrings(agg.Values[val].ClientIDs, clients) && agg.Values[val].Total == len(clients)
+		}
+		if !wantList(got, "👍", "bob") {
+			t.Fatalf("stamped snapshot = %#v, want 👍:[bob]", got)
+		}
+
+		// The projection carries the current summary for message reads.
+		latest, err := ch.LatestVersion(context.Background(), target.Serial)
+		if err != nil {
+			t.Fatalf("LatestVersion: %v", err)
+		}
+		if !wantList(latest.Summary, "👍", "bob") {
+			t.Errorf("projection summary = %#v, want 👍:[bob]", latest.Summary)
+		}
+
+		// A second client accumulates; reads reflect the latest summary.
+		if _, _, err := ch.StoreAnnotation(context.Background(), []*protocol.Annotation{
+			{Action: protocol.AnnotationCreate, ClientID: "carol", Type: "reaction:distinct.v1", Name: "👍", MessageSerial: target.Serial},
+		}); err != nil {
+			t.Fatalf("StoreAnnotation 2: %v", err)
+		}
+		latest, _ = ch.LatestVersion(context.Background(), target.Serial)
+		if !wantList(latest.Summary, "👍", "bob", "carol") {
+			t.Errorf("projection summary after 2nd = %#v, want 👍:[bob,carol]", latest.Summary)
+		}
+
+		// Collapsed message history carries the summary too.
+		col, err := ch.History(context.Background(), storage.HistoryQuery{Direction: storage.DirectionForwards, Collapse: true})
+		if err != nil {
+			t.Fatalf("collapsed History: %v", err)
+		}
+		if len(col.ChannelMessages) != 1 || len(col.ChannelMessages[0].Messages) != 1 {
+			t.Fatalf("collapsed cms = %d, want 1", len(col.ChannelMessages))
+		}
+		if !wantList(col.ChannelMessages[0].Messages[0].Summary, "👍", "bob", "carol") {
+			t.Errorf("history summary = %#v, want 👍:[bob,carol]", col.ChannelMessages[0].Messages[0].Summary)
+		}
+	})
+
+	t.Run("SummaryFoldSnapshotsAreIndependentInBatch", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		target := mustCreate(t, ch, &protocol.Message{Data: "post", ClientID: "alice"})
+
+		// Two creates in one batch on the same target: each annotation's
+		// stamped snapshot must reflect the fold as of THAT annotation, not
+		// the final state (DESIGN.md §14.2).
+		cm, _, err := ch.StoreAnnotation(context.Background(), []*protocol.Annotation{
+			{Action: protocol.AnnotationCreate, ClientID: "bob", Type: "reaction:total.v1", MessageSerial: target.Serial},
+			{Action: protocol.AnnotationCreate, ClientID: "carol", Type: "reaction:total.v1", MessageSerial: target.Serial},
+		})
+		if err != nil {
+			t.Fatalf("StoreAnnotation batch: %v", err)
+		}
+		total := func(a *protocol.Annotation) int {
+			agg := a.Summary["reaction:total.v1"]
+			if agg == nil || agg.Total == nil {
+				return -1
+			}
+			return agg.Total.Total
+		}
+		if got := total(cm.Annotations[0]); got != 1 {
+			t.Errorf("first annotation snapshot total = %d, want 1", got)
+		}
+		if got := total(cm.Annotations[1]); got != 2 {
+			t.Errorf("second annotation snapshot total = %d, want 2", got)
+		}
+	})
+
+	t.Run("SummaryFoldDeleteRemovesContribution", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		target := mustCreate(t, ch, &protocol.Message{Data: "post", ClientID: "alice"})
+
+		for _, a := range []*protocol.Annotation{
+			{Action: protocol.AnnotationCreate, ClientID: "bob", Type: "reaction:distinct.v1", Name: "👍", MessageSerial: target.Serial},
+			{Action: protocol.AnnotationCreate, ClientID: "carol", Type: "reaction:distinct.v1", Name: "👍", MessageSerial: target.Serial},
+			{Action: protocol.AnnotationDelete, ClientID: "bob", Type: "reaction:distinct.v1", Name: "👍", MessageSerial: target.Serial},
+		} {
+			if _, _, err := ch.StoreAnnotation(context.Background(), []*protocol.Annotation{a}); err != nil {
+				t.Fatalf("StoreAnnotation: %v", err)
+			}
+		}
+		latest, err := ch.LatestVersion(context.Background(), target.Serial)
+		if err != nil {
+			t.Fatalf("LatestVersion: %v", err)
+		}
+		agg := latest.Summary["reaction:distinct.v1"]
+		if agg == nil || agg.Values["👍"] == nil || !equalStrings(agg.Values["👍"].ClientIDs, []string{"carol"}) {
+			t.Errorf("after delete summary = %#v, want 👍:[carol]", latest.Summary)
+		}
+	})
+
 	t.Run("CollapsedDeletedShowsAsTombstone", func(t *testing.T) {
 		s := f(t)
 		ch := mustChannel(t, s, "foo")
