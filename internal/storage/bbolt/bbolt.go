@@ -61,6 +61,14 @@ var (
 	// a seed at the current wall-clock time, AFTER existing pre-restart
 	// cms.
 	initialsBucket = []byte("initials")
+	// annotationsBucket is the annotations-for-message index (DESIGN.md
+	// §14.4): keyed "<channel>\0<target>\0<annotationSerial>", value the
+	// msgpack-encoded protocol.Annotation. A prefix scan over
+	// "<channel>\0<target>\0" yields a message's annotations in stream
+	// order — the bbolt analogue of the postgres channel_messages serial
+	// index. The annotation cms also live in channel_messages so they flow
+	// through the appender and are kind-skipped by message/presence history.
+	annotationsBucket = []byte("annotations")
 )
 
 // keySep separates the channel name from the rest of a composite key.
@@ -112,6 +120,9 @@ func Open(opts Options) (*Storage, error) {
 			return err
 		}
 		if _, err := tx.CreateBucketIfNotExists(versionsBucket); err != nil {
+			return err
+		}
+		if _, err := tx.CreateBucketIfNotExists(annotationsBucket); err != nil {
 			return err
 		}
 		return nil
@@ -520,6 +531,139 @@ func (cs *channelStore) Versions(ctx context.Context, serial string, q storage.H
 	// Collapse append runs so history reflects the aggregate, not each
 	// delta (DESIGN.md §13.3, §13.4); the log keeps every append cm.
 	return storage.PaginateVersions(storage.CollapseAppendVersions(all), q), nil
+}
+
+// annotationKey returns the annotations-bucket key for one annotation of a
+// message: "<channel>\0<target>\0<annotationSerial>". Shares the composite
+// layout of versionKey; a prefix scan over annotationPrefix(channel,
+// target) yields a message's annotations in stream order.
+func annotationKey(channel, target, annotationSerial string) []byte {
+	return versionKey(channel, target, annotationSerial)
+}
+
+// annotationPrefix returns "<channel>\0<target>\0" — the lex bound for a
+// message's annotation range scan.
+func annotationPrefix(channel, target string) []byte {
+	return versionPrefix(channel, target)
+}
+
+// StoreAnnotation persists an annotation publish onto the channel_messages
+// log (kind = annotation) and indexes each annotation under its target in
+// the annotations bucket for annotations-for-message reads (DESIGN.md
+// §14.1, §14.4). Every target must resolve in the latest-version
+// projection (ErrTargetNotFound otherwise, like a mutation). Idempotency
+// shares the ids bucket with messages/presence. The appender fires after
+// commit, like Store. The returned cm is the TASK-66 summary-fold seam.
+func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*protocol.Annotation) (*protocol.ChannelMessage, bool, error) {
+	if len(annotations) == 0 {
+		return nil, false, errors.New("storage/bbolt: StoreAnnotation with no annotations")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+
+	var (
+		resultCM   *protocol.ChannelMessage
+		idempotent bool
+	)
+	err := cs.db.Update(func(tx *bolt.Tx) error {
+		messages := tx.Bucket(channelMessagesBucket)
+		ids := tx.Bucket(idsBucket)
+
+		for _, a := range annotations {
+			if a.ID == "" {
+				continue
+			}
+			if existingCS := ids.Get(channelKey(cs.name, a.ID)); existingCS != nil {
+				blob := messages.Get(channelKey(cs.name, string(existingCS)))
+				if blob == nil {
+					return fmt.Errorf("storage/bbolt: id index points to missing ChannelMessage %q", existingCS)
+				}
+				var original protocol.ChannelMessage
+				if err := msgpack.Unmarshal(blob, &original); err != nil {
+					return fmt.Errorf("storage/bbolt: decode original ChannelMessage: %w", err)
+				}
+				resultCM = &original
+				idempotent = true
+				return nil
+			}
+		}
+
+		// Target existence: every annotation must reference a message that
+		// resolves in the latest-version projection (DESIGN.md §14.1).
+		latest := tx.Bucket(latestBucket)
+		for _, a := range annotations {
+			if latest.Get(channelKey(cs.name, a.MessageSerial)) == nil {
+				return storage.ErrTargetNotFound
+			}
+		}
+
+		channelSerial := cs.gen.Mint()
+		for i, a := range annotations {
+			a.Serial = serial.MessageSerial(channelSerial, i)
+		}
+		cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Annotations: annotations}
+		blob, err := msgpack.Marshal(cm)
+		if err != nil {
+			return fmt.Errorf("storage/bbolt: encode annotation ChannelMessage: %w", err)
+		}
+		if err := messages.Put(channelKey(cs.name, channelSerial), blob); err != nil {
+			return err
+		}
+		annBucket := tx.Bucket(annotationsBucket)
+		for _, a := range annotations {
+			if a.ID != "" {
+				if err := ids.Put(channelKey(cs.name, a.ID), []byte(channelSerial)); err != nil {
+					return err
+				}
+			}
+			aBlob, err := msgpack.Marshal(a)
+			if err != nil {
+				return fmt.Errorf("storage/bbolt: encode annotation: %w", err)
+			}
+			if err := annBucket.Put(annotationKey(cs.name, a.MessageSerial, a.Serial), aBlob); err != nil {
+				return err
+			}
+		}
+		resultCM = cm
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+
+	if !idempotent && cs.appender != nil {
+		cs.appender.Append(resultCM)
+	}
+	return resultCM, idempotent, nil
+}
+
+// Annotations returns the annotations attached to messageSerial in stream
+// order via a prefix scan over the annotations bucket, paginated by
+// storage.PaginateAnnotations (DESIGN.md §14.4). An unknown target yields
+// an empty page.
+func (cs *channelStore) Annotations(ctx context.Context, messageSerial string, q storage.HistoryQuery) (storage.HistoryPage, error) {
+	if err := ctx.Err(); err != nil {
+		return storage.HistoryPage{}, err
+	}
+	var all []*protocol.Annotation
+	err := cs.db.View(func(tx *bolt.Tx) error {
+		prefix := annotationPrefix(cs.name, messageSerial)
+		c := tx.Bucket(annotationsBucket).Cursor()
+		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+			var a protocol.Annotation
+			if err := msgpack.Unmarshal(v, &a); err != nil {
+				return fmt.Errorf("storage/bbolt: decode annotation %q: %w", k, err)
+			}
+			ac := a
+			all = append(all, &ac)
+		}
+		return nil
+	})
+	if err != nil {
+		return storage.HistoryPage{}, err
+	}
+	return storage.PaginateAnnotations(all, q), nil
 }
 
 // StorePresence persists a presence publish onto the channel_messages

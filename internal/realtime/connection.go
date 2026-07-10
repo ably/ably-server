@@ -281,6 +281,11 @@ func (c *connection) dispatch(ctx context.Context, msg *protocol.ProtocolMessage
 			return
 		}
 		c.handlePresence(ctx, msg)
+	case protocol.ActionAnnotation:
+		if !c.acceptMsgSerial(msg.MsgSerial) {
+			return
+		}
+		c.handleAnnotation(ctx, msg)
 	case protocol.ActionAuth:
 		c.handleAuth(ctx, msg)
 	case protocol.ActionClose:

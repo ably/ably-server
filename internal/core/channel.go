@@ -90,6 +90,24 @@ func (c *Channel) PublishPresence(ctx context.Context, presence []*protocol.Pres
 	return c.store.StorePresence(ctx, presence)
 }
 
+// PublishAnnotation runs the annotation-publish sequence: hand the
+// annotations to the storage backend (which validates each target,
+// mints the channelSerial, stamps each Serial, persists the annotation cm
+// on the shared stream, and — the seam for the summary fold, TASK-66),
+// then the link onto the live list arrives via the Appender callback
+// exactly as for a message publish (DESIGN.md §14.1). The
+// (cm, idempotent, err) tuple is forwarded verbatim — notably
+// storage.ErrTargetNotFound when a target message does not exist.
+func (c *Channel) PublishAnnotation(ctx context.Context, annotations []*protocol.Annotation) (*protocol.ChannelMessage, bool, error) {
+	return c.store.StoreAnnotation(ctx, annotations)
+}
+
+// Annotations returns the annotations attached to the message identified
+// by messageSerial, paginated per q (DESIGN.md §14.4).
+func (c *Channel) Annotations(ctx context.Context, messageSerial string, q storage.HistoryQuery) (storage.HistoryPage, error) {
+	return c.store.Annotations(ctx, messageSerial, q)
+}
+
 // Mutate applies an update/delete/append to an existing message,
 // delegating to the storage backend (which validates the target, merges,
 // mints the new version, persists, and updates the projection/versions
@@ -171,11 +189,11 @@ func (c *Channel) InitialChannelSerial() string {
 // deliver a persisted cm to subscribers (the publisher's own publish
 // in memory/bbolt; every node's publish in cluster mode).
 //
-// A no-op when cm is nil or carries neither Messages nor Presence — a
-// presence cm (Presence populated, Messages empty) links onto the list
-// exactly like a message cm (DESIGN.md §12.2).
+// A no-op when cm is nil or carries no items — a presence cm or an
+// annotation cm (DESIGN.md §12.2, §14.1) links onto the list exactly like
+// a message cm.
 func (c *Channel) Append(cm *protocol.ChannelMessage) {
-	if cm == nil || (len(cm.Messages) == 0 && len(cm.Presence) == 0) {
+	if cm == nil || (len(cm.Messages) == 0 && len(cm.Presence) == 0 && len(cm.Annotations) == 0) {
 		return
 	}
 	c.mu.Lock()

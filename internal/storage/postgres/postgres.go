@@ -528,6 +528,14 @@ func decodeChannelMessageRows(rows pgx.Rows, queryErr error, channel, channelSer
 			cm.Presence = append(cm.Presence, &p)
 			continue
 		}
+		if kind == string(storage.KindAnnotation) {
+			var a protocol.Annotation
+			if err := msgpack.Unmarshal(payload, &a); err != nil {
+				return nil, fmt.Errorf("storage/postgres: decode annotation payload %s:%s idx=%d: %w", channel, channelSerial, idx, err)
+			}
+			cm.Annotations = append(cm.Annotations, &a)
+			continue
+		}
 		var m protocol.Message
 		if err := msgpack.Unmarshal(payload, &m); err != nil {
 			return nil, fmt.Errorf("storage/postgres: decode payload %s:%s idx=%d: %w", channel, channelSerial, idx, err)
@@ -537,7 +545,7 @@ func decodeChannelMessageRows(rows pgx.Rows, queryErr error, channel, channelSer
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("storage/postgres: rows %s:%s: %w", channel, channelSerial, err)
 	}
-	if len(cm.Messages) == 0 && len(cm.Presence) == 0 {
+	if len(cm.Messages) == 0 && len(cm.Presence) == 0 && len(cm.Annotations) == 0 {
 		return nil, fmt.Errorf("storage/postgres: ChannelMessage not found: %s:%s", channel, channelSerial)
 	}
 	return cm, nil
@@ -1243,6 +1251,186 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 	return cm, false, nil
 }
 
+// StoreAnnotation persists an annotation publish on channel_messages
+// (kind = annotation, message_serial = the TARGET message serial so the
+// channel_messages serial index serves annotations-for-message scans,
+// DESIGN.md §14.1, §14.4), then emits a NOTIFY so the cm reaches every
+// node's appender via the LISTEN round-trip exactly like a message
+// publish. Every target must resolve in the messages projection
+// (ErrTargetNotFound otherwise, like a mutation). The returned cm is the
+// TASK-66 summary-fold seam.
+func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*protocol.Annotation) (*protocol.ChannelMessage, bool, error) {
+	if len(annotations) == 0 {
+		return nil, false, errors.New("storage/postgres: StoreAnnotation with no annotations")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+
+	tx, err := cs.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Idempotency pre-check — shared id namespace with messages/presence.
+	if ids := nonEmptyAnnotationIDs(annotations); len(ids) > 0 {
+		var existingCS string
+		err := tx.QueryRow(ctx,
+			`SELECT channel_serial FROM channel_messages
+			 WHERE channel = $1 AND id = ANY($2) LIMIT 1`,
+			cs.name, ids).Scan(&existingCS)
+		switch {
+		case err == nil:
+			original, lerr := loadChannelMessageTx(ctx, tx, cs.name, existingCS)
+			if lerr != nil {
+				return nil, false, lerr
+			}
+			if cerr := tx.Commit(ctx); cerr != nil {
+				return nil, false, fmt.Errorf("storage/postgres: commit: %w", cerr)
+			}
+			return original, true, nil
+		case errors.Is(err, pgx.ErrNoRows):
+			// no prior match — fall through
+		default:
+			return nil, false, fmt.Errorf("storage/postgres: idempotency lookup: %w", err)
+		}
+	}
+
+	// Target existence: every annotation must reference a message in the
+	// projection (DESIGN.md §14.1). Checked before advancing the serial so
+	// a bad target does not burn one.
+	for _, a := range annotations {
+		var exists bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM messages WHERE channel = $1 AND message_serial = $2)`,
+			cs.name, a.MessageSerial,
+		).Scan(&exists); err != nil {
+			return nil, false, fmt.Errorf("storage/postgres: annotation target lookup: %w", err)
+		}
+		if !exists {
+			return nil, false, storage.ErrTargetNotFound
+		}
+	}
+
+	var channelSerial string
+	if err := tx.QueryRow(ctx,
+		`SELECT advance_channel_serial($1, $2)`, cs.name, cs.series,
+	).Scan(&channelSerial); err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: advance channel serial: %w", err)
+	}
+	for i, a := range annotations {
+		a.Serial = serial.MessageSerial(channelSerial, i)
+	}
+	cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Annotations: annotations}
+
+	for i, a := range annotations {
+		payload, err := msgpack.Marshal(a)
+		if err != nil {
+			return nil, false, fmt.Errorf("storage/postgres: encode annotation %d: %w", i, err)
+		}
+		var idArg any
+		if a.ID != "" {
+			idArg = a.ID
+		}
+		// message_serial holds the TARGET message serial so the existing
+		// channel_messages_serial_idx serves the annotations-for-message
+		// scan (DESIGN.md §14.4).
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO channel_messages (channel, channel_serial, idx, id, kind, payload, message_serial)
+			 VALUES ($1, $2, $3, $4, 'annotation', $5, $6)`,
+			cs.name, channelSerial, i, idArg, payload, a.MessageSerial,
+		); err != nil {
+			return nil, false, fmt.Errorf("storage/postgres: insert annotation %d: %w", i, err)
+		}
+	}
+
+	body, err := json.Marshal(notifyPayload{Channel: cs.name, Serial: channelSerial})
+	if err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: encode notify: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, notifyChannelName, string(body)); err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: notify: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, fmt.Errorf("storage/postgres: commit: %w", err)
+	}
+	return cm, false, nil
+}
+
+// Annotations returns the annotations attached to messageSerial in stream
+// order, paginated at annotation-serial granularity (DESIGN.md §14.4). The
+// scan filters channel_messages by kind = 'annotation' and message_serial
+// = the target, served by channel_messages_serial_idx. An unknown target
+// yields an empty page.
+func (cs *channelStore) Annotations(ctx context.Context, messageSerial string, q storage.HistoryQuery) (storage.HistoryPage, error) {
+	if err := ctx.Err(); err != nil {
+		return storage.HistoryPage{}, err
+	}
+
+	forwards := q.Direction == storage.DirectionForwards
+	order, cursorOp := "ASC", ">"
+	if !forwards {
+		order, cursorOp = "DESC", "<"
+	}
+
+	var (
+		cursorChannelSerial string
+		cursorIdx           int
+	)
+	if q.Cursor != "" {
+		var err error
+		cursorChannelSerial, cursorIdx, err = serial.ParseMessageSerial(q.Cursor)
+		if err != nil {
+			return storage.HistoryPage{}, fmt.Errorf("storage/postgres: parse annotation cursor: %w", err)
+		}
+	}
+
+	query := fmt.Sprintf(`
+		SELECT channel_serial, idx, payload
+		FROM channel_messages
+		WHERE channel = $1
+		  AND kind = 'annotation'
+		  AND message_serial = $2
+		  AND ($3 = '' OR (channel_serial, idx) %s ($3, $4))
+		ORDER BY channel_serial %s, idx %s
+		LIMIT CASE WHEN $5 > 0 THEN $5 + 1 ELSE NULL END
+	`, cursorOp, order, order)
+
+	rows, err := cs.pool.Query(ctx, query, cs.name, messageSerial, cursorChannelSerial, cursorIdx, q.Limit)
+	if err != nil {
+		return storage.HistoryPage{}, fmt.Errorf("storage/postgres: annotations query: %w", err)
+	}
+	defer rows.Close()
+
+	var page storage.HistoryPage
+	for rows.Next() {
+		var (
+			cs2     string
+			idx     int
+			payload []byte
+		)
+		if err := rows.Scan(&cs2, &idx, &payload); err != nil {
+			return storage.HistoryPage{}, fmt.Errorf("storage/postgres: scan annotation row: %w", err)
+		}
+		var a protocol.Annotation
+		if err := msgpack.Unmarshal(payload, &a); err != nil {
+			return storage.HistoryPage{}, fmt.Errorf("storage/postgres: decode annotation payload %s:%d: %w", cs2, idx, err)
+		}
+		appendAnnotation(&page, cs2, &a)
+	}
+	if err := rows.Err(); err != nil {
+		return storage.HistoryPage{}, fmt.Errorf("storage/postgres: annotation rows: %w", err)
+	}
+
+	if q.Limit > 0 && itemCount(page) > q.Limit {
+		trimToLimit(&page, q.Limit)
+		page.HasMore = true
+	}
+	return page, nil
+}
+
 // Members returns the channel's presence projection plus the channel's
 // current watermark serial as the as-of point.
 func (cs *channelStore) Members(ctx context.Context) ([]*protocol.PresenceMessage, string, error) {
@@ -1382,6 +1570,14 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 			appendPresence(&page, cs2, &p)
 			continue
 		}
+		if wantKind == storage.KindAnnotation {
+			var a protocol.Annotation
+			if err := msgpack.Unmarshal(payload, &a); err != nil {
+				return storage.HistoryPage{}, fmt.Errorf("storage/postgres: decode annotation payload %s:%d: %w", cs2, idx, err)
+			}
+			appendAnnotation(&page, cs2, &a)
+			continue
+		}
 		var m protocol.Message
 		if err := msgpack.Unmarshal(payload, &m); err != nil {
 			return storage.HistoryPage{}, fmt.Errorf("storage/postgres: decode payload %s:%d: %w", cs2, idx, err)
@@ -1485,10 +1681,24 @@ func appendPresence(page *storage.HistoryPage, channelSerial string, p *protocol
 	})
 }
 
-// cmLen is the item count of a cm — Messages or Presence, whichever the
-// (single-kind) cm carries.
+// appendAnnotation tacks a onto the trailing ChannelMessage when its
+// channelSerial matches; otherwise starts a fresh entry. The annotation
+// analogue of appendMessage.
+func appendAnnotation(page *storage.HistoryPage, channelSerial string, a *protocol.Annotation) {
+	if n := len(page.ChannelMessages); n > 0 && page.ChannelMessages[n-1].ChannelSerial == channelSerial {
+		page.ChannelMessages[n-1].Annotations = append(page.ChannelMessages[n-1].Annotations, a)
+		return
+	}
+	page.ChannelMessages = append(page.ChannelMessages, &protocol.ChannelMessage{
+		ChannelSerial: channelSerial,
+		Annotations:   []*protocol.Annotation{a},
+	})
+}
+
+// cmLen is the item count of a cm — Messages, Presence or Annotations,
+// whichever the (single-kind) cm carries.
 func cmLen(cm *protocol.ChannelMessage) int {
-	return len(cm.Messages) + len(cm.Presence)
+	return len(cm.Messages) + len(cm.Presence) + len(cm.Annotations)
 }
 
 // itemCount totals the items (Messages or Presence) across all
@@ -1515,9 +1725,12 @@ func trimToLimit(page *storage.HistoryPage, limit int) {
 			left -= cmLen(cm)
 			continue
 		}
-		if len(cm.Presence) > 0 {
+		switch {
+		case len(cm.Presence) > 0:
 			cm.Presence = cm.Presence[:left]
-		} else {
+		case len(cm.Annotations) > 0:
+			cm.Annotations = cm.Annotations[:left]
+		default:
 			cm.Messages = cm.Messages[:left]
 		}
 		page.ChannelMessages = page.ChannelMessages[:i+1]
@@ -1543,6 +1756,17 @@ func nonEmptyPresenceIDs(presence []*protocol.PresenceMessage) []string {
 	for _, p := range presence {
 		if p.ID != "" {
 			ids = append(ids, p.ID)
+		}
+	}
+	return ids
+}
+
+// nonEmptyAnnotationIDs is the annotation analogue of nonEmptyIDs.
+func nonEmptyAnnotationIDs(annotations []*protocol.Annotation) []string {
+	var ids []string
+	for _, a := range annotations {
+		if a.ID != "" {
+			ids = append(ids, a.ID)
 		}
 	}
 	return ids

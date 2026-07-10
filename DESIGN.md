@@ -1696,12 +1696,17 @@ respectively (§3.1). When `ATTACH.flags` carries no mode bits, the
 default set does **not** include the annotation modes (matching SDK
 defaults); clients opt in via modes or channel params.
 
-Live and resume delivery follow the stream: a resuming attachment
-replaying a gap (§4.3) receives the annotation/summary cms in stream
-order and converges on the newest summary. History *reads* do not
-enumerate annotation cms — they return messages whose embedded `summary`
-is current (§14.4) — and a `kind = message` history scan skips
-annotation cms exactly as it skips presence.
+Raw `ANNOTATION` frames are a **live** delivery: the attachment cursor
+walks every cm on the stream and forwards each annotation cm to
+`ANNOTATION_SUBSCRIBE` attachments in stream order. The resume gap
+replay (§4.3) is a `kind = message` history scan, so — exactly as it
+skips presence — it skips raw annotation cms; a resuming subscriber
+re-reads raw annotations via the REST endpoint (§14.4). The **summary**,
+by contrast, is an ordinary message cm and *is* gap-replayed, so a
+resuming subscriber still converges on the newest summary. History
+*reads* do not enumerate annotation cms — they return messages whose
+embedded `summary` is current (§14.4) — and a `kind = message` history
+scan skips annotation cms exactly as it skips presence.
 
 ### 14.4 Reads
 

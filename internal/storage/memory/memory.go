@@ -104,17 +104,26 @@ type channelStore struct {
 	// (publish) order.
 	latest   map[string]*protocol.Message
 	versions map[string][]*protocol.Message
+
+	// annotations indexes a target message identity serial to its
+	// annotations in stream (publish) order — the annotations-for-message
+	// scan (DESIGN.md §14.4), the memory analogue of the postgres
+	// channel_messages serial index. The annotation cms also live on the
+	// shared log (order/byCS) so they flow to the appender and are
+	// kind-skipped by message/presence history.
+	annotations map[string][]*protocol.Annotation
 }
 
 func newChannelStore(gen *serial.Generator, appender storage.Appender) *channelStore {
 	return &channelStore{
-		gen:      gen,
-		appender: appender,
-		byCS:     make(map[string]*protocol.ChannelMessage),
-		byID:     make(map[string]string),
-		members:  make(map[string]*protocol.PresenceMessage),
-		latest:   make(map[string]*protocol.Message),
-		versions: make(map[string][]*protocol.Message),
+		gen:         gen,
+		appender:    appender,
+		byCS:        make(map[string]*protocol.ChannelMessage),
+		byID:        make(map[string]string),
+		members:     make(map[string]*protocol.PresenceMessage),
+		latest:      make(map[string]*protocol.Message),
+		versions:    make(map[string][]*protocol.Message),
+		annotations: make(map[string][]*protocol.Annotation),
 	}
 }
 
@@ -272,6 +281,79 @@ func (cs *channelStore) Versions(ctx context.Context, serial string, q storage.H
 	// Collapse append runs so history reflects the aggregate, not each
 	// delta (DESIGN.md §13.3, §13.4); the log keeps every append cm.
 	return storage.PaginateVersions(storage.CollapseAppendVersions(all), q), nil
+}
+
+// StoreAnnotation persists an annotation publish on the same stream as
+// messages and presence (DESIGN.md §14.1), validating that every
+// annotation's target message resolves in the latest-version projection
+// (ErrTargetNotFound otherwise, like a mutation) before minting. The
+// annotation cm lands on the shared log and is indexed by its target
+// serial so annotations-for-message reads are O(target). Idempotency
+// shares the byID index with messages/presence. The returned cm is the
+// TASK-66 summary-fold seam.
+func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*protocol.Annotation) (*protocol.ChannelMessage, bool, error) {
+	if len(annotations) == 0 {
+		return nil, false, errors.New("storage/memory: StoreAnnotation with no annotations")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	for _, a := range annotations {
+		if a.ID == "" {
+			continue
+		}
+		if existingCS, ok := cs.byID[a.ID]; ok {
+			return cs.byCS[existingCS], true, nil
+		}
+	}
+
+	// Target existence: every annotation must reference a message that
+	// resolves in the latest-version projection (DESIGN.md §14.1). Checked
+	// before minting so a bad target does not burn a serial.
+	for _, a := range annotations {
+		if _, ok := cs.latest[a.MessageSerial]; !ok {
+			return nil, false, storage.ErrTargetNotFound
+		}
+	}
+
+	channelSerial := cs.gen.Mint()
+	for i, a := range annotations {
+		a.Serial = serial.MessageSerial(channelSerial, i)
+	}
+	cm := &protocol.ChannelMessage{
+		ChannelSerial: channelSerial,
+		Annotations:   annotations,
+	}
+
+	cs.byCS[channelSerial] = cm
+	cs.order = append(cs.order, channelSerial)
+	for _, a := range annotations {
+		if a.ID != "" {
+			cs.byID[a.ID] = channelSerial
+		}
+		cs.annotations[a.MessageSerial] = append(cs.annotations[a.MessageSerial], a)
+	}
+
+	if cs.appender != nil {
+		cs.appender.Append(cm)
+	}
+	return cm, false, nil
+}
+
+// Annotations returns the annotations attached to messageSerial in stream
+// order, paginated at annotation-serial granularity (DESIGN.md §14.4). An
+// unknown target yields an empty page.
+func (cs *channelStore) Annotations(ctx context.Context, messageSerial string, q storage.HistoryQuery) (storage.HistoryPage, error) {
+	if err := ctx.Err(); err != nil {
+		return storage.HistoryPage{}, err
+	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return storage.PaginateAnnotations(cs.annotations[messageSerial], q), nil
 }
 
 // StorePresence persists a presence publish on the same stream as

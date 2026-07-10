@@ -268,6 +268,20 @@ func (a *attachment) forward(cm *protocol.ChannelMessage, backlog bool) bool {
 			Presence:      cm.Presence,
 		})
 	}
+	if len(cm.Annotations) > 0 {
+		// Raw annotation frames go only to attachments holding
+		// ANNOTATION_SUBSCRIBE (DESIGN.md §14.3); all others skip them, the
+		// way a SUBSCRIBE-only attachment skips presence.
+		if !a.hasMode(protocol.FlagAnnotationSubscribe) {
+			return true
+		}
+		return a.send(&protocol.ProtocolMessage{
+			Action:        protocol.ActionAnnotation,
+			Channel:       a.channelName,
+			ChannelSerial: cm.ChannelSerial,
+			Annotations:   cm.Annotations,
+		})
+	}
 	return true
 }
 

@@ -1349,6 +1349,202 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 		}
 	})
 
+	// ---- Annotations (DESIGN.md §14) -----------------------------------
+
+	t.Run("StoreAnnotationStampsSerialsAndTarget", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		target := mustCreate(t, ch, &protocol.Message{Data: "post", ClientID: "alice"})
+
+		cm, idemp, err := ch.StoreAnnotation(context.Background(), []*protocol.Annotation{
+			{Action: protocol.AnnotationCreate, ClientID: "bob", Type: "reaction:distinct.v1", Name: "👍", MessageSerial: target.Serial},
+		})
+		if err != nil || idemp {
+			t.Fatalf("StoreAnnotation: err=%v idempotent=%v", err, idemp)
+		}
+		if cm.ChannelSerial == "" || len(cm.Annotations) != 1 {
+			t.Fatalf("annotation cm shape = %+v", cm)
+		}
+		if cm.Annotations[0].Serial != cm.ChannelSerial+":000" {
+			t.Errorf("annotation serial = %q, want %q", cm.Annotations[0].Serial, cm.ChannelSerial+":000")
+		}
+		if cm.Annotations[0].MessageSerial != target.Serial {
+			t.Errorf("annotation messageSerial = %q, want target %q", cm.Annotations[0].MessageSerial, target.Serial)
+		}
+	})
+
+	t.Run("StoreAnnotationRejectsUnknownTarget", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		_, _, err := ch.StoreAnnotation(context.Background(), []*protocol.Annotation{
+			{Action: protocol.AnnotationCreate, ClientID: "bob", Type: "reaction:distinct.v1", MessageSerial: "00000000000001-000@nope:000"},
+		})
+		if !errors.Is(err, storage.ErrTargetNotFound) {
+			t.Errorf("StoreAnnotation unknown target err = %v, want ErrTargetNotFound", err)
+		}
+	})
+
+	t.Run("AnnotationsForMessageInStreamOrder", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		a := mustCreate(t, ch, &protocol.Message{Data: "a", ClientID: "alice"})
+		b := mustCreate(t, ch, &protocol.Message{Data: "b", ClientID: "alice"})
+
+		var want []string
+		for _, name := range []string{"👍", "❤️", "🎉"} {
+			cm, _, err := ch.StoreAnnotation(context.Background(), []*protocol.Annotation{
+				{Action: protocol.AnnotationCreate, ClientID: "bob", Type: "reaction:multiple.v1", Name: name, MessageSerial: a.Serial},
+			})
+			if err != nil {
+				t.Fatalf("StoreAnnotation: %v", err)
+			}
+			want = append(want, cm.Annotations[0].Serial)
+		}
+		// An annotation on a different message must not leak.
+		if _, _, err := ch.StoreAnnotation(context.Background(), []*protocol.Annotation{
+			{Action: protocol.AnnotationCreate, ClientID: "bob", Type: "reaction:multiple.v1", Name: "🚀", MessageSerial: b.Serial},
+		}); err != nil {
+			t.Fatalf("StoreAnnotation on b: %v", err)
+		}
+
+		page, err := ch.Annotations(context.Background(), a.Serial, storage.HistoryQuery{Direction: storage.DirectionForwards})
+		if err != nil {
+			t.Fatalf("Annotations: %v", err)
+		}
+		var got []string
+		for _, cm := range page.ChannelMessages {
+			for _, an := range cm.Annotations {
+				got = append(got, an.Serial)
+			}
+		}
+		if !equalStrings(got, want) {
+			t.Errorf("annotations for a = %v, want %v (stream order, target-filtered)", got, want)
+		}
+	})
+
+	t.Run("AnnotationsPaginateAndHasMore", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		target := mustCreate(t, ch, &protocol.Message{Data: "post", ClientID: "alice"})
+		var serials []string
+		for i := range 3 {
+			cm, _, err := ch.StoreAnnotation(context.Background(), []*protocol.Annotation{
+				{Action: protocol.AnnotationCreate, ClientID: "bob", Type: "reaction:multiple.v1", Name: strconv.Itoa(i), MessageSerial: target.Serial},
+			})
+			if err != nil {
+				t.Fatalf("StoreAnnotation %d: %v", i, err)
+			}
+			serials = append(serials, cm.Annotations[0].Serial)
+		}
+		page, err := ch.Annotations(context.Background(), target.Serial, storage.HistoryQuery{Direction: storage.DirectionForwards, Limit: 2})
+		if err != nil {
+			t.Fatalf("Annotations: %v", err)
+		}
+		if !page.HasMore {
+			t.Error("HasMore=false with limit < total")
+		}
+		var got []string
+		for _, cm := range page.ChannelMessages {
+			for _, an := range cm.Annotations {
+				got = append(got, an.Serial)
+			}
+		}
+		if !equalStrings(got, serials[:2]) {
+			t.Errorf("first page = %v, want %v", got, serials[:2])
+		}
+		// Continue from the boundary.
+		next, err := ch.Annotations(context.Background(), target.Serial, storage.HistoryQuery{Direction: storage.DirectionForwards, Cursor: got[len(got)-1]})
+		if err != nil {
+			t.Fatalf("Annotations next: %v", err)
+		}
+		var gotNext []string
+		for _, cm := range next.ChannelMessages {
+			for _, an := range cm.Annotations {
+				gotNext = append(gotNext, an.Serial)
+			}
+		}
+		if !equalStrings(gotNext, serials[2:]) {
+			t.Errorf("next page = %v, want %v", gotNext, serials[2:])
+		}
+	})
+
+	t.Run("AnnotationsUnknownTargetIsEmpty", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		page, err := ch.Annotations(context.Background(), "00000000000001-000@nope:000", storage.HistoryQuery{Direction: storage.DirectionForwards})
+		if err != nil {
+			t.Fatalf("Annotations: %v", err)
+		}
+		if len(page.ChannelMessages) != 0 {
+			t.Errorf("unknown-target annotations = %d, want 0", len(page.ChannelMessages))
+		}
+	})
+
+	t.Run("AnnotationIdempotentByID", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		target := mustCreate(t, ch, &protocol.Message{Data: "post", ClientID: "alice"})
+		first, idemp, err := ch.StoreAnnotation(context.Background(), []*protocol.Annotation{
+			{ID: "ann-1", Action: protocol.AnnotationCreate, ClientID: "bob", Type: "reaction:multiple.v1", Name: "👍", MessageSerial: target.Serial},
+		})
+		if err != nil || idemp {
+			t.Fatalf("first StoreAnnotation: err=%v idempotent=%v", err, idemp)
+		}
+		second, idemp, err := ch.StoreAnnotation(context.Background(), []*protocol.Annotation{
+			{ID: "ann-1", Action: protocol.AnnotationCreate, ClientID: "bob", Type: "reaction:multiple.v1", Name: "❤️", MessageSerial: target.Serial},
+		})
+		if err != nil {
+			t.Fatalf("second StoreAnnotation: %v", err)
+		}
+		if !idemp {
+			t.Error("idempotent=false on duplicate annotation id")
+		}
+		if second.ChannelSerial != first.ChannelSerial {
+			t.Errorf("returned serial = %q, want original %q", second.ChannelSerial, first.ChannelSerial)
+		}
+		page, _ := ch.Annotations(context.Background(), target.Serial, storage.HistoryQuery{Direction: storage.DirectionForwards})
+		if n := len(page.ChannelMessages); n != 1 {
+			t.Errorf("annotations = %d, want 1 (duplicate must not persist)", n)
+		}
+	})
+
+	t.Run("AnnotationsSkippedByMessageAndPresenceHistory", func(t *testing.T) {
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		target := mustCreate(t, ch, &protocol.Message{Data: "post", ClientID: "alice"})
+		mustEnter(t, ch, "conn-1", "alice", "hi")
+		if _, _, err := ch.StoreAnnotation(context.Background(), []*protocol.Annotation{
+			{Action: protocol.AnnotationCreate, ClientID: "bob", Type: "reaction:multiple.v1", Name: "👍", MessageSerial: target.Serial},
+		}); err != nil {
+			t.Fatalf("StoreAnnotation: %v", err)
+		}
+
+		// Message history: only the create, no annotation cm.
+		msgPage, err := ch.History(context.Background(), storage.HistoryQuery{Direction: storage.DirectionForwards})
+		if err != nil {
+			t.Fatalf("message History: %v", err)
+		}
+		for _, cm := range msgPage.ChannelMessages {
+			if len(cm.Annotations) != 0 {
+				t.Error("message history leaked an annotation cm")
+			}
+		}
+		if n := len(msgPage.ChannelMessages); n != 1 {
+			t.Errorf("message history cms = %d, want 1 (create only)", n)
+		}
+
+		// Presence history skips the annotation cm too.
+		presPage, err := ch.History(context.Background(), storage.HistoryQuery{Kind: storage.KindPresence, Direction: storage.DirectionForwards})
+		if err != nil {
+			t.Fatalf("presence History: %v", err)
+		}
+		for _, cm := range presPage.ChannelMessages {
+			if len(cm.Annotations) != 0 {
+				t.Error("presence history leaked an annotation cm")
+			}
+		}
+	})
+
 	t.Run("CollapsedDeletedShowsAsTombstone", func(t *testing.T) {
 		s := f(t)
 		ch := mustChannel(t, s, "foo")

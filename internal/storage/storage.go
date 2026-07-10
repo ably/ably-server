@@ -176,6 +176,32 @@ type ChannelStore interface {
 	// the message has no versions. Backs GET .../messages/{serial}/versions.
 	Versions(ctx context.Context, serial string, q HistoryQuery) (HistoryPage, error)
 
+	// StoreAnnotation persists an annotation publish on the same stream as
+	// messages and presence, as a third cm kind (kind = annotation,
+	// DESIGN.md §14.1). It mints a channelSerial, stamps each
+	// Annotation.Serial to "<channelSerial>:<idx>", validates that every
+	// annotation's MessageSerial resolves in the latest-version projection
+	// (ErrTargetNotFound otherwise, exactly as for a mutation), persists the
+	// annotation cm on the log with the TARGET message serial recorded so
+	// the serial index serves annotations-for-message scans, and delivers
+	// the cm to the appender exactly as Store does.
+	//
+	// Idempotency works like Store: a contained Annotation.ID already seen
+	// on this channel returns the original cm with idempotent=true.
+	//
+	// The returned cm is the persisted annotation cm — the seam the summary
+	// fold (TASK-66) slots into at store time (DESIGN.md §14.2).
+	StoreAnnotation(ctx context.Context, annotations []*protocol.Annotation) (cm *protocol.ChannelMessage, idempotent bool, err error)
+
+	// Annotations returns the annotations attached to the message identified
+	// by messageSerial, in stream order, paginated via the shared
+	// HistoryQuery shape (DESIGN.md §14.4). q.Cursor, when set, is an
+	// Annotation.Serial compared direction-specifically; q.Limit caps the
+	// annotations returned. An unknown target yields an empty page (no
+	// error) — mirroring Ably, which lists rather than 404s. Backs
+	// GET .../messages/{serial}/annotations.
+	Annotations(ctx context.Context, messageSerial string, q HistoryQuery) (HistoryPage, error)
+
 	// StorePresence is the presence analogue of Store (DESIGN.md §12.2,
 	// §12.5). It mints a channelSerial, stamps each PresenceMessage.Serial
 	// to "<channelSerial>:<idx>", persists the presence ChannelMessage on
@@ -211,8 +237,9 @@ type ChannelStore interface {
 type Kind string
 
 const (
-	KindMessage  Kind = "message"
-	KindPresence Kind = "presence"
+	KindMessage    Kind = "message"
+	KindPresence   Kind = "presence"
+	KindAnnotation Kind = "annotation"
 )
 
 // Normalize maps the zero value to KindMessage.
@@ -524,6 +551,57 @@ func PaginateVersions(all []*protocol.Message, q HistoryQuery) HistoryPage {
 	return page
 }
 
+// PaginateAnnotations slices a stream-ordered (ascending-serial) list of
+// one message's annotations into a HistoryPage per the query's Direction /
+// Cursor / Limit (DESIGN.md §14.4). The cursor is an Annotation.Serial,
+// excluded strictly in the scan direction; each annotation becomes its own
+// single-annotation ChannelMessage positioned at its own channelSerial.
+// Shared by the in-memory and bbolt backends, which hold the annotation
+// list directly; Postgres paginates in SQL.
+func PaginateAnnotations(all []*protocol.Annotation, q HistoryQuery) HistoryPage {
+	forwards := q.Direction == DirectionForwards
+	cursor := q.Cursor
+	limit := q.Limit
+
+	var page HistoryPage
+	count := 0
+	emit := func(a *protocol.Annotation) bool {
+		if cursor != "" {
+			if forwards && a.Serial <= cursor {
+				return true
+			}
+			if !forwards && a.Serial >= cursor {
+				return true
+			}
+		}
+		if limit > 0 && count >= limit {
+			page.HasMore = true
+			return false
+		}
+		page.ChannelMessages = append(page.ChannelMessages, &protocol.ChannelMessage{
+			ChannelSerial: CreateChannelSerial(a.Serial),
+			Annotations:   []*protocol.Annotation{a},
+		})
+		count++
+		return true
+	}
+
+	if forwards {
+		for _, a := range all {
+			if !emit(a) {
+				break
+			}
+		}
+	} else {
+		for i := len(all) - 1; i >= 0; i-- {
+			if !emit(all[i]) {
+				break
+			}
+		}
+	}
+	return page
+}
+
 // CreateChannelSerial returns the channelSerial of the publish that
 // created the message with the given identity serial — the position a
 // collapsed history entry occupies (DESIGN.md §13.4). The identity is
@@ -550,11 +628,20 @@ type HistItem struct {
 // kind-filtered scan transparently skips it. Backends share this so
 // message and presence history walk identical pagination/limit logic.
 func CMItems(cm *protocol.ChannelMessage, kind Kind) []HistItem {
-	if kind.Normalize() == KindPresence {
+	switch kind.Normalize() {
+	case KindPresence:
 		out := make([]HistItem, len(cm.Presence))
 		for i, pm := range cm.Presence {
 			out[i] = HistItem{Serial: pm.Serial, Append: func(dst *protocol.ChannelMessage) {
 				dst.Presence = append(dst.Presence, pm)
+			}}
+		}
+		return out
+	case KindAnnotation:
+		out := make([]HistItem, len(cm.Annotations))
+		for i, an := range cm.Annotations {
+			out[i] = HistItem{Serial: an.Serial, Append: func(dst *protocol.ChannelMessage) {
+				dst.Annotations = append(dst.Annotations, an)
 			}}
 		}
 		return out
