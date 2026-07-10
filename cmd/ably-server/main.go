@@ -398,6 +398,8 @@ func newMux(rt *realtime.Server, rs *rest.Server, m *metrics.Metrics) *http.Serv
 	rest("PATCH /channels/{name}/messages/{serial}", rs.HandleMutate)
 	rest("GET /channels/{name}/messages/{serial}", rs.HandleMessage)
 	rest("GET /channels/{name}/messages/{serial}/versions", rs.HandleMessageVersions)
+	rest("POST /channels/{name}/messages/{serial}/annotations", rs.HandlePublishAnnotation)
+	rest("GET /channels/{name}/messages/{serial}/annotations", rs.HandleListAnnotations)
 	rest("GET /channels/{name}/presence", rs.HandlePresence)
 	rest("GET /channels/{name}/presence/history", rs.HandlePresenceHistory)
 	rest("POST /keys/{keyName}/requestToken", rs.HandleRequestToken)

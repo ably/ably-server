@@ -45,6 +45,8 @@ func newTestServer(t *testing.T) (*httptest.Server, *core.Manager) {
 	mux.HandleFunc("PATCH /channels/{name}/messages/{serial}", rs.HandleMutate)
 	mux.HandleFunc("GET /channels/{name}/messages/{serial}", rs.HandleMessage)
 	mux.HandleFunc("GET /channels/{name}/messages/{serial}/versions", rs.HandleMessageVersions)
+	mux.HandleFunc("POST /channels/{name}/messages/{serial}/annotations", rs.HandlePublishAnnotation)
+	mux.HandleFunc("GET /channels/{name}/messages/{serial}/annotations", rs.HandleListAnnotations)
 	mux.HandleFunc("GET /channels/{name}/presence", rs.HandlePresence)
 	mux.HandleFunc("GET /channels/{name}/presence/history", rs.HandlePresenceHistory)
 	mux.HandleFunc("GET /stats", rs.HandleStats)

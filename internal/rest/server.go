@@ -516,6 +516,258 @@ func (s *Server) HandleMessageVersions(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(resp)
 }
 
+// HandlePublishAnnotation publishes one or more annotations on a message —
+// POST /channels/{name}/messages/{serial}/annotations (DESIGN.md §14.4).
+// The target serial comes from the path (authoritative, overriding any in
+// the body). The body is a single Annotation or an array (JSON or msgpack
+// via Content-Type). It returns 201 with the assigned serial(s); a
+// missing/aged-out target is a 404. Gated by the annotation-publish
+// capability op (DESIGN.md §3.1, §14.5).
+func (s *Server) HandlePublishAnnotation(w http.ResponseWriter, r *http.Request) {
+	principal, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	clientID, ok := s.resolveRequestClientID(w, r, principal)
+	if !ok {
+		return
+	}
+	name := r.PathValue("name")
+	target := r.PathValue("serial")
+	if name == "" || target == "" {
+		http.Error(w, "channel name and message serial required", http.StatusBadRequest)
+		return
+	}
+	if !s.authorize(w, r, principal, name, auth.OpAnnotationPublish) {
+		return
+	}
+
+	format, err := contentTypeFormat(r.Header.Get("Content-Type"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnsupportedMediaType)
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	annotations, err := parseAnnotations(body, format)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(annotations) == 0 {
+		http.Error(w, "no annotations", http.StatusBadRequest)
+		return
+	}
+
+	now := time.Now().UnixMilli()
+	for _, an := range annotations {
+		// The path serial is authoritative: it names the target message,
+		// overriding any messageSerial in the body (matches the reference).
+		an.MessageSerial = target
+		cid, ok := auth.MessageClientID(clientID, an.ClientID)
+		if !ok {
+			http.Error(w, "annotation clientId not permitted", http.StatusBadRequest)
+			return
+		}
+		an.ClientID = cid
+		// REST publishes carry no connection, so connectionId stays empty
+		// (matching the reference's NewAnnotationChannelMessage).
+		if an.Timestamp == 0 {
+			an.Timestamp = now
+		}
+		if verr := an.Validate(); verr != nil {
+			s.writeErrorInfo(w, r, verr.StatusCode, verr.Code, verr.Message)
+			return
+		}
+	}
+
+	respFormat, err := acceptFormat(r.Header.Get("Accept"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotAcceptable)
+		return
+	}
+
+	ch, err := s.manager.GetChannel(r.Context(), name)
+	if err != nil {
+		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
+		http.Error(w, "channel unavailable", http.StatusInternalServerError)
+		return
+	}
+	cm, _, err := ch.PublishAnnotation(r.Context(), annotations)
+	if errors.Is(err, storage.ErrTargetNotFound) {
+		s.writeErrorInfo(w, r, http.StatusNotFound, 40400, "target message not found")
+		return
+	}
+	if err != nil {
+		s.logger.Warn("annotation publish failed", "channel", name, "target", target, "err", err)
+		http.Error(w, "annotation publish failed", http.StatusInternalServerError)
+		return
+	}
+
+	serials := annotationSerials(cm.Annotations)
+	var first string
+	if len(serials) > 0 {
+		first = serials[0]
+	}
+	respBody, err := marshalValue(annotationResponse{Channel: name, Serial: first, Serials: serials}, respFormat)
+	if err != nil {
+		s.logger.Warn("annotation publish encode failed", "channel", name, "err", err)
+		http.Error(w, "encode failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeFor(respFormat))
+	w.WriteHeader(http.StatusCreated)
+	_, _ = w.Write(respBody)
+}
+
+// HandleListAnnotations returns the annotations attached to a message in
+// stream order — GET /channels/{name}/messages/{serial}/annotations
+// (DESIGN.md §14.4) — paginated with the shared Link convention (§2.2).
+// An unknown target yields an empty array (not a 404), mirroring Ably.
+// Gated by the `history` capability op (DESIGN.md §3.1, §14.5).
+func (s *Server) HandleListAnnotations(w http.ResponseWriter, r *http.Request) {
+	principal, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	name := r.PathValue("name")
+	serial := r.PathValue("serial")
+	if name == "" || serial == "" {
+		http.Error(w, "channel name and message serial required", http.StatusBadRequest)
+		return
+	}
+	if !s.authorize(w, r, principal, name, auth.OpHistory) {
+		return
+	}
+
+	q, err := parseHistoryQuery(r.URL.Query())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Annotations read in stream order (ascending serial) by default —
+	// "in stream order" (§14.4), the same forwards default as versions. An
+	// explicit direction param still wins.
+	if r.URL.Query().Get("direction") == "" {
+		q.Direction = storage.DirectionForwards
+	}
+
+	format, err := acceptFormat(r.Header.Get("Accept"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotAcceptable)
+		return
+	}
+
+	ch, err := s.manager.GetChannel(r.Context(), name)
+	if err != nil {
+		s.logger.Warn("GetChannel failed", "channel", name, "err", err)
+		http.Error(w, "channel unavailable", http.StatusInternalServerError)
+		return
+	}
+	page, err := ch.Annotations(r.Context(), serial, q)
+	if err != nil {
+		s.logger.Warn("annotations read failed", "channel", name, "serial", serial, "err", err)
+		http.Error(w, "annotations read failed", http.StatusInternalServerError)
+		return
+	}
+
+	out := flattenAnnotations(page.ChannelMessages)
+	resp, err := marshalAnnotations(out, format)
+	if err != nil {
+		s.logger.Warn("annotations encode failed", "channel", name, "err", err)
+		http.Error(w, "encode failed", http.StatusInternalServerError)
+		return
+	}
+
+	writeLinkHeaders(w, r, lastAnnotationSerial(page), page.HasMore)
+	w.Header().Set("Content-Type", contentTypeFor(format))
+	_, _ = w.Write(resp)
+}
+
+// annotationResponse is the REST POST annotation response body: the
+// channel, the first assigned annotation serial (Serial), and every
+// assigned serial in batch order (Serials).
+type annotationResponse struct {
+	Channel string   `json:"channel"           msgpack:"channel"`
+	Serial  string   `json:"serial,omitempty"  msgpack:"serial,omitempty"`
+	Serials []string `json:"serials,omitempty" msgpack:"serials,omitempty"`
+}
+
+// annotationSerials returns the server-assigned Serial of each annotation
+// in batch order.
+func annotationSerials(annotations []*protocol.Annotation) []string {
+	out := make([]string, len(annotations))
+	for i, a := range annotations {
+		out[i] = a.Serial
+	}
+	return out
+}
+
+// parseAnnotations decodes an annotation publish body. The body may be a
+// single Annotation object or an array of Annotations.
+func parseAnnotations(body []byte, format protocol.Format) ([]*protocol.Annotation, error) {
+	if len(body) == 0 {
+		return nil, errors.New("empty body")
+	}
+	if looksLikeArray(body, format) {
+		var arr []*protocol.Annotation
+		if err := unmarshal(body, format, &arr); err != nil {
+			return nil, fmt.Errorf("decode array: %w", err)
+		}
+		return arr, nil
+	}
+	var single protocol.Annotation
+	if err := unmarshal(body, format, &single); err != nil {
+		return nil, fmt.Errorf("decode annotation: %w", err)
+	}
+	return []*protocol.Annotation{&single}, nil
+}
+
+// flattenAnnotations turns a page of annotation ChannelMessages into the
+// flat []Annotation wire shape, concatenating in storage order.
+func flattenAnnotations(cms []*protocol.ChannelMessage) []*protocol.Annotation {
+	total := 0
+	for _, cm := range cms {
+		total += len(cm.Annotations)
+	}
+	out := make([]*protocol.Annotation, 0, total)
+	for _, cm := range cms {
+		out = append(out, cm.Annotations...)
+	}
+	return out
+}
+
+// marshalAnnotations encodes an annotation slice, normalising nil to an
+// empty array (as marshalBody does for messages).
+func marshalAnnotations(v []*protocol.Annotation, format protocol.Format) ([]byte, error) {
+	if v == nil {
+		v = []*protocol.Annotation{}
+	}
+	switch format {
+	case protocol.FormatJSON:
+		return json.Marshal(v)
+	case protocol.FormatMsgpack:
+		return msgpack.Marshal(v)
+	}
+	return nil, fmt.Errorf("unsupported format")
+}
+
+// lastAnnotationSerial returns the Serial of the trailing annotation in a
+// page — the boundary for the next-page cursor — or "" if the page is empty.
+func lastAnnotationSerial(page storage.HistoryPage) string {
+	if len(page.ChannelMessages) == 0 {
+		return ""
+	}
+	cm := page.ChannelMessages[len(page.ChannelMessages)-1]
+	if n := len(cm.Annotations); n > 0 {
+		return cm.Annotations[n-1].Serial
+	}
+	return ""
+}
+
 // HandlePresence returns the channel's current presence set as a flat
 // array of PresenceMessages, each stamped action=PRESENT (DESIGN.md
 // §12.6). It honours the `clientId` and `connectionId` filter query
