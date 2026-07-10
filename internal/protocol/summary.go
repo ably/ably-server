@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"encoding/json"
+	"maps"
 	"slices"
 
 	"github.com/vmihailenco/msgpack/v5"
@@ -123,9 +124,7 @@ func (a *Aggregation) clone() *Aggregation {
 			cc := &ClientIDCounts{Total: v.Total, TotalUnidentified: v.TotalUnidentified, Clipped: v.Clipped, TotalClientIDs: v.TotalClientIDs}
 			if v.ClientIDs != nil {
 				cc.ClientIDs = make(map[string]int, len(v.ClientIDs))
-				for id, n := range v.ClientIDs {
-					cc.ClientIDs[id] = n
-				}
+				maps.Copy(cc.ClientIDs, v.ClientIDs)
 			}
 			c.Counts[k] = cc
 		}
