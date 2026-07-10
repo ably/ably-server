@@ -4,6 +4,7 @@ title: 'Summaries: aggregate annotations into per-message summaries'
 status: To Do
 assignee: []
 created_date: '2026-07-09 11:06'
+updated_date: '2026-07-10 10:13'
 labels: []
 dependencies:
   - TASK-64
@@ -20,8 +21,9 @@ PDR-090's experimental scope includes annotation summaries: the server rolls up 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
 - [ ] #1 An annotation create/delete updates the target message's summary and subscribers receive a MESSAGE_SUMMARY message carrying the new summary
-- [ ] #2 Summary aggregation semantics match Ably for the supported summarisation methods (at minimum the methods ably-js exercises)
-- [ ] #3 Message history and single-message reads include the current summary
-- [ ] #4 Works across nodes in cluster mode
-- [ ] #5 DESIGN.md documents the summary model
+- [ ] #2 Message history and single-message reads include the current summary
+- [ ] #3 Works across nodes in cluster mode
+- [ ] #4 All five v1 summarisation methods implemented (distinct.v1, unique.v1, multiple.v1, flag.v1, total.v1) with folds and wire shapes matching the reference (lib/ablyrpc annotation.go + message_test.go summary encodings)
+- [ ] #5 Per DESIGN.md §14.2: the summary is folded transactionally at store time, stamped on the stored annotation cm, and delivered from that snapshot as a MESSAGE with action summary (4) to ordinary subscribe attachments — no separate rollup publish, no debounce
+- [ ] #6 Unit tests mirror the reference's summary wire-shape tests; SDK-level verification is deferred to the ably-js run (TASK-68), since ably-go has no annotations API
 <!-- AC:END -->

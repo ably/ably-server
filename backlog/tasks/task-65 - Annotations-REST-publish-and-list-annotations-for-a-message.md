@@ -4,6 +4,7 @@ title: 'Annotations REST: publish and list annotations for a message'
 status: To Do
 assignee: []
 created_date: '2026-07-09 11:05'
+updated_date: '2026-07-10 10:13'
 labels: []
 dependencies:
   - TASK-63
@@ -23,4 +24,5 @@ REST surface for annotations per Ably's API: POST /channels/{channel}/messages/{
 - [ ] #2 GET /channels/{channel}/messages/{serial}/annotations returns the message's annotations, paginated via Link headers
 - [ ] #3 Both endpoints accept and return JSON and msgpack
 - [ ] #4 DESIGN.md §2.2 REST table updated
+- [ ] #5 Auth matches DESIGN.md §14.4/§14.5: POST requires annotation-publish, GET requires history
 <!-- AC:END -->

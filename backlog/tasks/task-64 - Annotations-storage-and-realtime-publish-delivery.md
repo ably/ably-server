@@ -4,6 +4,7 @@ title: 'Annotations: storage and realtime publish/delivery'
 status: To Do
 assignee: []
 created_date: '2026-07-09 11:05'
+updated_date: '2026-07-10 10:13'
 labels: []
 dependencies:
   - TASK-63
@@ -23,4 +24,5 @@ With the wire types in place (TASK-63), make annotations flow end to end over re
 - [ ] #2 Attachments with ANNOTATION_SUBSCRIBE receive outbound ANNOTATION frames; attachments without it do not
 - [ ] #3 Publish without ANNOTATION_PUBLISH mode is NACKed
 - [ ] #4 Works in memory, disk, and cluster modes (cluster via the normal NOTIFY path)
+- [ ] #5 Behaviour matches DESIGN.md §14.1/§14.3: annotation cms are kind=annotation sharing the channelSerial namespace, message_serial holds the target serial, targets must exist in the latest-version projection, concrete clientId required except anonymous multiple.v1/total.v1 publishes, and the no-mode-bits ATTACH default excludes the annotation modes
 <!-- AC:END -->

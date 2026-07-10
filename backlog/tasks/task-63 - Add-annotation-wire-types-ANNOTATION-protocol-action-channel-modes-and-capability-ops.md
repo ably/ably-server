@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-09 11:05'
+updated_date: '2026-07-10 10:13'
 labels: []
 dependencies: []
 documentation:
@@ -26,5 +27,5 @@ PDR-090 puts message annotations in the experimental-release functional scope ('
 - [ ] #2 ProtocolMessage supports action ANNOTATION (21) carrying annotations[]
 - [ ] #3 ANNOTATION_PUBLISH and ANNOTATION_SUBSCRIBE mode flags participate in attach mode resolution alongside the existing four modes
 - [ ] #4 annotation-publish and annotation-subscribe are recognised capability ops
-- [ ] #5 DESIGN.md documents the annotation model
+- [ ] #5 Constants and wire shapes match DESIGN.md §14: annotation actions create=0/delete=1, ANNOTATION protocol action 21, mode bits ANNOTATION_PUBLISH 1<<21 and ANNOTATION_SUBSCRIBE 1<<22, type parsed as <name>:<aggregation> against the five v1 methods
 <!-- AC:END -->

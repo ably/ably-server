@@ -94,6 +94,7 @@ Supported `Action` values:
 | `PRESENCE` (14) | ✓ | ✓ | presence enter/update/leave + delivery (see §12) |
 | `MESSAGE` (15) | ✓ | ✓ | publish + delivery |
 | `SYNC` (16) | | ✓ | presence set sync after attach (see §12) |
+| `ANNOTATION` (21) | ✓ | ✓ | annotation publish + delivery (see §14) |
 | `AUTH` (17) | ✓ | ✓ | inband re-auth: the server prompts near token expiry; the client supplies a fresh token (see §3) |
 
 ### 2.2 REST
@@ -109,6 +110,8 @@ All REST endpoints live under the root and accept either `application/json` or
 | GET | `/channels/{channel}/messages` | history (paginated; latest version per message, see §13.4) |
 | GET | `/channels/{channel}/messages/{serial}` | one message, latest version (see §13.4) |
 | GET | `/channels/{channel}/messages/{serial}/versions` | all versions of a message (paginated) |
+| POST | `/channels/{channel}/messages/{serial}/annotations` | publish an annotation on a message (see §14) |
+| GET | `/channels/{channel}/messages/{serial}/annotations` | a message's annotations (paginated, see §14.4) |
 | GET | `/channels/{channel}/presence` | current presence members (see §12) |
 | GET | `/channels/{channel}/presence/history` | presence history (paginated) |
 | POST | `/keys/{keyName}/requestToken` | mint a token (JWT) from a signed `TokenRequest` (see §3) |
@@ -215,8 +218,12 @@ modes are deliberately distinct so the SDK reacts correctly:
   The `[queue]*` / `[meta]*` resource prefixes do not apply since neither
   queues nor metachannels are in scope.
 - `<op>` is one of `publish`, `subscribe`, `presence`, `history`,
-  `stats`, `message-update-own`, `message-update-any`,
+  `stats`, `annotation-publish`, `annotation-subscribe`,
+  `message-update-own`, `message-update-any`,
   `message-delete-own`, `message-delete-any`. `*` matches any op.
+  The `annotation-*` ops gate annotations (§14): publishing one, and
+  receiving the raw `ANNOTATION` stream (summaries need only
+  `subscribe`).
   `stats` gates the `/stats` stub (§1) and is app-wide rather than
   per-channel, so it must be granted on the `*` resource.
   `subscribe` covers both
@@ -243,11 +250,16 @@ operation is rejected:
 | WS inbound `MESSAGE` (`update`/`append`) | `message-update-own`/`-any` (see §13.5) |
 | WS inbound `MESSAGE` (`delete`) | `message-delete-own`/`-any` |
 | WS inbound `PRESENCE` | `presence` (and the attachment must hold the `PRESENCE` mode flag) |
+| WS `ATTACH` flag `ANNOTATION_PUBLISH` | `annotation-publish` |
+| WS `ATTACH` flag `ANNOTATION_SUBSCRIBE` | `annotation-subscribe` |
+| WS inbound `ANNOTATION` | `annotation-publish` (and the attachment must hold the `ANNOTATION_PUBLISH` mode flag) |
 | REST `POST .../messages` | `publish` |
 | REST `PATCH .../messages/{serial}` | `message-{update,delete}-{own,any}` (see §13.5) |
 | REST `GET .../messages`, `GET .../messages/{serial}[/versions]` | `history` |
 | REST `GET .../presence` | `subscribe` |
 | REST `GET .../presence/history` | `history` |
+| REST `POST .../messages/{serial}/annotations` | `annotation-publish` |
+| REST `GET .../messages/{serial}/annotations` | `history` |
 | REST `GET /stats` | `stats` — app-wide, so it must be granted on the `*` resource |
 
 `ATTACH` mode resolution: the effective mode set delivered in `ATTACHED.flags`
@@ -378,9 +390,12 @@ the flags word, matching Ably's wire constants:
 | `PUBLISH` | `1 << 17` | publish `MESSAGE` |
 | `SUBSCRIBE` | `1 << 18` | receive `MESSAGE` |
 | `PRESENCE_SUBSCRIBE` | `1 << 19` | receive `PRESENCE` + presence sync |
+| `ANNOTATION_PUBLISH` | `1 << 21` | publish `ANNOTATION` (see §14) |
+| `ANNOTATION_SUBSCRIBE` | `1 << 22` | receive raw `ANNOTATION` frames (see §14.3) |
 
-If `flags` carries no mode bits the server treats it as the full set
-(matches SDK default).
+If `flags` carries no mode bits the server treats it as the default set —
+the four non-annotation modes above (matches SDK default; the annotation
+modes are opt-in, §14.3).
 
 The effective mode set is `requested ∩ capability-permitted`, where the
 permitted set is derived from the per-op capability mapping in §3:
@@ -389,6 +404,8 @@ permitted set is derived from the per-op capability mapping in §3:
   `subscribe` on the channel.
 - `PUBLISH` permitted iff cap grants `publish`.
 - `PRESENCE` permitted iff cap grants `presence`.
+- `ANNOTATION_PUBLISH` / `ANNOTATION_SUBSCRIBE` permitted iff cap grants
+  `annotation-publish` / `annotation-subscribe`.
 
 Empty intersection → the attach is rejected with `ERROR` (`code: 40160`)
 and no channel state is created. Otherwise `ATTACHED.flags` carries the
@@ -789,7 +806,7 @@ CREATE TABLE channel_messages (
   channel_serial TEXT     NOT NULL,    -- "<ts>-<ctr>@<series>" (§8) — this cm's position
   idx            INT      NOT NULL,    -- position within the publish batch
   id             TEXT,                 -- nullable, client-supplied idempotency key
-  kind           TEXT     NOT NULL DEFAULT 'message',  -- 'message' | 'presence' (§12.1)
+  kind           TEXT     NOT NULL DEFAULT 'message',  -- 'message' | 'presence' (§12.1) | 'annotation' (§14)
   message_serial TEXT,                 -- message identity (§8); NULL for presence; = channel_serial:idx for a create
   payload        BYTEA    NOT NULL,    -- msgpack protocol.Message or PresenceMessage, per kind
   PRIMARY KEY (channel, channel_serial, idx)
@@ -1234,8 +1251,9 @@ can be brought up to date without replaying the whole stream.
 A presence operation is a publish like any other: it lands on the
 channel as one ChannelMessage and flows through the unified
 `storage → Appender.Append` path (§7). The only difference is the
-payload — a ChannelMessage carries **either** `Messages` (a data
-publish) **or** `Presence` (a presence publish), never both:
+payload — a ChannelMessage carries exactly one of `Messages` (a data
+publish), `Presence` (a presence publish), or `Annotations` (an
+annotation publish, §14):
 
 ```go
 type PresenceMessage struct {
@@ -1587,7 +1605,129 @@ use `history`.
   `GET .../messages/{serial}` and `GET .../messages/{serial}/versions`
   read the latest version and the full version chain (§2.2).
 
-## 14. Testing strategy
+## 14. Annotations & summaries
+
+An **annotation** is a piece of metadata a client attaches to an existing
+message — a reaction, a citation, a flag — identified by a `type` and
+aggregated by the server into a per-message **summary** that subscribers
+and history readers consume instead of the raw annotation stream. As with
+presence (§12) and mutations (§13), annotations are operations on the
+append-only stream plus a derived view: nothing is rewritten in place.
+
+### 14.1 Model
+
+An annotation is a publish like any other: it lands on the channel as one
+ChannelMessage carrying `Annotations []*protocol.Annotation` (never
+`Messages` or `Presence`) and flows through the unified
+`storage → Appender.Append` path (§7), as a third stream kind
+(`kind = annotation`) sharing the channelSerial namespace.
+
+An Annotation carries: `id` / `serial` with the same split as Message
+(§8 — client-supplied idempotency key vs server-assigned
+`<channelSerial>:<idx>`), an `action` (`annotation.create = 0`,
+`annotation.delete = 1`), the target `messageSerial`, a `type`, optional
+`name`, `count`, `data`/`encoding`, and the attributed `clientId` plus
+server-stamped `connectionId` and `timestamp` — field names and enum
+values pinned to Ably's wire shape.
+
+The `type` has the form `<name>:<aggregation>` where `<aggregation>` is
+one of the five v1 **summarisation methods**: `distinct.v1` (per-value
+set of distinct clientIds), `unique.v1` (one value per clientId, newest
+wins), `multiple.v1` (per-value counts, `count` honoured), `flag.v1`
+(boolean per clientId), `total.v1` (anonymous tally). Validation mirrors
+Ably: a missing/malformed `messageSerial` or `type` is rejected (40000).
+
+**Identity.** Annotation publishes are attributed: a concrete `clientId`
+is required (resolved per §3.2), except that the `multiple.v1` and
+`total.v1` methods also accept anonymous publishes — mirroring Ably's
+anonymous-aggregation allowance. An `annotation.delete` removes the
+caller's own contribution(s) for the type, per the method's fold.
+
+**Target existence.** The target message must resolve in the
+latest-version projection (§13.4) — i.e. exist within retention — or the
+publish is rejected, exactly as for update/delete.
+
+### 14.2 Summary fold
+
+The summary is the fold of a message's annotations, computed **by the
+storage backend transactionally at store time** — the same pattern as the
+presence membership set (§12.5) and the latest-version projection
+(§13.4). `StoreAnnotation` mints the channelSerial, persists the
+annotation cm on the log, folds it into the target message's summary (a
+`map[type]aggregation` keyed by the full `<name>:<aggregation>` type),
+and stamps the **post-fold summary snapshot onto the stored cm** before
+it reaches the Appender.
+
+That snapshot is what makes cluster delivery deterministic: every node —
+including ones that never witnessed earlier annotations — emits the
+summary for a given annotation cm from the cm itself, off the normal
+Append/NOTIFY path (§7.2). No node ever publishes a separate rollup, so
+there is no duplicate-summary problem and no cross-node coordination
+beyond the existing per-channel advisory lock. There is no debounce:
+one summary delivery per annotation, which Ably's conflation latitude
+permits (only the *latest* summary a subscriber holds matters).
+
+The summary is stored on the messages projection row (the merged latest
+Message carries its `summary`), so it dies with the message under
+whatever retention policy applies (TASK-26) — a summary is message
+state, not independent state.
+
+### 14.3 Delivery
+
+On Append of an annotation cm a node emits, per attachment mode (§4.2):
+
+- **`ANNOTATION` (21)** — the raw annotation, only to attachments
+  holding `ANNOTATION_SUBSCRIBE`. Publishing requires the
+  `ANNOTATION_PUBLISH` mode on the attachment (WS) and is NACKed
+  without it.
+- **`MESSAGE` with `action: summary` (4)** — the post-fold summary
+  snapshot, carrying the target message's unchanged `serial` and the
+  `summary` object, to ordinary `SUBSCRIBE` attachments. This is how a
+  subscriber that knows nothing about annotations sees reactions/
+  citations accumulate. Wire shape:
+  `{"action": 4, "serial": "<target>", "summary": {"<type>": {…}}}`
+  with the per-method value shapes (`{value: {total, clientIds}}` for
+  distinct/unique, counts for multiple, etc.) pinned to Ably's.
+
+The two new mode flags extend the §4.2 table: `ANNOTATION_PUBLISH`
+(`1 << 21`) and `ANNOTATION_SUBSCRIBE` (`1 << 22`), permitted iff the
+capability grants `annotation-publish` / `annotation-subscribe`
+respectively (§3.1). When `ATTACH.flags` carries no mode bits, the
+default set does **not** include the annotation modes (matching SDK
+defaults); clients opt in via modes or channel params.
+
+Live and resume delivery follow the stream: a resuming attachment
+replaying a gap (§4.3) receives the annotation/summary cms in stream
+order and converges on the newest summary. History *reads* do not
+enumerate annotation cms — they return messages whose embedded `summary`
+is current (§14.4) — and a `kind = message` history scan skips
+annotation cms exactly as it skips presence.
+
+### 14.4 Reads
+
+- `GET /channels/{channel}/messages/{serial}/annotations` — the raw
+  annotations for one message, in stream order, paginated with the
+  standard `Link` convention (§2.2); requires `history` (reads) —
+  publishes via `POST` on the same path require `annotation-publish`.
+- Message reads (`GET .../messages`, `GET .../messages/{serial}`,
+  history) carry the current `summary` on each message via the
+  latest-version projection — no separate summary endpoint.
+
+Storage: annotation log rows are `kind = annotation` with
+`message_serial` holding the **target** message serial, so the existing
+serial index serves annotations-for-message scans (message-version scans
+add `kind = 'message'` to their predicates, §6.3). The summary lives in
+the messages projection payload; bbolt mirrors this in its `messages`
+bucket value, memory in its projection map.
+
+### 14.5 Capabilities
+
+Two ops extend §3.1, matching Ably: `annotation-publish` (publish an
+annotation, WS or REST) and `annotation-subscribe` (receive raw
+`ANNOTATION` frames). Summaries require only `subscribe` — they are
+message deliveries. Reading annotations via REST requires `history`.
+
+## 15. Testing strategy
 
 - **Unit**: per-package; mock-free where practical (the storage interface
   has an in-memory implementation, exercised by the same test suite as the
@@ -1602,7 +1742,7 @@ There is no existing Ably protocol conformance suite to target; the
 ably-go integration tests are the de-facto external check on SDK
 compatibility.
 
-## 15. Project layout & licensing
+## 16. Project layout & licensing
 
 - License: **Apache 2.0** (matches ably-go).
 - Module: `github.com/ably/ably-server`.
