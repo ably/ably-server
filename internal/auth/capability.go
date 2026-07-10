@@ -31,6 +31,12 @@ const (
 	OpMessageDeleteOwn Op = "message-delete-own"
 	OpMessageDeleteAny Op = "message-delete-any"
 
+	// Annotation ops (DESIGN.md §3.1, §14.5). annotation-publish gates
+	// publishing an annotation (WS or REST); annotation-subscribe gates
+	// receiving the raw ANNOTATION stream (summaries need only subscribe).
+	OpAnnotationPublish   Op = "annotation-publish"
+	OpAnnotationSubscribe Op = "annotation-subscribe"
+
 	// OpWildcard grants every operation on a matching resource.
 	OpWildcard Op = "*"
 )

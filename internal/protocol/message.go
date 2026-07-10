@@ -81,9 +81,10 @@ type MessageVersion struct {
 // one ChannelMessage; subscribers receive ChannelMessages as the
 // atomic delivery unit (one outbound MESSAGE frame per ChannelMessage).
 // Storage persists ChannelMessages keyed by ChannelSerial.
-// A ChannelMessage carries either Messages (a data publish) or Presence
-// (a presence publish), never both — the two ride one ordered stream
-// distinguished by which slice is populated (DESIGN.md §12.1).
+// A ChannelMessage carries exactly one of Messages (a data publish),
+// Presence (a presence publish), or Annotations (an annotation publish,
+// DESIGN.md §14.1) — the three ride one ordered stream distinguished by
+// which slice is populated (DESIGN.md §12.1).
 //
 // ID is the batch identifier for a message publish (DESIGN.md §8): the
 // client-supplied idempotency key, or a server-generated 8-char base64
@@ -95,6 +96,7 @@ type ChannelMessage struct {
 	ChannelSerial string             `json:"channelSerial,omitempty" msgpack:"channelSerial,omitempty"`
 	Messages      []*Message         `json:"messages,omitempty"      msgpack:"messages,omitempty"`
 	Presence      []*PresenceMessage `json:"presence,omitempty"      msgpack:"presence,omitempty"`
+	Annotations   []*Annotation      `json:"annotations,omitempty"   msgpack:"annotations,omitempty"`
 }
 
 // ProtocolMessage is one frame on the realtime WebSocket connection.
@@ -115,6 +117,7 @@ type ProtocolMessage struct {
 	Flags         int64              `json:"flags,omitempty"         msgpack:"flags,omitempty"`
 	Messages      []*Message         `json:"messages,omitempty"      msgpack:"messages,omitempty"`
 	Presence      []*PresenceMessage `json:"presence,omitempty"      msgpack:"presence,omitempty"`
+	Annotations   []*Annotation      `json:"annotations,omitempty"   msgpack:"annotations,omitempty"`
 	Error         *ErrorInfo         `json:"error,omitempty"         msgpack:"error,omitempty"`
 	Params        map[string]string  `json:"params,omitempty"        msgpack:"params,omitempty"`
 	// ConnectionDetails carries the resolved identity and connection
@@ -214,4 +217,9 @@ const (
 	FlagPublish           int64 = 1 << 17 // publish MESSAGE
 	FlagSubscribe         int64 = 1 << 18 // receive MESSAGE
 	FlagPresenceSubscribe int64 = 1 << 19 // receive PRESENCE + presence sync
+	// Annotation modes (DESIGN.md §14.3). They are opt-in: the no-mode-bits
+	// ATTACH default set excludes them (§4.2). Bits match Ably's wire
+	// constants (1<<20 MAY_HAVE_PRESENCE is internal-only and unused here).
+	FlagAnnotationPublish   int64 = 1 << 21 // publish ANNOTATION
+	FlagAnnotationSubscribe int64 = 1 << 22 // receive raw ANNOTATION frames
 )

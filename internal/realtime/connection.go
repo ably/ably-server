@@ -390,6 +390,16 @@ func (c *connection) permittedModes(channel string) int64 {
 	if cap.Permits(channel, auth.OpPresence) {
 		m |= protocol.FlagPresence
 	}
+	// Annotation modes (DESIGN.md §4.2, §14.3): permitted iff the
+	// capability grants the matching annotation op. They are opt-in —
+	// resolveModes excludes them from the no-mode-bits default — but a
+	// client that requests them is granted them here when permitted.
+	if cap.Permits(channel, auth.OpAnnotationPublish) {
+		m |= protocol.FlagAnnotationPublish
+	}
+	if cap.Permits(channel, auth.OpAnnotationSubscribe) {
+		m |= protocol.FlagAnnotationSubscribe
+	}
 	return m
 }
 

@@ -115,17 +115,26 @@ func newAttachment(parent context.Context, name string, channel *core.Channel, s
 	}
 }
 
-// allModes is the full channel-mode set — the default when an ATTACH
-// requests no specific modes (DESIGN.md §4.2).
-const allModes = protocol.FlagPresence | protocol.FlagPublish | protocol.FlagSubscribe | protocol.FlagPresenceSubscribe
+// defaultModes is the ATTACH default when a client requests no specific
+// modes — the four non-annotation modes (DESIGN.md §4.2). The annotation
+// modes are opt-in and deliberately excluded (§14.3), matching SDK
+// defaults.
+const defaultModes = protocol.FlagPresence | protocol.FlagPublish | protocol.FlagSubscribe | protocol.FlagPresenceSubscribe
+
+// modeMask is every recognised channel-mode bit — the four defaults plus
+// the two opt-in annotation modes (DESIGN.md §4.2, §14.3). Used to extract
+// the requested mode bits from an ATTACH flags word.
+const modeMask = defaultModes | protocol.FlagAnnotationPublish | protocol.FlagAnnotationSubscribe
 
 // resolveModes extracts the channel-mode bits from an ATTACH flags word.
-// A request with no mode bits is treated as the full set (SDK default).
+// A request with no mode bits is treated as the default set (the four
+// non-annotation modes; annotation modes must be opted into explicitly,
+// DESIGN.md §4.2, §14.3).
 func resolveModes(flags int64) int64 {
-	if m := flags & allModes; m != 0 {
+	if m := flags & modeMask; m != 0 {
 		return m
 	}
-	return allModes
+	return defaultModes
 }
 
 // hasMode reports whether this attachment holds the given channel mode.

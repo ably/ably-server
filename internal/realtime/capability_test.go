@@ -67,8 +67,8 @@ func TestAttachModesFromCapability(t *testing.T) {
 		t.Fatalf("action = %v, want ATTACHED", f.Action)
 	}
 	wantModes := protocol.FlagSubscribe | protocol.FlagPresenceSubscribe
-	if f.Flags&allModes != wantModes {
-		t.Errorf("ATTACHED modes = %b, want %b", f.Flags&allModes, wantModes)
+	if f.Flags&modeMask != wantModes {
+		t.Errorf("ATTACHED modes = %b, want %b", f.Flags&modeMask, wantModes)
 	}
 
 	// Requesting only PUBLISH on chat:* yields an empty intersection →

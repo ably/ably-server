@@ -21,6 +21,9 @@ const (
 	ActionMessage      Action = 15
 	ActionSync         Action = 16
 	ActionAuth         Action = 17
+	// ActionAnnotation carries annotation publishes and deliveries
+	// (DESIGN.md §14). Pinned to Ably's wire value 21.
+	ActionAnnotation Action = 21
 )
 
 var actionNames = map[Action]string{
@@ -42,6 +45,7 @@ var actionNames = map[Action]string{
 	ActionMessage:      "message",
 	ActionSync:         "sync",
 	ActionAuth:         "auth",
+	ActionAnnotation:   "annotation",
 }
 
 func (a Action) String() string {
