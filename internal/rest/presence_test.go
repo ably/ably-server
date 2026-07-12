@@ -203,6 +203,61 @@ func TestPresenceHistoryPagination(t *testing.T) {
 	}
 }
 
+// TestPresenceHistoryDirectionPagination pins direction-qualified
+// presence-history reads (RSP4b2): with five members entered in order
+// a..e, a forwards scan returns them oldest-first and a backwards scan
+// newest-first, and both walk the full set across limit=2 pages via the
+// opaque rel=next cursor without dropping or repeating a member.
+func TestPresenceHistoryDirectionPagination(t *testing.T) {
+	for _, tc := range []struct {
+		direction string
+		want      []string
+	}{
+		{"forwards", []string{"a", "b", "c", "d", "e"}},
+		{"backwards", []string{"e", "d", "c", "b", "a"}},
+	} {
+		t.Run(tc.direction, func(t *testing.T) {
+			srv, manager := newTestServer(t)
+			for _, c := range []string{"a", "b", "c", "d", "e"} {
+				enterPresence(t, manager, "room", &protocol.PresenceMessage{Action: protocol.PresenceEnter, ClientID: c, ConnectionID: c})
+			}
+
+			var got []string
+			pages := 0
+			nextURL := "/channels/room/presence/history?direction=" + tc.direction + "&limit=2"
+			for nextURL != "" {
+				req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+nextURL, nil)
+				if err != nil {
+					t.Fatalf("new request: %v", err)
+				}
+				req.SetBasicAuth("app.key", "secret")
+				resp, err := srv.Client().Do(req)
+				if err != nil {
+					t.Fatalf("page %d do: %v", pages+1, err)
+				}
+				page := decodePresenceJSON(t, resp)
+				for _, m := range page {
+					got = append(got, m.ClientID)
+				}
+				pages++
+				nextURL = nextLink(t, resp)
+				resp.Body.Close()
+				if pages > 5 {
+					t.Fatal("pagination did not terminate")
+				}
+			}
+
+			if !equalStrings(got, tc.want) {
+				t.Fatalf("direction=%s paged order = %v, want %v", tc.direction, got, tc.want)
+			}
+			// 5 members at limit 2 => 3 pages (2, 2, 1).
+			if pages != 3 {
+				t.Fatalf("direction=%s paged %d times, want 3", tc.direction, pages)
+			}
+		})
+	}
+}
+
 // TestPresenceGetPaginatesByLimit seeds six members and pages the
 // presence set with limit=2: three full pages of two, a rel=next link on
 // all but the last, and the full set recovered across pages (RSP3a1).
