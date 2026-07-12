@@ -45,7 +45,7 @@ func TestAckCountPerProtocolMessage(t *testing.T) {
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   "room",
-		MsgSerial: 1,
+		MsgSerial: msgSerialPtr(1),
 		Messages:  []*protocol.Message{{Data: "v1"}},
 	})
 
@@ -84,10 +84,10 @@ func TestAckCountPerProtocolMessage(t *testing.T) {
 			t.Fatalf("frame %d: action = %v, want ACK", i+1, a.Action)
 		}
 		if a.Count != 1 {
-			t.Errorf("frame %d (msgSerial %d): Count = %d, want 1", i+1, a.MsgSerial, a.Count)
+			t.Errorf("frame %d (msgSerial %d): Count = %d, want 1", i+1, a.PublishSerial(), a.Count)
 		}
-		if a.MsgSerial != want {
-			t.Errorf("ACK %d: msgSerial = %d, want %d", i+1, a.MsgSerial, want)
+		if a.PublishSerial() != want {
+			t.Errorf("ACK %d: msgSerial = %d, want %d", i+1, a.PublishSerial(), want)
 		}
 	}
 }
@@ -105,7 +105,7 @@ func TestAckCountMultiMessagePublish(t *testing.T) {
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   "room",
-		MsgSerial: 1,
+		MsgSerial: msgSerialPtr(1),
 		Messages: []*protocol.Message{
 			{Data: "a"}, {Data: "b"}, {Data: "c"},
 		},

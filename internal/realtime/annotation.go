@@ -23,7 +23,7 @@ import (
 // Subscribers holding ANNOTATION_SUBSCRIBE receive each annotation as an
 // outbound ANNOTATION frame via the normal attachment cursor (forward()).
 func (c *connection) handleAnnotation(ctx context.Context, msg *protocol.ProtocolMessage) {
-	msgSerial := msg.MsgSerial
+	msgSerial := msg.PublishSerial()
 	if msg.Channel == "" || len(msg.Annotations) == 0 {
 		c.logger.Warn("ANNOTATION with empty channel or no payload; rejecting", "msgSerial", msgSerial)
 		c.enqueueNack(ctx, msgSerial, nil)
@@ -101,7 +101,7 @@ func (c *connection) handleAnnotation(ctx context.Context, msg *protocol.Protoco
 		// is 1: an ACK acknowledges one protocol frame.
 		c.queue(ctx, &protocol.ProtocolMessage{
 			Action:    protocol.ActionAck,
-			MsgSerial: msgSerial,
+			MsgSerial: &msgSerial,
 			Count:     1,
 			Res:       []*protocol.PublishResult{{Serials: annotationSerials(cm.Annotations)}},
 		})

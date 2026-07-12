@@ -1009,6 +1009,45 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 		}
 	})
 
+	t.Run("EmptyStringDataSurvivesStorage", func(t *testing.T) {
+		// An empty-string (and empty []byte) payload must survive the
+		// msgpack storage round-trip — omitempty would otherwise drop it,
+		// so a client that published "" would read back an absent value
+		// (TASK-97 AC#3, DESIGN.md §6).
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		if _, _, err := ch.Store(context.Background(), []*protocol.Message{{Name: "s", Data: ""}, {Name: "b", Data: []byte{}}}); err != nil {
+			t.Fatalf("Store: %v", err)
+		}
+		page, err := ch.History(context.Background(), storage.HistoryQuery{Direction: storage.DirectionForwards})
+		if err != nil {
+			t.Fatalf("History: %v", err)
+		}
+		msgs := page.ChannelMessages
+		if len(msgs) != 1 || len(msgs[0].Messages) != 2 {
+			t.Fatalf("history shape = %v, want one cm with two messages", channelSerialsOf(page))
+		}
+		for i, m := range msgs[0].Messages {
+			if m.Data == nil {
+				t.Errorf("message %d empty Data round-tripped as nil (dropped by storage encoding)", i)
+			}
+		}
+
+		// Presence data "" shares the same storage round-trip.
+		room := mustChannel(t, s, "room")
+		mustEnter(t, room, "conn-1", "alice", "")
+		members, _, err := room.Members(context.Background())
+		if err != nil {
+			t.Fatalf("Members: %v", err)
+		}
+		if len(members) != 1 {
+			t.Fatalf("members = %d, want 1", len(members))
+		}
+		if members[0].Data == nil {
+			t.Errorf("empty presence Data round-tripped as nil (dropped by storage encoding)")
+		}
+	})
+
 	// ---- Mutable messages (DESIGN.md §13) ------------------------------
 
 	t.Run("CreateStampsActionAndVersion", func(t *testing.T) {

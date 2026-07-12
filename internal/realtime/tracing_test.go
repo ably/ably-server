@@ -48,7 +48,7 @@ func TestSpansEmittedWhenTracingEnabled(t *testing.T) {
 	writeProto(t, ws, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   "traced",
-		MsgSerial: 1,
+		MsgSerial: msgSerialPtr(1),
 		Messages:  []*protocol.Message{{Name: "n", Data: "d"}},
 	})
 	if f := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); f.Action != protocol.ActionAck {

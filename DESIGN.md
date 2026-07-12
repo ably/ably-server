@@ -1037,11 +1037,17 @@ should use Ably or fork.
 - **clientId**: optional, resolved at auth time per §3.2. The server stamps
   it onto every outbound `Message.clientId` published by this connection,
   and rejects inbound frames that try to set a different value.
-- **msgSerial** (per-connection publish counter): `int64` on
+- **msgSerial** (per-connection publish counter): `*int64` on
   `ProtocolMessage`, assigned by the client; the server echoes it on
-  `ACK`/`NACK` so the SDK can address publish acknowledgements. Distinct
-  from `channelSerial` below — this is the wire field for publish flow
-  control, not the canonical message ordering identifier.
+  `ACK`/`NACK` so the SDK can address publish acknowledgements. Every
+  `ACK`/`NACK` carries an explicit `msgSerial`, including `0` for the
+  first publish on a connection — SDKs correlate acknowledgements
+  positionally and treat an absent serial as invalid — while frames the
+  server never stamps (`HEARTBEAT`, `CONNECTED`, `MESSAGE` deliveries)
+  omit the field; the pointer distinguishes "publish serial 0" from
+  "no serial". An inbound frame's serial is read as absent-means-0.
+  Distinct from `channelSerial` below — this is the wire field for
+  publish flow control, not the canonical message ordering identifier.
 - **ChannelMessage**: the atomic unit of a publish — one inbound
   REST request, or one `MESSAGE` frame carrying `messages[]`, lands
   on a channel as exactly one ChannelMessage containing one or more

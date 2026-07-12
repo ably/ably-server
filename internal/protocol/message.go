@@ -112,7 +112,15 @@ type ProtocolMessage struct {
 	ConnectionID  string             `json:"connectionId,omitempty"  msgpack:"connectionId,omitempty"`
 	Channel       string             `json:"channel,omitempty"       msgpack:"channel,omitempty"`
 	ChannelSerial string             `json:"channelSerial,omitempty" msgpack:"channelSerial,omitempty"`
-	MsgSerial     int64              `json:"msgSerial,omitempty"     msgpack:"msgSerial,omitempty"`
+	// MsgSerial is the per-connection publish counter (§8), a pointer so
+	// the server can emit msgSerial:0 while every non-publish frame omits
+	// the field. pointer+omitempty emits the value whenever it is non-nil
+	// (including 0) and omits it when nil, so an ACK/NACK always carries an
+	// explicit msgSerial — ably-js reads it positionally and computes NaN
+	// if it is absent (TASK-97) — while HEARTBEAT/CONNECTED/MESSAGE
+	// deliveries, which never set it, stay free of a spurious msgSerial:0.
+	// Read an inbound frame's serial via PublishSerial (absent means 0).
+	MsgSerial     *int64             `json:"msgSerial,omitempty"     msgpack:"msgSerial,omitempty"`
 	Timestamp     int64              `json:"timestamp,omitempty"     msgpack:"timestamp,omitempty"`
 	Count         int                `json:"count,omitempty"         msgpack:"count,omitempty"`
 	// Res carries the per-message publish results back to the publisher
@@ -133,6 +141,18 @@ type ProtocolMessage struct {
 	// re-authentication (DESIGN.md §2.1, §3); field name/tags match
 	// ably-go's authDetails so SDKs encode it unchanged.
 	Auth *AuthDetails `json:"auth,omitempty" msgpack:"auth,omitempty"`
+}
+
+// PublishSerial returns the frame's msgSerial, treating an absent (nil)
+// MsgSerial as 0. Inbound publish-like frames address their ACK by this
+// per-connection counter; ably-go — and this server — omit msgSerial:0 on
+// the first publish, so absent-means-0 preserves inbound compatibility
+// (DESIGN.md §8).
+func (m *ProtocolMessage) PublishSerial() int64 {
+	if m.MsgSerial == nil {
+		return 0
+	}
+	return *m.MsgSerial
 }
 
 // AuthDetails carries the token supplied on an inband AUTH ProtocolMessage

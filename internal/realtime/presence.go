@@ -25,7 +25,7 @@ const teardownLeaveTimeout = 5 * time.Second
 // (§12.3), stamps the connectionId, publishes via the channel, and
 // ACK/NACKs on the msgSerial.
 func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolMessage) {
-	msgSerial := msg.MsgSerial
+	msgSerial := msg.PublishSerial()
 	if msg.Channel == "" || len(msg.Presence) == 0 {
 		c.logger.Warn("PRESENCE with empty channel or no payload; rejecting", "msgSerial", msgSerial)
 		c.enqueueNack(ctx, msgSerial, nil)
@@ -87,7 +87,7 @@ func (c *connection) handlePresence(ctx context.Context, msg *protocol.ProtocolM
 		}
 		c.queue(ctx, &protocol.ProtocolMessage{
 			Action:    protocol.ActionAck,
-			MsgSerial: msgSerial,
+			MsgSerial: &msgSerial,
 			Count:     1,
 		})
 	})
@@ -212,7 +212,7 @@ func (c *connection) publishLeaves(ctx context.Context, channel string, set map[
 func (c *connection) nack(ctx context.Context, msgSerial int64, errInfo *protocol.ErrorInfo) {
 	c.queue(ctx, &protocol.ProtocolMessage{
 		Action:    protocol.ActionNack,
-		MsgSerial: msgSerial,
+		MsgSerial: &msgSerial,
 		Count:     1,
 		Error:     errInfo,
 	})

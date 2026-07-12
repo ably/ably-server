@@ -119,7 +119,7 @@ func TestShutdownSynthesisesPresenceLeave(t *testing.T) {
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionPresence,
 		Channel:   "room",
-		MsgSerial: 1,
+		MsgSerial: msgSerialPtr(1),
 		Presence:  []*protocol.PresenceMessage{{Action: protocol.PresenceEnter, Data: "hi"}},
 	})
 	if ack := readFrame(t, ws, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {

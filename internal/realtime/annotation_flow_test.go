@@ -16,7 +16,7 @@ func publishMessageForTarget(t *testing.T, ws *websocket.Conn, channel string, m
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   channel,
-		MsgSerial: msgSerial,
+		MsgSerial: msgSerialPtr(msgSerial),
 		Messages:  []*protocol.Message{{Data: "post"}},
 	})
 	ack := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
@@ -35,7 +35,7 @@ func sendAnnotation(t *testing.T, ws *websocket.Conn, channel, messageSerial str
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionAnnotation,
 		Channel:   channel,
-		MsgSerial: msgSerial,
+		MsgSerial: msgSerialPtr(msgSerial),
 		Annotations: []*protocol.Annotation{{
 			Action:        protocol.AnnotationCreate,
 			Type:          "reaction:multiple.v1",

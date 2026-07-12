@@ -17,7 +17,7 @@ func publishCreate(t *testing.T, ws *websocket.Conn, channel string, msgSerial i
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   channel,
-		MsgSerial: msgSerial,
+		MsgSerial: msgSerialPtr(msgSerial),
 		Messages:  []*protocol.Message{{Data: data}},
 	})
 	var serial string
@@ -39,7 +39,7 @@ func sendMutation(t *testing.T, ws *websocket.Conn, channel string, msgSerial in
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   channel,
-		MsgSerial: msgSerial,
+		MsgSerial: msgSerialPtr(msgSerial),
 		Messages:  []*protocol.Message{m},
 	})
 }
@@ -84,7 +84,7 @@ func TestMutationUpdateAckedAndForwarded(t *testing.T) {
 			fwd = f
 		}
 	}
-	if ack == nil || ack.MsgSerial != 2 || ack.Count != 1 {
+	if ack == nil || ack.PublishSerial() != 2 || ack.Count != 1 {
 		t.Fatalf("ACK = %+v, want msgSerial 2 / count 1", ack)
 	}
 	if fwd == nil {
@@ -129,7 +129,7 @@ func TestMutationDeleteForwarded(t *testing.T) {
 			fwd = f
 		}
 	}
-	if ack == nil || ack.MsgSerial != 2 {
+	if ack == nil || ack.PublishSerial() != 2 {
 		t.Fatalf("ACK = %+v, want msgSerial 2", ack)
 	}
 	if fwd == nil || fwd.Messages[0].Action != protocol.MessageDelete {
@@ -188,8 +188,8 @@ func TestMutationTargetNotFound(t *testing.T) {
 	if f.Action != protocol.ActionNack {
 		t.Fatalf("action = %v, want NACK", f.Action)
 	}
-	if f.MsgSerial != 5 {
-		t.Errorf("NACK msgSerial = %d, want 5", f.MsgSerial)
+	if f.PublishSerial() != 5 {
+		t.Errorf("NACK msgSerial = %d, want 5", f.PublishSerial())
 	}
 }
 
@@ -211,7 +211,7 @@ func TestMutationWithoutAttachmentSucceeds(t *testing.T) {
 	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   "room",
-		MsgSerial: 1,
+		MsgSerial: msgSerialPtr(1),
 		Messages:  []*protocol.Message{{Data: "v1"}},
 	})
 	if ack := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {

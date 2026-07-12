@@ -123,7 +123,7 @@ func TestReauthSuccess(t *testing.T) {
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   "chat:room",
-		MsgSerial: 1,
+		MsgSerial: msgSerialPtr(1),
 		Messages:  []*protocol.Message{{Name: "n", Data: "x"}},
 	})
 	if f := readFrame(t, ws, protocol.FormatJSON, 3*time.Second); f.Action != protocol.ActionAck {

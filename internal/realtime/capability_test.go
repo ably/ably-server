@@ -163,7 +163,7 @@ func TestInboundMessageCapability(t *testing.T) {
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   "chat:room",
-		MsgSerial: 1,
+		MsgSerial: msgSerialPtr(1),
 		Messages:  []*protocol.Message{{Name: "n", Data: "x"}},
 	})
 	f := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
@@ -177,7 +177,7 @@ func TestInboundMessageCapability(t *testing.T) {
 	sendFrame(t, ws2, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   "chat:room",
-		MsgSerial: 1,
+		MsgSerial: msgSerialPtr(1),
 		Messages:  []*protocol.Message{{Name: "n", Data: "x"}},
 	})
 	f = readFrame(t, ws2, protocol.FormatJSON, 2*time.Second)
@@ -196,7 +196,7 @@ func sendUpdate(t *testing.T, ws *websocket.Conn, channel, serial string, msgSer
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   channel,
-		MsgSerial: msgSerial,
+		MsgSerial: msgSerialPtr(msgSerial),
 		Messages:  []*protocol.Message{{Action: protocol.MessageUpdate, Serial: serial, Data: "edited"}},
 	})
 	return readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
@@ -212,7 +212,7 @@ func TestWSMutationOwnership(t *testing.T) {
 	sendFrame(t, alice, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   channel,
-		MsgSerial: 1,
+		MsgSerial: msgSerialPtr(1),
 		Messages:  []*protocol.Message{{Name: "n", Data: "orig"}},
 	})
 	ack := readFrame(t, alice, protocol.FormatJSON, 2*time.Second)

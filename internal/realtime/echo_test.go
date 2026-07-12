@@ -66,7 +66,7 @@ func TestEchoFalseSuppressesOwnMessage(t *testing.T) {
 	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   "room",
-		MsgSerial: 1,
+		MsgSerial: msgSerialPtr(1),
 		Messages:  []*protocol.Message{{Data: "hello"}},
 	})
 
@@ -96,7 +96,7 @@ func TestEchoTrueReceivesOwnMessage(t *testing.T) {
 	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   "room",
-		MsgSerial: 1,
+		MsgSerial: msgSerialPtr(1),
 		Messages:  []*protocol.Message{{Data: "hi"}},
 	})
 
@@ -132,7 +132,7 @@ func TestEchoFalseStillDeliversOwnPresence(t *testing.T) {
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionPresence,
 		Channel:   "room",
-		MsgSerial: 1,
+		MsgSerial: msgSerialPtr(1),
 		Presence:  []*protocol.PresenceMessage{{Action: protocol.PresenceEnter, Data: "here"}},
 	})
 

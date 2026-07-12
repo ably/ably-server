@@ -272,17 +272,17 @@ func (c *connection) dispatch(ctx context.Context, msg *protocol.ProtocolMessage
 	case protocol.ActionDetach:
 		c.handleDetach(ctx, msg.Channel)
 	case protocol.ActionMessage:
-		if !c.acceptMsgSerial(msg.MsgSerial) {
+		if !c.acceptMsgSerial(msg.PublishSerial()) {
 			return
 		}
 		c.handleMessage(ctx, msg)
 	case protocol.ActionPresence:
-		if !c.acceptMsgSerial(msg.MsgSerial) {
+		if !c.acceptMsgSerial(msg.PublishSerial()) {
 			return
 		}
 		c.handlePresence(ctx, msg)
 	case protocol.ActionAnnotation:
-		if !c.acceptMsgSerial(msg.MsgSerial) {
+		if !c.acceptMsgSerial(msg.PublishSerial()) {
 			return
 		}
 		c.handleAnnotation(ctx, msg)
@@ -436,7 +436,7 @@ func (c *connection) handleDetach(ctx context.Context, name string) {
 // rejections are also enqueued so their NACK stays ordered behind any
 // still-pending publishes on this connection (TASK-20).
 func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMessage) {
-	msgSerial := msg.MsgSerial
+	msgSerial := msg.PublishSerial()
 	if msg.Channel == "" {
 		c.logger.Warn("MESSAGE with empty channel name; rejecting", "msgSerial", msgSerial)
 		c.enqueueNack(ctx, msgSerial, nil)
@@ -524,7 +524,7 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 		// is emitted only now, after storage has durably committed.
 		c.queue(ctx, &protocol.ProtocolMessage{
 			Action:    protocol.ActionAck,
-			MsgSerial: msgSerial,
+			MsgSerial: &msgSerial,
 			Count:     1,
 			Res:       []*protocol.PublishResult{{Serials: messageSerials(cm.Messages)}},
 		})

@@ -32,7 +32,7 @@ import (
 // runs on the publish worker (where the creator lookup is available) so it
 // stays ordered with this connection's other ACK/NACKs.
 func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolMessage) {
-	msgSerial := msg.MsgSerial
+	msgSerial := msg.PublishSerial()
 	if len(msg.Messages) != 1 {
 		c.logger.Warn("mutation must carry exactly one message; rejecting",
 			"channel", msg.Channel, "count", len(msg.Messages), "msgSerial", msgSerial)
@@ -110,7 +110,7 @@ func (c *connection) handleMutation(ctx context.Context, msg *protocol.ProtocolM
 		// as the operation's VersionSerial (DESIGN.md §13.1).
 		c.queue(ctx, &protocol.ProtocolMessage{
 			Action:    protocol.ActionAck,
-			MsgSerial: msgSerial,
+			MsgSerial: &msgSerial,
 			Count:     1,
 			Res:       []*protocol.PublishResult{{Serials: []string{storage.VersionSerial(cm.Messages[0])}}},
 		})

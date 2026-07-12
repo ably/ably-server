@@ -91,7 +91,7 @@ func sendPublish(t *testing.T, ws *websocket.Conn, channel string, msgSerial int
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   channel,
-		MsgSerial: msgSerial,
+		MsgSerial: msgSerialPtr(msgSerial),
 		Messages:  []*protocol.Message{{Data: data}},
 	})
 }
@@ -126,8 +126,8 @@ func TestPublishAckAfterCommitNonBlocking(t *testing.T) {
 	// lets storage commit; the ACK follows (ACK-after-durable-commit).
 	close(gate)
 	ack := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
-	if ack.Action != protocol.ActionAck || ack.MsgSerial != 1 {
-		t.Fatalf("post-commit frame = %v/msgSerial %d, want ACK/1", ack.Action, ack.MsgSerial)
+	if ack.Action != protocol.ActionAck || ack.PublishSerial() != 1 {
+		t.Fatalf("post-commit frame = %v/msgSerial %d, want ACK/1", ack.Action, ack.PublishSerial())
 	}
 }
 
@@ -143,8 +143,8 @@ func TestPublishNackOnStoreFailure(t *testing.T) {
 
 	sendPublish(t, ws, "room", 1, "v1")
 	f := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
-	if f.Action != protocol.ActionNack || f.MsgSerial != 1 {
-		t.Fatalf("frame = %v/msgSerial %d, want NACK/1 on store failure", f.Action, f.MsgSerial)
+	if f.Action != protocol.ActionNack || f.PublishSerial() != 1 {
+		t.Fatalf("frame = %v/msgSerial %d, want NACK/1 on store failure", f.Action, f.PublishSerial())
 	}
 }
 
@@ -168,10 +168,10 @@ func TestPublishAckOrderingUnderSlowStore(t *testing.T) {
 
 	first := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
 	second := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
-	if first.Action != protocol.ActionAck || first.MsgSerial != 1 {
-		t.Fatalf("first ACK = %v/msgSerial %d, want ACK/1", first.Action, first.MsgSerial)
+	if first.Action != protocol.ActionAck || first.PublishSerial() != 1 {
+		t.Fatalf("first ACK = %v/msgSerial %d, want ACK/1", first.Action, first.PublishSerial())
 	}
-	if second.Action != protocol.ActionAck || second.MsgSerial != 2 {
-		t.Fatalf("second ACK = %v/msgSerial %d, want ACK/2", second.Action, second.MsgSerial)
+	if second.Action != protocol.ActionAck || second.PublishSerial() != 2 {
+		t.Fatalf("second ACK = %v/msgSerial %d, want ACK/2", second.Action, second.PublishSerial())
 	}
 }

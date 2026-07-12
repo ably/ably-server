@@ -198,7 +198,7 @@ func TestAppendIncompatibleDataNacked(t *testing.T) {
 		if f.Action == protocol.ActionMessage {
 			continue // skip the create echo
 		}
-		if f.Action != protocol.ActionNack || f.MsgSerial != 2 {
+		if f.Action != protocol.ActionNack || f.PublishSerial() != 2 {
 			t.Fatalf("frame = %+v, want NACK on msgSerial 2", f)
 		}
 		break

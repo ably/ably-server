@@ -10,7 +10,7 @@ func TestRoundTrip(t *testing.T) {
 	original := &ProtocolMessage{
 		Action:       ActionConnected,
 		ConnectionID: "abc123def456",
-		MsgSerial:    42,
+		MsgSerial:    i64p(42),
 		Timestamp:    1700000000000,
 	}
 
@@ -122,6 +122,74 @@ func TestMessageRoundTrip(t *testing.T) {
 			}
 			if !reflect.DeepEqual(decoded.Messages[0], original) {
 				t.Fatalf("Message round-trip mismatch:\n got %+v\nwant %+v", decoded.Messages[0], original)
+			}
+		})
+	}
+}
+
+func i64p(v int64) *int64 { return &v }
+
+// TestAckCarriesMsgSerialZero pins TASK-97 AC#1: an ACK (and NACK) for the
+// first publish on a connection — msgSerial 0 — must emit an explicit
+// msgSerial field in BOTH JSON and msgpack. ably-js reads it positionally
+// and computes NaN when it is absent, hanging the first publish.
+func TestAckCarriesMsgSerialZero(t *testing.T) {
+	ack := &ProtocolMessage{Action: ActionAck, MsgSerial: i64p(0), Count: 1}
+
+	jsonData, err := Marshal(ack, FormatJSON)
+	if err != nil {
+		t.Fatalf("Marshal JSON: %v", err)
+	}
+	if !strings.Contains(string(jsonData), `"msgSerial":0`) {
+		t.Errorf("ACK JSON %q missing literal %q", jsonData, `"msgSerial":0`)
+	}
+
+	mpData, err := Marshal(ack, FormatMsgpack)
+	if err != nil {
+		t.Fatalf("Marshal msgpack: %v", err)
+	}
+	var decoded map[string]any
+	if err := unmarshalMsgpackMap(mpData, &decoded); err != nil {
+		t.Fatalf("decode msgpack map: %v", err)
+	}
+	v, ok := decoded["msgSerial"]
+	if !ok {
+		t.Fatalf("ACK msgpack map %v missing msgSerial key", decoded)
+	}
+	if n, _ := toInt64(v); n != 0 {
+		t.Errorf("ACK msgpack msgSerial = %v, want 0", v)
+	}
+}
+
+// TestNonPublishFramesOmitMsgSerial pins the other half of TASK-97: frames
+// the server never stamps with a msgSerial (HEARTBEAT, CONNECTED, and a
+// MESSAGE delivery) must NOT carry a spurious msgSerial:0. pointer-nil +
+// omitempty keeps them clean.
+func TestNonPublishFramesOmitMsgSerial(t *testing.T) {
+	frames := map[string]*ProtocolMessage{
+		"heartbeat": {Action: ActionHeartbeat},
+		"connected": {Action: ActionConnected, ConnectionID: "abc"},
+		"message":   {Action: ActionMessage, Channel: "c", Messages: []*Message{{Serial: "s:000", Data: "x"}}},
+	}
+	for name, f := range frames {
+		t.Run(name, func(t *testing.T) {
+			data, err := Marshal(f, FormatJSON)
+			if err != nil {
+				t.Fatalf("Marshal JSON: %v", err)
+			}
+			if strings.Contains(string(data), "msgSerial") {
+				t.Errorf("%s JSON %q unexpectedly carries msgSerial", name, data)
+			}
+			mp, err := Marshal(f, FormatMsgpack)
+			if err != nil {
+				t.Fatalf("Marshal msgpack: %v", err)
+			}
+			var decoded map[string]any
+			if err := unmarshalMsgpackMap(mp, &decoded); err != nil {
+				t.Fatalf("decode msgpack map: %v", err)
+			}
+			if _, ok := decoded["msgSerial"]; ok {
+				t.Errorf("%s msgpack map %v unexpectedly carries msgSerial", name, decoded)
 			}
 		})
 	}

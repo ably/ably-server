@@ -41,6 +41,11 @@ func (h *testHarness) publish(t *testing.T, channel string, msgs ...*protocol.Me
 	}
 }
 
+// msgSerialPtr wraps an inbound frame's msgSerial. ProtocolMessage.MsgSerial
+// is a *int64 (TASK-97) so an ACK/NACK carries msgSerial:0 explicitly;
+// tests build inbound frames with it and read acks via PublishSerial().
+func msgSerialPtr(v int64) *int64 { return &v }
+
 const testKey = "app.key:secret"
 
 // newTestServer constructs an httptest.Server wrapping our realtime
@@ -433,7 +438,7 @@ func TestPublishAcksAndForwardsToAttachedConnection(t *testing.T) {
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   "foo",
-		MsgSerial: 7,
+		MsgSerial: msgSerialPtr(7),
 		Messages:  []*protocol.Message{{ID: "m1"}},
 	})
 
@@ -449,8 +454,8 @@ func TestPublishAcksAndForwardsToAttachedConnection(t *testing.T) {
 	if ack == nil {
 		t.Fatal("no ACK received")
 	}
-	if ack.MsgSerial != 7 {
-		t.Errorf("ACK.MsgSerial = %d, want 7", ack.MsgSerial)
+	if ack.PublishSerial() != 7 {
+		t.Errorf("ACK.MsgSerial = %d, want 7", ack.PublishSerial())
 	}
 	if ack.Count != 1 {
 		t.Errorf("ACK.Count = %d, want 1", ack.Count)
@@ -481,7 +486,7 @@ func TestPublishAckIsPerProtocolMessage(t *testing.T) {
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   "foo",
-		MsgSerial: 3,
+		MsgSerial: msgSerialPtr(3),
 		Messages:  []*protocol.Message{{ID: "batch:0"}, {ID: "batch:1"}, {ID: "batch:2"}},
 	})
 
@@ -489,8 +494,8 @@ func TestPublishAckIsPerProtocolMessage(t *testing.T) {
 	if ack.Action != protocol.ActionAck {
 		t.Fatalf("Action = %v, want ACK", ack.Action)
 	}
-	if ack.MsgSerial != 3 {
-		t.Errorf("MsgSerial = %d, want 3", ack.MsgSerial)
+	if ack.PublishSerial() != 3 {
+		t.Errorf("MsgSerial = %d, want 3", ack.PublishSerial())
 	}
 	if ack.Count != 1 {
 		t.Errorf("Count = %d, want 1 (one protocol message acked, not the batch size)", ack.Count)
@@ -511,7 +516,7 @@ func TestPublishWithEmptyChannelIsNacked(t *testing.T) {
 
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
-		MsgSerial: 11,
+		MsgSerial: msgSerialPtr(11),
 		Messages:  []*protocol.Message{{ID: "x"}},
 	})
 
@@ -519,8 +524,8 @@ func TestPublishWithEmptyChannelIsNacked(t *testing.T) {
 	if msg.Action != protocol.ActionNack {
 		t.Fatalf("Action = %v, want NACK", msg.Action)
 	}
-	if msg.MsgSerial != 11 {
-		t.Errorf("MsgSerial = %d, want 11", msg.MsgSerial)
+	if msg.PublishSerial() != 11 {
+		t.Errorf("MsgSerial = %d, want 11", msg.PublishSerial())
 	}
 }
 
@@ -532,15 +537,15 @@ func TestPublishWithNoMessagesIsNacked(t *testing.T) {
 	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   "foo",
-		MsgSerial: 22,
+		MsgSerial: msgSerialPtr(22),
 	})
 
 	msg := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
 	if msg.Action != protocol.ActionNack {
 		t.Fatalf("Action = %v, want NACK", msg.Action)
 	}
-	if msg.MsgSerial != 22 {
-		t.Errorf("MsgSerial = %d, want 22", msg.MsgSerial)
+	if msg.PublishSerial() != 22 {
+		t.Errorf("MsgSerial = %d, want 22", msg.PublishSerial())
 	}
 }
 
@@ -571,7 +576,7 @@ func TestPublishCrossesConnections(t *testing.T) {
 	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   "foo",
-		MsgSerial: 1,
+		MsgSerial: msgSerialPtr(1),
 		Messages:  []*protocol.Message{original},
 	})
 
@@ -1065,7 +1070,7 @@ func TestPublishStampsAndRejectsClientID(t *testing.T) {
 	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   "room",
-		MsgSerial: 1,
+		MsgSerial: msgSerialPtr(1),
 		Messages:  []*protocol.Message{{Name: "n", Data: "d"}},
 	})
 	if ack := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); ack.Action != protocol.ActionAck {
@@ -1083,7 +1088,7 @@ func TestPublishStampsAndRejectsClientID(t *testing.T) {
 	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
 		Action:    protocol.ActionMessage,
 		Channel:   "room",
-		MsgSerial: 2,
+		MsgSerial: msgSerialPtr(2),
 		Messages:  []*protocol.Message{{Name: "n", Data: "d", ClientID: "bob"}},
 	})
 	if nack := readFrame(t, pub, protocol.FormatJSON, 2*time.Second); nack.Action != protocol.ActionNack {
