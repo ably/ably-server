@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/ably/ably-server/internal/core"
@@ -137,9 +138,89 @@ func resolveModes(flags int64) int64 {
 	return defaultModes
 }
 
+// resolveRequestedModes resolves the channel modes an ATTACH requests,
+// honouring the reference precedence (DESIGN.md §4.2): a comma-separated
+// `modes` channel param wins over the flags mode bits, which win over the
+// default set. The `modes` param is how ably-js sends ChannelOptions.params
+// = {modes: 'subscribe,presence'} (RTL4k), and the SDK expects the resolved
+// set reflected both in ATTACHED.flags (from which it reads channel.modes)
+// and echoed in ATTACHED.params.modes. A param that names no valid mode is
+// ignored and the flags/default path is used instead.
+func resolveRequestedModes(flags int64, params map[string]string) int64 {
+	if s, ok := params["modes"]; ok {
+		if m := parseModesParam(s); m != 0 {
+			return m
+		}
+	}
+	return resolveModes(flags)
+}
+
+// modeParamNames maps each channel-mode bit to its wire token, in the
+// order the reference emits them in ATTACHED.params.modes (Mode.ParamsString).
+var modeParamNames = []struct {
+	bit  int64
+	name string
+}{
+	{protocol.FlagPresence, "presence"},
+	{protocol.FlagPublish, "publish"},
+	{protocol.FlagSubscribe, "subscribe"},
+	{protocol.FlagPresenceSubscribe, "presence_subscribe"},
+	{protocol.FlagAnnotationSubscribe, "annotation_subscribe"},
+	{protocol.FlagAnnotationPublish, "annotation_publish"},
+}
+
+// parseModesParam parses a comma-separated channel-modes param value into
+// its mode-bit set, ignoring unrecognised tokens (matching the reference's
+// ParseModes, which drops invalid tokens rather than erroring).
+func parseModesParam(s string) int64 {
+	var m int64
+	for _, tok := range strings.Split(s, ",") {
+		tok = strings.ToLower(strings.TrimSpace(tok))
+		for _, mp := range modeParamNames {
+			if tok == mp.name {
+				m |= mp.bit
+			}
+		}
+	}
+	return m
+}
+
+// modesParamString renders a mode-bit set as the comma-separated token
+// list carried in ATTACHED.params.modes (reference Mode.ParamsString order).
+func modesParamString(modes int64) string {
+	names := make([]string, 0, len(modeParamNames))
+	for _, mp := range modeParamNames {
+		if modes&mp.bit != 0 {
+			names = append(names, mp.name)
+		}
+	}
+	return strings.Join(names, ",")
+}
+
 // hasMode reports whether this attachment holds the given channel mode.
 func (a *attachment) hasMode(mode int64) bool {
 	return a.modes&mode != 0
+}
+
+// echoParams builds the params map echoed on ATTACHED (DESIGN.md §4.1),
+// from which the SDK populates channel.params (RTL4k1). It reflects the
+// params the client requested, with the `modes` entry — when the client
+// requested modes via the params map — rewritten to the effective
+// (capability-intersected) mode set so channel.params.modes agrees with
+// the modes the SDK decodes from ATTACHED.flags. Other requested params
+// (e.g. rewind) pass through unchanged; nil when nothing was requested.
+func (a *attachment) echoParams() map[string]string {
+	if len(a.params) == 0 {
+		return nil
+	}
+	echo := make(map[string]string, len(a.params))
+	for k, v := range a.params {
+		echo[k] = v
+	}
+	if _, ok := echo["modes"]; ok {
+		echo["modes"] = modesParamString(a.modes)
+	}
+	return echo
 }
 
 // run sends ATTACHED, optionally replays history (resume or rewind),
@@ -186,7 +267,7 @@ func (a *attachment) run() {
 		ChannelSerial: attachPoint,
 		Flags:         flags,
 		Error:         errInfo,
-		Params:        a.params,
+		Params:        a.echoParams(),
 	}
 	if !a.send(attached) {
 		return

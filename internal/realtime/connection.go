@@ -380,7 +380,7 @@ func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMes
 	// §3.1, §4.2). An empty intersection means the credential grants no
 	// mode on this channel: reject with ERROR 40160 and create no
 	// attachment.
-	effective := resolveModes(msg.Flags) & c.permittedModes(name)
+	effective := resolveRequestedModes(msg.Flags, msg.Params) & c.permittedModes(name)
 	if effective == 0 {
 		c.queue(ctx, &protocol.ProtocolMessage{
 			Action:  protocol.ActionError,
@@ -493,6 +493,26 @@ func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMe
 			c.handleMutation(ctx, msg)
 			return
 		}
+	}
+
+	// A publish on a channel this connection is attached to is gated by
+	// the attachment's `publish` mode: an attachment that did not request
+	// publish (e.g. ChannelOptions.modes / params.modes excluding it) may
+	// not publish and is NACKed 40160, mirroring the reference, which
+	// refuses a publish op the attachment's mode does not permit
+	// (lib/channel/attachment.go handlePublish). A publish with no
+	// attachment is a transient publish — the reference materialises a
+	// publish-capable transient attachment — so it is gated only by
+	// capability below.
+	if a, ok := c.attachments[msg.Channel]; ok && !a.hasMode(protocol.FlagPublish) {
+		c.logger.Warn("publish rejected: attachment lacks the publish mode",
+			"channel", msg.Channel, "msgSerial", msgSerial)
+		c.enqueueNack(ctx, msgSerial, &protocol.ErrorInfo{
+			Message:    "publish requires an attachment with the publish mode",
+			Code:       40160,
+			StatusCode: 401,
+		})
+		return
 	}
 
 	// A create publish requires the `publish` capability on the channel
