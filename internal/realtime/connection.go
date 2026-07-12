@@ -288,6 +288,8 @@ func (c *connection) dispatch(ctx context.Context, msg *protocol.ProtocolMessage
 		c.handleAnnotation(ctx, msg)
 	case protocol.ActionAuth:
 		c.handleAuth(ctx, msg)
+	case protocol.ActionHeartbeat:
+		c.handleHeartbeat(ctx, msg)
 	case protocol.ActionClose:
 		c.handleClose(ctx)
 	default:
@@ -313,6 +315,21 @@ func (c *connection) acceptMsgSerial(serial int64) bool {
 		return true
 	}
 	return serial >= last+1
+}
+
+// handleHeartbeat replies to a client-initiated HEARTBEAT with a
+// HEARTBEAT that echoes the inbound frame's id. connection.ping() sends a
+// HEARTBEAT with a random id and resolves only when it sees a HEARTBEAT
+// carrying the same id (ably-js correlates by id), so the echo is what
+// makes the ping resolve. The server's idle write-loop HEARTBEAT carries
+// no id and never satisfies a ping. Mirrors the reference frontdoor's
+// inbound-HEARTBEAT handler (id copied straight back, omitted on the wire
+// when empty).
+func (c *connection) handleHeartbeat(ctx context.Context, msg *protocol.ProtocolMessage) {
+	c.queue(ctx, &protocol.ProtocolMessage{
+		Action: protocol.ActionHeartbeat,
+		ID:     msg.ID,
+	})
 }
 
 // handleClose responds to a client-initiated CLOSE with CLOSED. The
