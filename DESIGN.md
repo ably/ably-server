@@ -1162,19 +1162,7 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --log-format {text|json}
 --debug-listen                pprof on a separate port; disabled if unset
 --config ably-server.toml     optional TOML file, see below
---fixtures path.json          pre-seed presence members from a test-app-setup spec (test-suite compat)
 ```
-
-`--fixtures` points at an Ably *test-app-setup*-shaped JSON file (the
-`post_apps` object, or a bare `{channels:[…]}`). At startup, before the
-listener opens, each channel's `presence[]` members are entered through
-the normal `StorePresence` path so they land in both the membership set
-and presence history, with server-synthesized `connectionId`s;
-`clientId`/`data`/`encoding` round-trip verbatim (encoding is opaque —
-cipher payloads are never decoded). It exists purely so the ably-go
-presence suite, which the cloud sandbox provisions these members for, can
-run against a local server; seeded members are static (§12.5). An
-unreadable path or a malformed spec is a startup error.
 
 Configuration may also be supplied via an optional TOML config file
 (`--config ably-server.toml`), covering the same keys as the flags above
@@ -1200,6 +1188,41 @@ Every key is optional. Resolution order,
 highest priority first: flag > env > config file > hardcoded default —
 so a flag always wins, an env var beats the file, and the file only
 supplies a value nothing more specific set.
+
+The config file additionally carries the startup fixtures — everything
+the server boots with is visible in one file, structured like the Ably
+*test-app-setup* `post_apps` shape (the sandbox provisioner translates
+that JSON into this config rather than the server parsing it):
+
+- `[[namespaces]]` — a namespace `id` plus the `persisted`,
+  `mutableMessages`, and `pushEnabled` feature flags. These are **parsed
+  and recorded but behaviourally inert**: no behaviour keys off them yet;
+  they exist so a provisioner can round-trip the full app shape. A
+  namespace with no `id` is a startup error.
+- `[[channels]]` — a channel `name` plus nested `[[channels.presence]]`
+  member entries (`clientId`, `data`, `encoding`). At startup, before the
+  listener opens, each member is entered through the normal
+  `StorePresence` path so it lands in both the membership set and
+  presence history, with a server-synthesized `connectionId`;
+  `clientId`/`data`/`encoding` round-trip verbatim (encoding is opaque —
+  cipher payloads are never decoded). Seeded members are static (§12.5).
+  A channel with no `name` or a member with no `clientId` is a startup
+  error. This exists purely so the ably-go presence suite, which the
+  cloud sandbox provisions these members for, can run against a local
+  server.
+
+```toml
+[[namespaces]]
+id = "persisted"
+persisted = true
+
+[[channels]]
+name = "persisted:presence_fixtures"
+
+  [[channels.presence]]
+  clientId = "client_string"
+  data = "This is a string clientData payload"
+```
 
 ## 10. Observability
 
@@ -1406,8 +1429,9 @@ into it transactionally and `Members` reads it (§6). Per backend:
   straight from `Members` (a `SELECT` against this table); it need never
   have witnessed the original ENTERs.
 
-**Static fixture members.** Members seeded via `--fixtures` (§9) are the
-one exception to connection-scoped liveness: they belong to no
+**Static fixture members.** Members seeded from the config file's
+`[[channels]]` presence entries (§9) are the one exception to
+connection-scoped liveness: they belong to no
 connection, so no teardown ever synthesises a LEAVE for them, and in
 cluster mode they are stored with a sentinel owner and a non-expiring
 (`'infinity'`) lease so neither the lease-bump loop nor the reaper ever

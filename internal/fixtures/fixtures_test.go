@@ -2,7 +2,6 @@ package fixtures_test
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 
 	"github.com/ably/ably-server/internal/core"
@@ -12,68 +11,28 @@ import (
 	"github.com/ably/ably-server/internal/storage/memory"
 )
 
-func TestParse_PostAppsShape(t *testing.T) {
-	spec, err := fixtures.Parse([]byte(`{
-		"limits": {"presence": {"maxMembers": 250}},
-		"post_apps": {"channels": [
-			{"name": "c1", "presence": [{"clientId": "a", "data": "true"}]}
-		]}
-	}`))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if len(spec.Channels) != 1 || spec.Channels[0].Name != "c1" {
-		t.Fatalf("unexpected channels: %+v", spec.Channels)
-	}
-	if got := spec.Channels[0].Presence[0].ClientID; got != "a" {
-		t.Fatalf("clientId = %q, want a", got)
-	}
+// presenceFixturesSpec mirrors the persisted:presence_fixtures channel the
+// cloud sandbox provisions (ably-common test-app-setup.json), the members
+// the ably-go presence suite reads back.
+func presenceFixturesSpec() *fixtures.Spec {
+	return &fixtures.Spec{Channels: []fixtures.Channel{{
+		Name: "persisted:presence_fixtures",
+		Presence: []fixtures.Member{
+			{ClientID: "client_bool", Data: "true"},
+			{ClientID: "client_int", Data: "24"},
+			{ClientID: "client_string", Data: "This is a string clientData payload"},
+			{ClientID: "client_json", Data: `{ "test": "This is a JSONObject clientData payload"}`},
+			{ClientID: "client_decoded", Data: `{"example":{"json":"Object"}}`, Encoding: "json"},
+			{ClientID: "client_encoded", Data: "HO4cYSP8LybPYBPZPHQOtuD53yrD3YV3NBoTEYBh4U0N1QXHbtkfsDfTspKeLQFt", Encoding: "json/utf-8/cipher+aes-128-cbc/base64"},
+		},
+	}}}
 }
 
-func TestParse_BareChannelsShape(t *testing.T) {
-	spec, err := fixtures.Parse([]byte(`{"channels": [
-		{"name": "c1", "presence": [{"clientId": "a", "data": "1"}]}
-	]}`))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if len(spec.Channels) != 1 {
-		t.Fatalf("want 1 channel, got %d", len(spec.Channels))
-	}
-}
-
-func TestParse_Malformed(t *testing.T) {
-	cases := map[string]string{
-		"invalid json":     `{not json`,
-		"no channels":      `{"post_apps": {"keys": []}}`,
-		"empty channels":   `{"channels": []}`,
-		"unnamed channel":  `{"channels": [{"presence": []}]}`,
-		"member no client": `{"channels": [{"name": "c1", "presence": [{"data": "x"}]}]}`,
-	}
-	for name, body := range cases {
-		t.Run(name, func(t *testing.T) {
-			if _, err := fixtures.Parse([]byte(body)); err == nil {
-				t.Fatalf("Parse(%q) = nil error, want error", body)
-			}
-		})
-	}
-}
-
-func TestLoad_BadPath(t *testing.T) {
-	if _, err := fixtures.Load(filepath.Join(t.TempDir(), "does-not-exist.json")); err == nil {
-		t.Fatal("Load of missing path = nil error, want error")
-	}
-}
-
-// TestSeed_MembersHistoryAndEncodings seeds the testdata spec into a
-// memory-backed manager and asserts the members land in both the
-// membership set and presence history with data/encoding verbatim
-// (AC #1, #2).
+// TestSeed_MembersHistoryAndEncodings seeds the spec into a memory-backed
+// manager and asserts the members land in both the membership set and
+// presence history with data/encoding verbatim (AC #1).
 func TestSeed_MembersHistoryAndEncodings(t *testing.T) {
-	spec, err := fixtures.Load(filepath.Join("testdata", "presence-fixtures.json"))
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
+	spec := presenceFixturesSpec()
 
 	mgr := core.NewManager(memory.New(memory.Options{}))
 	ctx := context.Background()

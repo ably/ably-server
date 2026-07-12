@@ -46,7 +46,6 @@ const (
 	shutdownGraceEnv = "ABLY_SERVER_SHUTDOWN_GRACE"
 	logLevelEnv      = "ABLY_SERVER_LOG_LEVEL"
 	configPathEnv    = "ABLY_SERVER_CONFIG"
-	fixturesEnv      = "ABLY_SERVER_FIXTURES"
 )
 
 func main() {
@@ -128,7 +127,6 @@ func run(ctx context.Context, opts runOpts) int {
 	logLevel := fs.String("log-level", config.Default(opts.Getenv(logLevelEnv), file.LogLevel, "info"), "log level: debug, info, warn, error (env: "+logLevelEnv+")")
 	logFormat := fs.String("log-format", config.Default(opts.Getenv(logFormatEnv), file.LogFormat, "text"), "log format: text or json (env: "+logFormatEnv+")")
 	debugListen := fs.String("debug-listen", config.Default(opts.Getenv(debugListenEnv), file.DebugListen, ""), "address for the pprof debug listener; disabled if empty (env: "+debugListenEnv+")")
-	fixturesPath := fs.String("fixtures", config.Default(opts.Getenv(fixturesEnv), file.Fixtures, ""), "path to a test-app-setup-shaped JSON file whose presence members are pre-seeded at startup, for SDK test-suite compatibility (env: "+fixturesEnv+")")
 	if err := fs.Parse(opts.Args); err != nil {
 		return 2
 	}
@@ -208,16 +206,17 @@ func run(ctx context.Context, opts runOpts) int {
 	m := metrics.New()
 	manager := core.NewManager(store)
 
-	// Pre-seed presence fixtures before serving traffic (DESIGN.md §9).
-	// An unreadable path or malformed spec is a startup error.
-	if *fixturesPath != "" {
-		spec, err := fixtures.Load(*fixturesPath)
-		if err != nil {
-			logger.Error("load fixtures", "path", *fixturesPath, "err", err)
-			return 1
-		}
+	// Pre-seed presence fixtures declared in the config file before
+	// serving traffic (DESIGN.md §9, §12.5). Malformed sections are a
+	// startup error.
+	spec, err := fixtureSpec(file)
+	if err != nil {
+		logger.Error("invalid config fixtures", "err", err)
+		return 1
+	}
+	if spec != nil {
 		if err := fixtures.Seed(ctx, manager, spec, logger); err != nil {
-			logger.Error("seed fixtures", "path", *fixturesPath, "err", err)
+			logger.Error("seed fixtures", "err", err)
 			return 1
 		}
 	}
@@ -385,6 +384,43 @@ func splitTrim(in []string) []string {
 		}
 	}
 	return out
+}
+
+// fixtureSpec validates the config file's [[namespaces]] and [[channels]]
+// sections and builds the presence-fixture spec to seed at startup
+// (DESIGN.md §9, §12.5). Namespaces are validated but otherwise inert
+// (their flags are recorded, not acted on). A namespace with no id, a
+// channel with no name, or a presence member with no clientId is a
+// malformed section and returns an error. Returns a nil spec when no
+// channels are declared.
+func fixtureSpec(file config.File) (*fixtures.Spec, error) {
+	for i, ns := range file.Namespaces {
+		if ns.ID == "" {
+			return nil, fmt.Errorf("namespace #%d has no id", i)
+		}
+	}
+	if len(file.Channels) == 0 {
+		return nil, nil
+	}
+	spec := &fixtures.Spec{Channels: make([]fixtures.Channel, 0, len(file.Channels))}
+	for i, ch := range file.Channels {
+		if ch.Name == "" {
+			return nil, fmt.Errorf("channel #%d has no name", i)
+		}
+		members := make([]fixtures.Member, 0, len(ch.Presence))
+		for mi, m := range ch.Presence {
+			if m.ClientID == "" {
+				return nil, fmt.Errorf("channel %q presence member #%d has no clientId", ch.Name, mi)
+			}
+			members = append(members, fixtures.Member{
+				ClientID: m.ClientID,
+				Data:     m.Data,
+				Encoding: m.Encoding,
+			})
+		}
+		spec.Channels = append(spec.Channels, fixtures.Channel{Name: ch.Name, Presence: members})
+	}
+	return spec, nil
 }
 
 // openStorage constructs the storage.Storage selected by mode:

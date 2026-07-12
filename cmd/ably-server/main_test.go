@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ably/ably-server/internal/config"
 )
 
 // writeConfigFile writes contents to a fresh ably-server.toml under a
@@ -246,6 +248,78 @@ func TestRunConfigFileShutdownGraceMalformed(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "invalid duration") {
 		t.Errorf("output = %q, want substring %q", out.String(), "invalid duration")
+	}
+}
+
+func TestFixtureSpec(t *testing.T) {
+	// Valid namespaces + channels build a spec with members preserved
+	// verbatim; namespaces are validated but do not appear in the spec.
+	spec, err := fixtureSpec(config.File{
+		Namespaces: []config.Namespace{{ID: "persisted", Persisted: true}},
+		Channels: []config.Channel{{
+			Name: "persisted:presence_fixtures",
+			Presence: []config.PresenceMember{
+				{ClientID: "a", Data: "1"},
+				{ClientID: "b", Data: "x", Encoding: "json"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("fixtureSpec: %v", err)
+	}
+	if len(spec.Channels) != 1 || spec.Channels[0].Name != "persisted:presence_fixtures" {
+		t.Fatalf("channels = %+v", spec.Channels)
+	}
+	if len(spec.Channels[0].Presence) != 2 || spec.Channels[0].Presence[1].Encoding != "json" {
+		t.Fatalf("presence = %+v", spec.Channels[0].Presence)
+	}
+
+	// No channels → nil spec (nothing to seed).
+	if s, err := fixtureSpec(config.File{}); err != nil || s != nil {
+		t.Errorf("fixtureSpec(empty) = %v, %v; want nil, nil", s, err)
+	}
+
+	// Malformed sections are errors.
+	malformed := map[string]config.File{
+		"namespace no id": {Namespaces: []config.Namespace{{Persisted: true}}},
+		"channel no name": {Channels: []config.Channel{{Presence: nil}}},
+		"member no clientId": {Channels: []config.Channel{{
+			Name:     "c1",
+			Presence: []config.PresenceMember{{Data: "x"}},
+		}}},
+	}
+	for name, f := range malformed {
+		t.Run(name, func(t *testing.T) {
+			if _, err := fixtureSpec(f); err == nil {
+				t.Errorf("fixtureSpec(%s) = nil error, want error", name)
+			}
+		})
+	}
+}
+
+// TestRunConfigChannelMalformedIsStartupError proves a malformed
+// [[channels]] section (a member without a clientId) fails startup.
+func TestRunConfigChannelMalformedIsStartupError(t *testing.T) {
+	path := writeConfigFile(t, `
+api-key = "app.key:secret"
+
+[[channels]]
+name = "c1"
+
+  [[channels.presence]]
+  data = "x"
+`)
+	var out bytes.Buffer
+	code := run(context.Background(), runOpts{
+		Args:   []string{"--config=" + path},
+		Getenv: emptyEnv,
+		Out:    &out,
+	})
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(out.String(), "no clientId") {
+		t.Errorf("output = %q, want substring %q", out.String(), "no clientId")
 	}
 }
 

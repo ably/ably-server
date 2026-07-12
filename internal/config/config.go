@@ -40,13 +40,18 @@ type File struct {
 	DataDir       string     `toml:"data-dir"`
 	DBDSN         string   `toml:"db-dsn"`
 	ShutdownGrace string   `toml:"shutdown-grace"`
-	LogLevel      string   `toml:"log-level"`
-	LogFormat     string   `toml:"log-format"`
-	DebugListen   string   `toml:"debug-listen"`
-	// Fixtures is the path to an Ably test-app-setup-shaped JSON file
-	// whose channels' presence members are pre-seeded at startup — for
-	// SDK test-suite compatibility only (DESIGN.md §9).
-	Fixtures string `toml:"fixtures"`
+	LogLevel    string `toml:"log-level"`
+	LogFormat   string `toml:"log-format"`
+	DebugListen string `toml:"debug-listen"`
+	// Namespaces are [[namespaces]] entries mirroring the test-app-setup
+	// post_apps shape (DESIGN.md §9, §12.5). They are parsed and retained
+	// but behaviourally inert: the feature flags are recorded, not acted
+	// on. They exist so the whole startup state lives in one config file.
+	Namespaces []Namespace `toml:"namespaces"`
+	// Channels are [[channels]] entries whose nested presence members are
+	// seeded at startup as static fixtures (DESIGN.md §9, §12.5),
+	// replacing the retired --fixtures JSON path.
+	Channels []Channel `toml:"channels"`
 }
 
 // KeyEntry is one structured [[keys]] entry (DESIGN.md §3.1, §9): an
@@ -56,6 +61,34 @@ type File struct {
 type KeyEntry struct {
 	Key        string `toml:"key"`
 	Capability string `toml:"capability"`
+}
+
+// Namespace is one [[namespaces]] entry (DESIGN.md §9, §12.5): a
+// namespace id plus feature flags mirroring test-app-setup's post_apps
+// shape. The flags are recorded but inert — no behaviour keys off them
+// yet.
+type Namespace struct {
+	ID              string `toml:"id"`
+	Persisted       bool   `toml:"persisted"`
+	MutableMessages bool   `toml:"mutableMessages"`
+	PushEnabled     bool   `toml:"pushEnabled"`
+}
+
+// Channel is one [[channels]] entry: a channel name plus the presence
+// members to seed at startup (DESIGN.md §9, §12.5).
+type Channel struct {
+	Name     string           `toml:"name"`
+	Presence []PresenceMember `toml:"presence"`
+}
+
+// PresenceMember is one nested presence entry under a [[channels]] entry.
+// Data and Encoding round-trip verbatim — the server treats Encoding as
+// opaque and never decodes Data (DESIGN.md §12), so a cipher payload is
+// seeded exactly as given.
+type PresenceMember struct {
+	ClientID string `toml:"clientId"`
+	Data     string `toml:"data"`
+	Encoding string `toml:"encoding"`
 }
 
 // Load parses the TOML file at path into a File.

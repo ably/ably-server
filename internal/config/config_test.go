@@ -96,6 +96,51 @@ key = "app.full:secret2"
 	}
 }
 
+func TestLoadParsesNamespacesAndChannels(t *testing.T) {
+	path := writeTOML(t, `
+[[namespaces]]
+id = "persisted"
+persisted = true
+
+[[namespaces]]
+id = "mutable"
+mutableMessages = true
+
+[[channels]]
+name = "persisted:presence_fixtures"
+
+  [[channels.presence]]
+  clientId = "client_string"
+  data = "hello"
+
+  [[channels.presence]]
+  clientId = "client_encoded"
+  data = "AAAA"
+  encoding = "json/utf-8/cipher+aes-128-cbc/base64"
+`)
+	f, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	wantNS := []Namespace{
+		{ID: "persisted", Persisted: true},
+		{ID: "mutable", MutableMessages: true},
+	}
+	if !reflect.DeepEqual(f.Namespaces, wantNS) {
+		t.Errorf("Namespaces = %+v, want %+v", f.Namespaces, wantNS)
+	}
+	wantCh := []Channel{{
+		Name: "persisted:presence_fixtures",
+		Presence: []PresenceMember{
+			{ClientID: "client_string", Data: "hello"},
+			{ClientID: "client_encoded", Data: "AAAA", Encoding: "json/utf-8/cipher+aes-128-cbc/base64"},
+		},
+	}}
+	if !reflect.DeepEqual(f.Channels, wantCh) {
+		t.Errorf("Channels = %+v, want %+v", f.Channels, wantCh)
+	}
+}
+
 func TestLoadPartialFileLeavesOtherFieldsZero(t *testing.T) {
 	path := writeTOML(t, `log-format = "json"`)
 
