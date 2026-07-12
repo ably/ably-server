@@ -30,9 +30,14 @@ type File struct {
 	// singular key is retained for backwards compatibility and combined
 	// with the api-keys array (both are used when both are present). At
 	// least one key must be configured across all sources.
-	APIKey        string   `toml:"api-key"`
-	APIKeys       []string `toml:"api-keys"`
-	DataDir       string   `toml:"data-dir"`
+	APIKey  string   `toml:"api-key"`
+	APIKeys []string `toml:"api-keys"`
+	// Keys are structured [[keys]] entries: each a key spec plus an
+	// optional per-key capability (DESIGN.md §3.1, §9). They are combined
+	// with APIKey/APIKeys within the file tier; unlike those, an entry may
+	// carry a capability that narrows what the key grants.
+	Keys          []KeyEntry `toml:"keys"`
+	DataDir       string     `toml:"data-dir"`
 	DBDSN         string   `toml:"db-dsn"`
 	ShutdownGrace string   `toml:"shutdown-grace"`
 	LogLevel      string   `toml:"log-level"`
@@ -42,6 +47,15 @@ type File struct {
 	// whose channels' presence members are pre-seeded at startup — for
 	// SDK test-suite compatibility only (DESIGN.md §9).
 	Fixtures string `toml:"fixtures"`
+}
+
+// KeyEntry is one structured [[keys]] entry (DESIGN.md §3.1, §9): an
+// Ably-format key spec plus an optional capability. Capability is an
+// `x-ably-capability`-format JSON object string; empty means the key
+// grants the full capability, matching a flag/env or bare api-key entry.
+type KeyEntry struct {
+	Key        string `toml:"key"`
+	Capability string `toml:"capability"`
 }
 
 // Load parses the TOML file at path into a File.

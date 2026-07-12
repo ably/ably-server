@@ -13,6 +13,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/vmihailenco/msgpack/v5"
 
+	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/protocol"
 )
 
@@ -166,6 +167,51 @@ func TestRESTMutationOwnership(t *testing.T) {
 	if resp := tokenRequest(t, srv, http.MethodPatch, path, carol, del); resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("carol delete (no delete cap) status = %d, want 401", resp.StatusCode)
 	}
+}
+
+// TestRESTRestrictedBasicKey exercises a restricted key end to end over
+// Basic auth (TASK-93 AC #2): the Basic principal resolves to the key's
+// own capability, so an op outside it is denied 40160 while one inside
+// succeeds.
+func TestRESTRestrictedBasicKey(t *testing.T) {
+	key, err := auth.ParseAPIKeyWithCapability("app.sub:s3cr3t", `{"chat:*":["subscribe"]}`)
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+	srv, _ := newTestServerWithKeys(t, key)
+
+	basic := func(method, path string, body []byte) *http.Response {
+		t.Helper()
+		req, err := http.NewRequestWithContext(context.Background(), method, srv.URL+path, bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		req.SetBasicAuth("app.sub", "s3cr3t")
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("do: %v", err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+
+	// Presence GET on chat:* needs subscribe, which the key grants: 200.
+	if resp := basic(http.MethodGet, "/channels/chat:room/presence", nil); resp.StatusCode != http.StatusOK {
+		t.Errorf("presence chat:room status = %d, want 200", resp.StatusCode)
+	}
+	// Publish needs publish, which the key lacks: 401/40160.
+	msg, _ := json.Marshal(&protocol.Message{Name: "n", Data: "x"})
+	resp := basic(http.MethodPost, "/channels/chat:room/messages", msg)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("publish status = %d, want 401", resp.StatusCode)
+	}
+	assertCapabilityError(t, resp)
+	// Subscribe op outside the key's chat:* scope is also denied: 401/40160.
+	resp = basic(http.MethodGet, "/channels/other/presence", nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("presence other status = %d, want 401", resp.StatusCode)
+	}
+	assertCapabilityError(t, resp)
 }
 
 func assertCapabilityError(t *testing.T, resp *http.Response) {

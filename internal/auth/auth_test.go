@@ -145,6 +145,165 @@ func mintToken(t *testing.T, secret string, claims jwt.MapClaims) string {
 	return s
 }
 
+// TestParseAPIKeyWithCapability covers the per-key capability parsing
+// (TASK-93): a bare key grants the full capability, an explicit
+// capability is parsed and attached, and a malformed one errors.
+func TestParseAPIKeyWithCapability(t *testing.T) {
+	full, err := ParseAPIKey("app.key:secret")
+	if err != nil {
+		t.Fatalf("ParseAPIKey: %v", err)
+	}
+	if !full.Capability().Permits("anything", OpPublish) {
+		t.Errorf("bare key should grant full capability")
+	}
+
+	scoped, err := ParseAPIKeyWithCapability("app.key:secret", `{"chat:*":["subscribe"]}`)
+	if err != nil {
+		t.Fatalf("ParseAPIKeyWithCapability: %v", err)
+	}
+	if !scoped.Capability().Permits("chat:room", OpSubscribe) {
+		t.Errorf("scoped key should grant subscribe on chat:room")
+	}
+	if scoped.Capability().Permits("chat:room", OpPublish) {
+		t.Errorf("scoped key should not grant publish")
+	}
+	if scoped.Capability().Permits("other", OpSubscribe) {
+		t.Errorf("scoped key should not grant subscribe outside chat:*")
+	}
+
+	if _, err := ParseAPIKeyWithCapability("app.key:secret", `not json`); err == nil {
+		t.Errorf("malformed capability should error")
+	}
+}
+
+// TestAuthenticateBasicResolvesKeyCapability verifies a Basic-auth
+// principal resolves to the authenticating key's capability, not the
+// permissive all-access set (TASK-93 AC #2).
+func TestAuthenticateBasicResolvesKeyCapability(t *testing.T) {
+	restricted, err := ParseAPIKeyWithCapability("app.sub:secret", `{"chat:*":["subscribe"]}`)
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	a := NewAuthenticator(restricted)
+
+	r := httptest.NewRequest(http.MethodGet, "/?key=app.sub:secret", nil)
+	p, err := a.Authenticate(r)
+	if err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+	if !p.Capabilities().Permits("chat:room", OpSubscribe) {
+		t.Errorf("Basic principal should inherit the key's subscribe grant")
+	}
+	if p.Capabilities().Permits("chat:room", OpPublish) {
+		t.Errorf("Basic principal should not gain publish beyond the key")
+	}
+}
+
+// TestAuthenticateJWTIntersectsKeyCapability verifies a token's effective
+// capability is the claim intersected with the signing key's capability,
+// and that an absent claim inherits the key's capability (TASK-93 AC #3).
+func TestAuthenticateJWTIntersectsKeyCapability(t *testing.T) {
+	key, err := ParseAPIKeyWithCapability("app.key:secret", `{"chat:*":["publish","subscribe"]}`)
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	a := NewAuthenticator(key)
+	now := time.Now()
+
+	t.Run("absent claim inherits key capability", func(t *testing.T) {
+		tok := mintToken(t, "secret", jwt.MapClaims{"iat": now.Unix(), "exp": now.Add(time.Hour).Unix()})
+		r := httptest.NewRequest(http.MethodGet, "/?access_token="+tok, nil)
+		p, err := a.Authenticate(r)
+		if err != nil {
+			t.Fatalf("Authenticate: %v", err)
+		}
+		if !p.Capabilities().Permits("chat:room", OpPublish) {
+			t.Errorf("absent claim should inherit key's publish grant")
+		}
+		if p.Capabilities().Permits("other", OpPublish) {
+			t.Errorf("absent claim must not exceed the key's scope")
+		}
+	})
+
+	t.Run("claim intersected with key capability", func(t *testing.T) {
+		// Claim asks for publish+subscribe on all channels; key only
+		// grants chat:* — the intersection is publish/subscribe on chat:*.
+		tok := mintToken(t, "secret", jwt.MapClaims{
+			"iat":               now.Unix(),
+			"exp":               now.Add(time.Hour).Unix(),
+			"x-ably-capability": `{"*":["publish","subscribe"]}`,
+		})
+		r := httptest.NewRequest(http.MethodGet, "/?access_token="+tok, nil)
+		p, err := a.Authenticate(r)
+		if err != nil {
+			t.Fatalf("Authenticate: %v", err)
+		}
+		if !p.Capabilities().Permits("chat:room", OpSubscribe) {
+			t.Errorf("intersection should grant subscribe on chat:room")
+		}
+		if p.Capabilities().Permits("other", OpSubscribe) {
+			t.Errorf("intersection must not grant beyond the key's chat:* scope")
+		}
+	})
+
+	t.Run("claim narrower than key", func(t *testing.T) {
+		tok := mintToken(t, "secret", jwt.MapClaims{
+			"iat":               now.Unix(),
+			"exp":               now.Add(time.Hour).Unix(),
+			"x-ably-capability": `{"chat:*":["subscribe"]}`,
+		})
+		r := httptest.NewRequest(http.MethodGet, "/?access_token="+tok, nil)
+		p, err := a.Authenticate(r)
+		if err != nil {
+			t.Fatalf("Authenticate: %v", err)
+		}
+		if p.Capabilities().Permits("chat:room", OpPublish) {
+			t.Errorf("claim narrowing away publish should deny it")
+		}
+		if !p.Capabilities().Permits("chat:room", OpSubscribe) {
+			t.Errorf("claim should retain subscribe")
+		}
+	})
+}
+
+// TestMintTokenNarrowsAgainstKeyCapability verifies requestToken minting
+// narrows the requested capability against the signing key's own
+// capability, rejecting a request the key cannot grant (TASK-93 AC #4).
+func TestMintTokenNarrowsAgainstKeyCapability(t *testing.T) {
+	key, err := ParseAPIKeyWithCapability("app.key:secret", `{"chat:*":["subscribe"]}`)
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	a := NewAuthenticator(key)
+
+	// Requesting publish (which the key does not grant) is rejected.
+	if _, _, _, err := a.MintToken(&TokenRequest{
+		KeyName:    "app.key",
+		Capability: `{"chat:*":["publish"]}`,
+	}); !errors.Is(err, ErrInvalidToken) {
+		t.Errorf("minting a capability the key cannot grant: err = %v, want ErrInvalidToken", err)
+	}
+
+	// Requesting subscribe on all channels is clamped to the key's chat:*.
+	tok, _, _, err := a.MintToken(&TokenRequest{
+		KeyName:    "app.key",
+		Capability: `{"*":["subscribe"]}`,
+	})
+	if err != nil {
+		t.Fatalf("MintToken: %v", err)
+	}
+	p, err := a.VerifyToken(tok)
+	if err != nil {
+		t.Fatalf("VerifyToken: %v", err)
+	}
+	if !p.Capabilities().Permits("chat:room", OpSubscribe) {
+		t.Errorf("minted token should grant subscribe on chat:room")
+	}
+	if p.Capabilities().Permits("other", OpSubscribe) {
+		t.Errorf("minted token must be clamped to the key's chat:* scope")
+	}
+}
+
 func TestAuthenticateJWT(t *testing.T) {
 	parsed, err := ParseAPIKey(testKey)
 	if err != nil {

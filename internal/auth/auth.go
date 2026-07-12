@@ -39,13 +39,16 @@ const WildcardClientID = "*"
 const clockSkewLeeway = 60 * time.Second
 
 // APIKey is a parsed Ably-format API key in the form
-// `appId.keyId:keySecret`.
+// `appId.keyId:keySecret`, carrying the capability it grants (DESIGN.md
+// §3.1). A key configured without an explicit capability grants the full
+// {"*":["*"]} set; a structured config entry may narrow it.
 type APIKey struct {
 	AppID     string
 	KeyID     string
 	KeySecret string
 
-	raw string // cached `appId.keyId:keySecret` for constant-time compare
+	cap Capability // the capability this key grants; bounds any token minted from it
+	raw string     // cached `appId.keyId:keySecret` for constant-time compare
 }
 
 // Name returns the key's `appId.keyId` portion — the value carried as a
@@ -54,17 +57,27 @@ func (k APIKey) Name() string {
 	return k.AppID + "." + k.KeyID
 }
 
-// Capability returns the key's capability. In this single-key model keys
-// are not individually scoped, so every key carries the full capability
-// {"*":["*"]} — the ceiling a token minted from it can be narrowed to
-// (DESIGN.md §3.1, §3.3).
+// Capability returns the key's capability — the ceiling a token minted
+// from it can be narrowed to, and the set a Basic-auth holder of it
+// resolves to (DESIGN.md §3.1, §3.3).
 func (k APIKey) Capability() Capability {
-	return AllowAllCapability()
+	return k.cap
 }
 
-// ParseAPIKey validates and decomposes an Ably-format API key. All
-// three components must be non-empty.
+// ParseAPIKey validates and decomposes an Ably-format API key, granting
+// it the full capability. This is the flag/env path, where keys are not
+// individually scoped (DESIGN.md §9). All three components must be
+// non-empty.
 func ParseAPIKey(s string) (APIKey, error) {
+	return ParseAPIKeyWithCapability(s, "")
+}
+
+// ParseAPIKeyWithCapability parses an Ably-format API key and attaches
+// the capability described by capJSON, an `x-ably-capability`-format JSON
+// object (DESIGN.md §3.1). An empty capJSON grants the full {"*":["*"]}
+// capability, so the flag/env path (ParseAPIKey) stays full-capability; a
+// malformed capJSON is an error.
+func ParseAPIKeyWithCapability(s, capJSON string) (APIKey, error) {
 	name, secret, ok := strings.Cut(s, ":")
 	if !ok {
 		return APIKey{}, fmt.Errorf("api key missing ':' between name and secret")
@@ -84,10 +97,20 @@ func ParseAPIKey(s string) (APIKey, error) {
 		return APIKey{}, fmt.Errorf("api key has empty keyId")
 	}
 
+	cap := AllowAllCapability()
+	if capJSON != "" {
+		c, err := ParseCapability(capJSON)
+		if err != nil {
+			return APIKey{}, fmt.Errorf("api key capability: %w", err)
+		}
+		cap = c
+	}
+
 	return APIKey{
 		AppID:     appID,
 		KeyID:     keyID,
 		KeySecret: secret,
+		cap:       cap,
 		raw:       s,
 	}, nil
 }
@@ -122,8 +145,9 @@ type Principal struct {
 	HasClientID bool
 
 	// cap is the resolved capability set enforced for this principal
-	// (DESIGN.md §3.1): the permissive all-access set for Basic auth or a
-	// token with no capability claim, otherwise the parsed claim.
+	// (DESIGN.md §3.1): the authenticating key's capability for Basic auth
+	// or a token with no capability claim, otherwise the claim intersected
+	// with the signing key's capability.
 	cap Capability
 
 	// ExpiresAt is the token's expiry (from the `exp` claim), used to
@@ -168,16 +192,22 @@ func NewAuthenticator(keys ...APIKey) *Authenticator {
 	}
 }
 
-// matchKey reports whether presented equals any configured key, in
+// matchKey returns the configured key equal to presented, comparing in
 // constant time. Every key is compared (no early return) so the timing
-// does not reveal which key, if any, matched.
-func (a *Authenticator) matchKey(presented string) bool {
+// does not reveal which key, if any, matched; the matched key is needed
+// so a Basic-auth principal resolves to that key's capability (§3.1).
+func (a *Authenticator) matchKey(presented string) (APIKey, bool) {
 	pb := []byte(presented)
-	matched := 0
+	var matched APIKey
+	found := 0
 	for _, k := range a.keys {
-		matched |= subtle.ConstantTimeCompare(pb, []byte(k.raw))
+		eq := subtle.ConstantTimeCompare(pb, []byte(k.raw))
+		if eq == 1 {
+			matched = k
+		}
+		found |= eq
 	}
-	return matched == 1
+	return matched, found == 1
 }
 
 // Authenticate extracts and verifies the request's credentials. A bearer
@@ -190,10 +220,11 @@ func (a *Authenticator) Authenticate(r *http.Request) (*Principal, error) {
 		return a.verifyToken(tok)
 	}
 	if k, ok := extractKey(r); ok {
-		if !a.matchKey(k) {
+		key, ok := a.matchKey(k)
+		if !ok {
 			return nil, ErrInvalidKey
 		}
-		return &Principal{Method: MethodBasic, cap: AllowAllCapability()}, nil
+		return &Principal{Method: MethodBasic, cap: key.Capability()}, nil
 	}
 	return nil, ErrNoCredentials
 }
@@ -207,12 +238,30 @@ func (a *Authenticator) Authenticate(r *http.Request) (*Principal, error) {
 // still verifies.
 func (a *Authenticator) verifyToken(tokenString string) (*Principal, error) {
 	claims := jwt.MapClaims{}
+	// signingKey records which configured key verified the token, so its
+	// capability can bound the token's (§3): claim ∩ key, with an absent
+	// claim inheriting the key's capability outright.
+	var signingKey APIKey
 	_, err := a.parser.ParseWithClaims(tokenString, claims, func(t *jwt.Token) (any, error) {
 		if kid, ok := t.Header["kid"].(string); ok {
 			if k, ok := a.byName[kid]; ok {
+				signingKey = k
 				return []byte(k.KeySecret), nil
 			}
 		}
+		// No usable kid: find the key whose secret verifies the signature
+		// (a token minted elsewhere with a shared secret), so its
+		// capability still bounds the token. text is the signed portion —
+		// everything before the trailing `.signature` segment.
+		text := t.Raw[:strings.LastIndexByte(t.Raw, '.')]
+		for _, k := range a.keys {
+			if t.Method.Verify(text, t.Signature, []byte(k.KeySecret)) == nil {
+				signingKey = k
+				return []byte(k.KeySecret), nil
+			}
+		}
+		// Nothing verified: return the full set so the library reports a
+		// signature-invalid error the same way it always has.
 		set := jwt.VerificationKeySet{Keys: make([]jwt.VerificationKey, len(a.keys))}
 		for i, k := range a.keys {
 			set.Keys[i] = []byte(k.KeySecret)
@@ -226,7 +275,9 @@ func (a *Authenticator) verifyToken(tokenString string) (*Principal, error) {
 		return nil, fmt.Errorf("%w: missing iat claim", ErrInvalidToken)
 	}
 
-	p := &Principal{Method: MethodToken, cap: AllowAllCapability()}
+	// An absent capability claim inherits the signing key's capability;
+	// a present claim narrows it via intersection (DESIGN.md §3).
+	p := &Principal{Method: MethodToken, cap: signingKey.Capability()}
 	if c, ok := claims["x-ably-capability"].(string); ok {
 		p.Capability = c
 		// A present capability claim narrows access (§3.1); a malformed
@@ -235,7 +286,7 @@ func (a *Authenticator) verifyToken(tokenString string) (*Principal, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
 		}
-		p.cap = cap
+		p.cap = cap.Intersect(signingKey.Capability())
 	}
 	if cid, ok := claims["x-ably-clientId"].(string); ok {
 		p.ClientID = cid
@@ -384,10 +435,11 @@ func (a *Authenticator) ValidateTokenRequest(tr *TokenRequest, r *http.Request) 
 // the key's secret and carrying its name as the kid header. The token's
 // clientId claim comes from the request; its capability is the requested
 // capability narrowed against (intersected with) the signing key's
-// capability (DESIGN.md §3.3) — for this single-key model the key carries
-// the full `{"*":["*"]}` capability, so a requested capability passes
-// through unchanged but a syntactically invalid one is rejected. Returns
-// the signed token and its expiry.
+// capability (DESIGN.md §3.3), so the token grants only what both the
+// request and the key permit — a request the key cannot grant at all is
+// rejected. A request with no capability leaves the claim unset, so the
+// minted token inherits the key's capability at verification time.
+// Returns the signed token and its expiry.
 func (a *Authenticator) MintToken(tr *TokenRequest) (token string, issued, expires time.Time, err error) {
 	key, ok := a.byName[tr.KeyName]
 	if !ok {

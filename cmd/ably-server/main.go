@@ -146,7 +146,7 @@ func run(ctx context.Context, opts runOpts) int {
 	}
 	parsedKeys := make([]auth.APIKey, 0, len(keySpecs))
 	for _, spec := range keySpecs {
-		k, err := auth.ParseAPIKey(spec)
+		k, err := auth.ParseAPIKeyWithCapability(spec.key, spec.capability)
 		if err != nil {
 			logger.Error("invalid api key", "err", err)
 			return 1
@@ -332,25 +332,48 @@ func (m *multiFlag) Set(v string) error {
 	return nil
 }
 
-// resolveAPIKeys resolves the configured API key specs with precedence
+// keySpec is one resolved API key: its Ably-format spec plus an optional
+// per-key capability (an x-ably-capability-format JSON string, empty for
+// full capability) — DESIGN.md §3.1, §9.
+type keySpec struct {
+	key        string
+	capability string
+}
+
+// resolveAPIKeys resolves the configured API keys with precedence
 // flag > env > file, applied as whole sets (DESIGN.md §3, §9): repeated
 // --api-key flags win outright; otherwise a comma-separated
-// ABLY_SERVER_API_KEY; otherwise the config file's api-keys array plus
-// its singular api-key. Whitespace around each spec is trimmed and empty
-// entries dropped.
-func resolveAPIKeys(flagKeys []string, env string, file config.File) []string {
+// ABLY_SERVER_API_KEY; otherwise the config file's keys — its api-keys
+// array, its singular api-key, and its structured [[keys]] entries
+// combined. Flag/env keys are always full-capability; only [[keys]]
+// entries may carry a narrowing capability. Whitespace around each spec
+// is trimmed and empty entries dropped.
+func resolveAPIKeys(flagKeys []string, env string, file config.File) []keySpec {
 	if len(flagKeys) > 0 {
-		return splitTrim(flagKeys)
+		return fullCapSpecs(splitTrim(flagKeys))
 	}
 	if env != "" {
-		return splitTrim(strings.Split(env, ","))
+		return fullCapSpecs(splitTrim(strings.Split(env, ",")))
 	}
-	var fromFile []string
-	fromFile = append(fromFile, file.APIKeys...)
-	if file.APIKey != "" {
-		fromFile = append(fromFile, file.APIKey)
+	specs := fullCapSpecs(splitTrim(file.APIKeys))
+	if s := strings.TrimSpace(file.APIKey); s != "" {
+		specs = append(specs, keySpec{key: s})
 	}
-	return splitTrim(fromFile)
+	for _, e := range file.Keys {
+		if s := strings.TrimSpace(e.Key); s != "" {
+			specs = append(specs, keySpec{key: s, capability: e.Capability})
+		}
+	}
+	return specs
+}
+
+// fullCapSpecs wraps bare key strings as full-capability keySpecs.
+func fullCapSpecs(keys []string) []keySpec {
+	out := make([]keySpec, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, keySpec{key: k})
+	}
+	return out
 }
 
 // splitTrim trims whitespace from each entry and drops empties.

@@ -69,6 +69,33 @@ api-keys = ["app.key1:secret1", "app.key2:secret2"]
 	}
 }
 
+func TestLoadParsesStructuredKeys(t *testing.T) {
+	path := writeTOML(t, `
+api-key = "app.key0:secret0"
+
+[[keys]]
+key = "app.sub:secret1"
+capability = '{"chat:*":["subscribe"]}'
+
+[[keys]]
+key = "app.full:secret2"
+`)
+	f, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []KeyEntry{
+		{Key: "app.sub:secret1", Capability: `{"chat:*":["subscribe"]}`},
+		{Key: "app.full:secret2"},
+	}
+	if !reflect.DeepEqual(f.Keys, want) {
+		t.Errorf("Keys = %+v, want %+v", f.Keys, want)
+	}
+	if f.APIKey != "app.key0:secret0" {
+		t.Errorf("APIKey = %q", f.APIKey)
+	}
+}
+
 func TestLoadPartialFileLeavesOtherFieldsZero(t *testing.T) {
 	path := writeTOML(t, `log-format = "json"`)
 

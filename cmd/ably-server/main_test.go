@@ -249,6 +249,29 @@ func TestRunConfigFileShutdownGraceMalformed(t *testing.T) {
 	}
 }
 
+func TestRunConfigFileStructuredKeyMalformedCapability(t *testing.T) {
+	// A [[keys]] entry with a malformed capability is a startup error,
+	// proving the structured-key path is parsed and its capability
+	// validated (TASK-93).
+	path := writeConfigFile(t, `
+[[keys]]
+key = "app.key:secret"
+capability = "not json"
+`)
+	var out bytes.Buffer
+	code := run(context.Background(), runOpts{
+		Args:   []string{"--config=" + path},
+		Getenv: emptyEnv,
+		Out:    &out,
+	})
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(out.String(), "invalid api key") {
+		t.Errorf("output = %q, want substring %q", out.String(), "invalid api key")
+	}
+}
+
 func TestRunConfigFileMissingPathIsAnError(t *testing.T) {
 	var out bytes.Buffer
 	code := run(context.Background(), runOpts{

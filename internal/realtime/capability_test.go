@@ -2,6 +2,8 @@ package realtime
 
 import (
 	"context"
+	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"testing"
@@ -10,7 +12,10 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 
+	"github.com/ably/ably-server/internal/auth"
+	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/storage/memory"
 )
 
 // dialToken connects a WebSocket client authenticating with a JWT
@@ -48,6 +53,60 @@ func dialTokenClientID(t *testing.T, srv *httptest.Server, capability, clientID 
 	}
 	t.Cleanup(func() { _ = ws.Close() })
 	return ws
+}
+
+// TestAttachModesFromRestrictedKey exercises a restricted key end to end
+// over Basic (?key=) auth (TASK-93): the connection resolves to the key's
+// own capability, so attach modes are intersected against it — a
+// subscribe-only key attaching the full set is narrowed, and an op the
+// key lacks yields ERROR 40160.
+func TestAttachModesFromRestrictedKey(t *testing.T) {
+	key, err := auth.ParseAPIKeyWithCapability("app.sub:secret", `{"chat:*":["subscribe"]}`)
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+	manager := core.NewManager(memory.New(memory.Options{}))
+	rt := NewServer([]auth.APIKey{key}, manager, time.Hour, slog.New(slog.DiscardHandler), nil, nil)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", rt.HandleWebSocket)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	u, _ := url.Parse(srv.URL)
+	u.Scheme = "ws"
+	q := u.Query()
+	q.Set("key", "app.sub:secret")
+	u.RawQuery = q.Encode()
+	ws, _, err := websocket.DefaultDialer.DialContext(context.Background(), u.String(), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = ws.Close() })
+	drainConnected(t, ws)
+
+	// Full-set attach on chat:* is narrowed to SUBSCRIBE|PRESENCE_SUBSCRIBE.
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:  protocol.ActionAttach,
+		Channel: "chat:room",
+	})
+	f := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if f.Action != protocol.ActionAttached {
+		t.Fatalf("action = %v, want ATTACHED", f.Action)
+	}
+	wantModes := protocol.FlagSubscribe | protocol.FlagPresenceSubscribe
+	if f.Flags&modeMask != wantModes {
+		t.Errorf("ATTACHED modes = %b, want %b", f.Flags&modeMask, wantModes)
+	}
+
+	// A channel outside the key's chat:* scope: empty intersection, 40160.
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:  protocol.ActionAttach,
+		Channel: "other",
+	})
+	f = readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if f.Action != protocol.ActionError || f.Error == nil || f.Error.Code != 40160 {
+		t.Fatalf("frame = %+v, want ERROR 40160", f)
+	}
 }
 
 func TestAttachModesFromCapability(t *testing.T) {

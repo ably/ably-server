@@ -36,8 +36,15 @@ func newTestServer(t *testing.T) (*httptest.Server, *core.Manager) {
 	if err != nil {
 		t.Fatalf("parse api key: %v", err)
 	}
+	return newTestServerWithKeys(t, parsed)
+}
+
+// newTestServerWithKeys is newTestServer with caller-supplied keys, so
+// tests can exercise per-key capabilities (TASK-93).
+func newTestServerWithKeys(t *testing.T, keys ...auth.APIKey) (*httptest.Server, *core.Manager) {
+	t.Helper()
 	manager := core.NewManager(memory.New(memory.Options{}))
-	rs := NewServer([]auth.APIKey{parsed}, manager, slog.New(slog.DiscardHandler), nil, nil, nil)
+	rs := NewServer(keys, manager, slog.New(slog.DiscardHandler), nil, nil, nil)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /channels/{name}/messages", rs.HandlePublish)
 	mux.HandleFunc("GET /channels/{name}/messages", rs.HandleHistory)

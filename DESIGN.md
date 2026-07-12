@@ -148,8 +148,14 @@ SDKs read for the code and message.
 One or more API keys are configured (via repeated `--api-key`, a
 comma-separated `ABLY_SERVER_API_KEY`, or the config file — §9), each in
 the canonical Ably format `appId.keyId:keySecret` (so SDKs that parse the
-key work unchanged). At least one key is required; the server refuses to
-start with none. All configured keys must share the same `appId`: the
+key work unchanged). Each key carries a **capability** (§3.1): a key
+configured via a flag, an env var, or a bare `api-key`/`api-keys` entry
+grants the full `{"*":["*"]}` capability, while a structured `[[keys]]`
+config entry (§9) may narrow it to a scoped set. A Basic-auth holder of a
+key resolves to that key's capability, and a token minted or signed by a
+key is bounded by it (§3.3). At least one key is required; the server
+refuses to start with none. All configured keys must share the same
+`appId`: the
 server owns one channel namespace (mirroring how one Ably app owns one
 namespace), so keys spanning multiple appIds are a misconfiguration and
 startup fails. A request authenticates against **any** configured key,
@@ -174,7 +180,7 @@ JWT claims:
 |---|---|---|
 | `iat` | ✓ | issued-at; server rejects clock-skewed tokens beyond a small leeway |
 | `exp` | ✓ | expiry |
-| `x-ably-capability` | | JSON object granting per-channel ops (see §3.1). Absent → token inherits the signing key's capability, which for our single-key model is `{"*":["*"]}` (i.e. permissive by default; the claim is only needed to *narrow* access) |
+| `x-ably-capability` | | JSON object granting per-channel ops (see §3.1). Present → the token's capability is the claim **intersected with** the signing key's capability. Absent → the token inherits the signing key's capability outright (for a full-capability key that is `{"*":["*"]}`, so the claim is only needed to *narrow* access; for a scoped key the token is bounded by the key regardless) |
 | `x-ably-clientId` | | string; controls the connection's `clientId` (see §3.2) |
 
 **Inband re-authentication.** A token-authenticated WebSocket tracks its
@@ -330,10 +336,12 @@ presents as an `access_token` verified by the path above.
 
 The requested `capability` is *narrowed* against the signing key's
 capability before it is stamped on the token (§3.1): the token grants
-only the intersection of what was requested and what the key permits. For
-this single-key model the key carries the full `{"*":["*"]}` capability,
-so a requested capability passes through unchanged, but a request whose
-capability the key cannot grant at all is rejected.
+only the intersection of what was requested and what the key permits. A
+full-capability key (`{"*":["*"]}`) passes a requested capability through
+unchanged; a scoped key clamps it to the key's own grants; either way a
+request whose capability the key cannot grant at all is rejected. A
+request with no capability leaves the claim unset, so the minted token
+inherits the key's capability when it is later verified.
 
 > Nonce replay tracking is not implemented; the mac alone guarantees
 > integrity.
@@ -1174,7 +1182,21 @@ Configuration may also be supplied via an optional TOML config file
 `log-level`, `log-format`, `debug-listen` — `shutdown-grace` as a
 duration string, e.g. `"10s"`). API keys may also be given as an
 `api-keys` array; the file's `api-keys` and singular `api-key` are
-combined. Every key is optional. Resolution order,
+combined. Keys may additionally be declared as structured `[[keys]]`
+entries, each a `key` spec plus an optional `capability` — an
+`x-ably-capability`-format JSON object string (§3.1) that scopes what the
+key grants; omitting it grants the full capability, like a flag/env or
+bare `api-key` entry. Within the file tier the `api-key`, `api-keys`, and
+`[[keys]]` sources are all combined; only `[[keys]]` entries can carry a
+narrowing capability. A malformed capability string is a startup error.
+
+```toml
+[[keys]]
+key = "app.subscriber:s3cr3t"
+capability = '{"chat:*":["subscribe"]}'
+```
+
+Every key is optional. Resolution order,
 highest priority first: flag > env > config file > hardcoded default —
 so a flag always wins, an env var beats the file, and the file only
 supplies a value nothing more specific set.
