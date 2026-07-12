@@ -204,3 +204,60 @@ func TestAppendIncompatibleDataNacked(t *testing.T) {
 		break
 	}
 }
+
+// TestAppendDeltaCarriesIdentityToCaughtUpSubscriber: the incremental delta
+// a caught-up subscriber receives must repeat the message's identity — its
+// name, extras and top-level create timestamp — even when the append itself
+// supplies no name (the streaming-publisher shape: it re-sends extras but
+// omits the name, relying on carry-forward). A name-less delta is invisible
+// to a subscriber that routes/filters by name, which is the TASK-115 durable
+// -supersede failure (DESIGN.md §8, §13.3).
+func TestAppendDeltaCarriesIdentityToCaughtUpSubscriber(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+
+	sub := dialClient(t, srv, "")
+	drainConnected(t, sub)
+	attach(t, sub, "room", protocol.FlagSubscribe)
+
+	pub := dialClient(t, srv, "alice")
+	drainConnected(t, pub)
+	attach(t, pub, "room", protocol.FlagPublish|protocol.FlagSubscribe)
+
+	// Create carrying a name and extras.
+	extras := map[string]any{"ai": map[string]any{"transport": map[string]any{"step-id": "wf-step-X"}}}
+	sendFrame(t, pub, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "room",
+		MsgSerial: msgSerialPtr(1),
+		Messages:  []*protocol.Message{{Name: "ai-output", Data: "INIT ", Extras: extras}},
+	})
+	create := readMessage(t, sub).Messages[0]
+	if create.Name != "ai-output" {
+		t.Fatalf("create name = %q, want ai-output", create.Name)
+	}
+	if create.Timestamp == 0 {
+		t.Errorf("create carried no top-level timestamp")
+	}
+	target := create.Serial
+
+	// Append supplies its own extras but NO name (the streaming shape).
+	sendMutation(t, pub, "room", 2, &protocol.Message{
+		Action: protocol.MessageAppend, Serial: target, Data: "DEAD partial answer", Extras: extras,
+	})
+	delta := readMessage(t, sub).Messages[0]
+	if delta.Action != protocol.MessageAppend {
+		t.Fatalf("delta action = %v, want incremental append", delta.Action)
+	}
+	if delta.Data != "DEAD partial answer" {
+		t.Errorf("delta data = %v, want the incremental slice", delta.Data)
+	}
+	if delta.Name != "ai-output" {
+		t.Errorf("delta name = %q, want %q carried forward from the create", delta.Name, "ai-output")
+	}
+	if delta.Extras == nil {
+		t.Errorf("delta extras = nil, want the carried/supplied extras on the wire")
+	}
+	if delta.Timestamp != create.Timestamp {
+		t.Errorf("delta top-level timestamp = %d, want carried-forward create ts %d", delta.Timestamp, create.Timestamp)
+	}
+}

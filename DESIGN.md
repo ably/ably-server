@@ -1199,6 +1199,16 @@ should use Ably or fork.
   mutation carries the target's extras forward unless it supplies its own,
   which replaces the whole object (shallow-mixin, §13.2). `PresenceMessage`
   and `Annotation` carry the same `extras` field with identical semantics.
+- **Message.timestamp**: the message's **create time** (server wall-clock ms,
+  derived from the create serial), stamped at create and carried forward
+  **unchanged** onto every later version — update, delete, append aggregate,
+  and append delta alike. It is the message-identity timestamp, distinct from
+  `version.timestamp`, which carries the *operation* time of the version that
+  produced it. This mirrors the reference's `buildUpdateMessage`, whose
+  top-level `timestamp` is the original message's timestamp. The field is
+  `omitempty`: an unstamped (zero) value is dropped on the wire, so every
+  delivery must carry it (an SDK reads the top-level timestamp as the create
+  time and drives its retention/reorder clock from it).
 
 Replay on `ATTACH` is a bounded history read from storage between the
 client-supplied `channelSerial` and the channel's current head, streamed
@@ -1617,7 +1627,9 @@ frame carrying the `action` and the target `serial`. The server:
 4. Stamps operation metadata into `version` (timestamp, operating
    `clientId`, optional description/metadata), mints the new `version`,
    persists the cm on the stream, and updates the `serial → versions`
-   index and the latest-version fold (§13.4).
+   index and the latest-version fold (§13.4). The **top-level
+   `Message.timestamp` is left as the original create time** (§8) — only
+   `version.timestamp` carries this operation's time.
 5. ACKs / NACKs (WS) or responds (REST) as for any publish.
 
 A `delete` is **soft**: it writes a tombstone version (the latest fold
@@ -1639,8 +1651,15 @@ delete:
 - The server maintains the **rolled-up** latest data for the message. An
   append is persisted and fanned out as a full `action: update` whose
   `data` is the aggregate so far, carrying the incremental append in
-  `alt["delta-append"]` (an `action: append` message holding just the new
-  `data`, sharing the version). The delivery path chooses per subscriber:
+  `alt["delta-append"]` (an `action: append` message holding the new
+  `data`, sharing the version). The delta repeats the message's identity —
+  its `name`, `extras` and top-level create `timestamp`, carried forward
+  from the create (name / extras replaced by the append's own when it
+  supplies them, §13.2) — so a subscriber routes an append frame by `name`
+  and `extras` exactly as the create; only its `data` is the incremental
+  slice. A streaming publisher omits the `name` on each append (relying on
+  this carry-forward), so a name-less delta would be invisible to a
+  name-filtering subscriber. The delivery path chooses per subscriber:
   a subscriber that is caught up receives the delta **incrementally**
   (`action: append`, just the new `data`); the first delivery for a
   message a subscriber has not yet seen — e.g. immediately after attach,

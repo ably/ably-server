@@ -350,8 +350,17 @@ func messageBaseID(msgs []*protocol.Message) (base string, hasID bool, err error
 // creator clientId. Called by every backend's Store after the serial is
 // assigned, so creates carry the same version shape as mutations. The
 // message's own Action stays MessageCreate (the zero value).
+//
+// It also stamps the top-level Message.Timestamp with the create time, which
+// every later version carries forward (§8, §13.2) — matching the reference's
+// buildUpdateMessage, whose top-level Timestamp is the ORIGINAL message's
+// timestamp (the operation time lives in version.Timestamp). Message.Timestamp
+// is omitempty, so an unstamped (zero) value is dropped on the wire; the SDK
+// Tree reads the top-level timestamp as the message's create time on every
+// delivery and drives its retention clock from it (TASK-115).
 func StampCreateVersion(m *protocol.Message) {
 	ts, _ := serial.Timestamp(m.Serial)
+	m.Timestamp = ts
 	m.Version = &protocol.MessageVersion{
 		Serial:    m.Serial,
 		Timestamp: ts,
@@ -428,27 +437,40 @@ func MergeVersion(current, mut *protocol.Message, versionSerial string) (*protoc
 		if err != nil {
 			return nil, err
 		}
+		// Apply the append's own name if it supplies one; otherwise the name
+		// carried forward from the create (copied into v above) stands. Done
+		// before cloning the delta so the delta inherits the resolved name.
+		if mut.Name != "" {
+			v.Name = mut.Name
+		}
 		// The delta the delivery path hands a caught-up subscriber: the
 		// incremental append alone, sharing this version so newest-wins
-		// convergence treats the delta and the full aggregate as one.
+		// convergence treats the delta and the full aggregate as one. It is
+		// built AFTER identity carry-forward (name, extras, top-level create
+		// timestamp) but carries the incremental data only — mirroring the
+		// reference's buildUpdateMessage, which clones the delta after
+		// populating the carried-forward fields but before concatenating data.
+		// A caught-up subscriber routes an append frame by name/extras exactly
+		// as the create; without the carried-forward name the delta arrives on
+		// the wire nameless and a name-filtering subscriber never sees it — the
+		// TASK-115 durable-supersede failure (the AIT encoder omits name on a
+		// streamed append, relying on this carry-forward).
 		delta := &protocol.Message{
 			Serial:       current.Serial,
 			Action:       protocol.MessageAppend,
 			ClientID:     current.ClientID,
 			ConnectionID: current.ConnectionID,
+			Name:         v.Name,      // carried-forward (or append-supplied) name
+			Timestamp:    v.Timestamp, // the create-time top-level timestamp
 			Data:         mut.Data,
 			Encoding:     mut.Encoding,
-			Extras:       v.Extras, // delta carries the merged extras (matches the aggregate)
+			Extras:       v.Extras, // supplied-or-carried-forward extras (matches the aggregate)
 			Version:      ver,
 		}
 		v.Action = protocol.MessageUpdate
 		v.Data = concatenated
 		if mut.Encoding != "" {
 			v.Encoding = mut.Encoding
-		}
-		if mut.Name != "" {
-			v.Name = mut.Name
-			delta.Name = mut.Name
 		}
 		v.Alt = map[string]*protocol.Message{protocol.DeltaAppend: delta}
 	default: // update

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/serial"
 	"github.com/ably/ably-server/internal/storage"
 )
 
@@ -1213,6 +1214,83 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 		}
 		if delta.Serial != created.Serial {
 			t.Errorf("delta serial = %q, want stable identity %q", delta.Serial, created.Serial)
+		}
+	})
+
+	t.Run("CreateStampsTopLevelTimestamp", func(t *testing.T) {
+		// Every message carries a top-level create timestamp on the wire (§8);
+		// it is omitempty, so a zero value is dropped and an SDK reads it as
+		// absent (TASK-115). It must equal the create serial's timestamp.
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		created := mustCreate(t, ch, &protocol.Message{Data: "hi", ClientID: "alice"})
+		wantTS, _ := serial.Timestamp(created.Serial)
+		if created.Timestamp != wantTS || created.Timestamp == 0 {
+			t.Errorf("create top-level timestamp = %d, want create-serial ts %d (non-zero)", created.Timestamp, wantTS)
+		}
+		if latest, _ := ch.LatestVersion(context.Background(), created.Serial); latest.Timestamp != wantTS {
+			t.Errorf("LatestVersion top-level timestamp = %d, want %d", latest.Timestamp, wantTS)
+		}
+	})
+
+	t.Run("MutateCarriesTopLevelCreateTimestampForward", func(t *testing.T) {
+		// An update/delete/append delivery keeps the ORIGINAL create timestamp
+		// at the top level; only version.timestamp carries the operation time
+		// (§8, §13.2, mirroring the reference's buildUpdateMessage).
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		created := mustCreate(t, ch, &protocol.Message{Data: "a", ClientID: "alice"})
+		createTS := created.Timestamp
+		if createTS == 0 {
+			t.Fatal("create carried no top-level timestamp")
+		}
+		updated := mustMutate(t, ch, &protocol.Message{Action: protocol.MessageUpdate, Serial: created.Serial, Data: "b", ClientID: "alice"})
+		if updated.Timestamp != createTS {
+			t.Errorf("update top-level timestamp = %d, want carried-forward create ts %d", updated.Timestamp, createTS)
+		}
+		if updated.Version == nil || updated.Version.Timestamp < createTS {
+			t.Errorf("update version.timestamp = %v, want the (later) operation time", updated.Version)
+		}
+	})
+
+	t.Run("MutateAppendDeltaCarriesIdentityForward", func(t *testing.T) {
+		// The append delta must repeat the message's identity — name, extras,
+		// and the top-level create timestamp — not just the incremental data
+		// (DESIGN.md §13.3). A subscriber routes append frames by name/extras
+		// exactly as the create; a streaming publisher omits the name on each
+		// append (relying on carry-forward), so a name-less delta is invisible
+		// to a name-filtering subscriber even though it arrives on the wire
+		// (TASK-115).
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+		extras := map[string]any{"ai": map[string]any{"transport": map[string]any{"step-id": "wf-step-X"}}}
+		created := mustCreate(t, ch, &protocol.Message{Name: "ai-output", Data: "INIT ", Extras: extras, ClientID: "alice"})
+		// The append supplies its own extras (the streaming shape) but NO name.
+		appended := mustMutate(t, ch, &protocol.Message{Action: protocol.MessageAppend, Serial: created.Serial, Data: "DEAD partial answer", Extras: extras, ClientID: "alice"})
+
+		// The rolled-up aggregate keeps the name and the create timestamp.
+		if appended.Name != "ai-output" {
+			t.Errorf("aggregate name = %q, want %q carried forward", appended.Name, "ai-output")
+		}
+		if appended.Timestamp != created.Timestamp {
+			t.Errorf("aggregate top-level timestamp = %d, want carried-forward create ts %d", appended.Timestamp, created.Timestamp)
+		}
+
+		delta := appended.Alt[protocol.DeltaAppend]
+		if delta == nil {
+			t.Fatalf("append version carries no %q delta", protocol.DeltaAppend)
+		}
+		if delta.Name != "ai-output" {
+			t.Errorf("delta name = %q, want %q carried forward from the create", delta.Name, "ai-output")
+		}
+		if !reflect.DeepEqual(delta.Extras, extras) {
+			t.Errorf("delta extras = %#v, want the supplied/carried-forward %#v", delta.Extras, extras)
+		}
+		if delta.Timestamp != created.Timestamp {
+			t.Errorf("delta top-level timestamp = %d, want carried-forward create ts %d", delta.Timestamp, created.Timestamp)
+		}
+		if delta.Data != "DEAD partial answer" {
+			t.Errorf("delta data = %v, want the incremental slice only", delta.Data)
 		}
 	})
 
