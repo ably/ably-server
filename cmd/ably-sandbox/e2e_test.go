@@ -157,6 +157,14 @@ func TestProvisionAndSmoke(t *testing.T) {
 		t.Errorf("publish with subscribe-only key: status = %d, want 401", code)
 	}
 
+	// AC#1 (qualifier wildcard, TASK-114): keys[5] is the sandbox
+	// all-access key {"[*]*":["*"]} — the standard SDK / AIT-suite key.
+	// Its "[*]" qualifier must match a plain channel, so publishing on an
+	// arbitrary channel succeeds (previously denied with 40160).
+	if code, body := publish(t, child, app.keyStr(5), "arbitrary:channel", `{"data":"hello"}`); code != http.StatusCreated {
+		t.Fatalf("publish with all-access key keys[5] [*]*: status = %d, body: %s", code, body)
+	}
+
 	// AC#1/#2 (presence fixtures): the seeded members are readable.
 	members := readPresence(t, child, app.keyStr(0), channel)
 	if len(members) != 6 {

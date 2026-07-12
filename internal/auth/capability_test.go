@@ -28,6 +28,20 @@ func TestMatchResource(t *testing.T) {
 		{"foo*", "foo*", true},
 		{"foo*", "foobar", false},
 		{"foo*", "foo", false},
+		// A "[qualifier]" prefix scopes the resource TYPE. "[*]" matches
+		// any type, so it matches a plain channel; the name path then
+		// applies the usual wildcard rules.
+		{"[*]*", "foo", true},
+		{"[*]*", "foo:bar:baz", true},
+		{"[*]foo", "foo", true},
+		{"[*]foo", "bar", false},
+		{"[*]chat:*", "chat:room", true},
+		{"[*]chat:*", "other", false},
+		// A concrete qualifier matches no plain channel: queues and
+		// metachannels do not exist as resources here.
+		{"[meta]*", "foo", false},
+		{"[queue]*", "foo", false},
+		{"[meta]log", "log", false},
 	}
 	for _, tc := range cases {
 		if got := matchResource(tc.pattern, tc.channel); got != tc.want {
@@ -78,6 +92,22 @@ func TestCapabilityPermits(t *testing.T) {
 		t.Errorf("publish should not be granted on weather")
 	}
 
+	// The sandbox all-access key keys[5] — the exact capability string
+	// from cmd/ably-sandbox/testdata/test-app-setup.json — grants every
+	// channel op on an arbitrary channel (the AIT-suite blocker,
+	// TASK-114). Before the qualifier fix "[*]*" matched nothing.
+	allAccess, err := ParseCapability(`{ "[*]*":["*"] }`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ch := range []string{"foo", "mutable:foo", "persisted:presence_fixtures"} {
+		for _, op := range []Op{OpPublish, OpSubscribe, OpHistory, OpPresence} {
+			if !allAccess.Permits(ch, op) {
+				t.Errorf("keys[5] [*]* should grant %q on %q", op, ch)
+			}
+		}
+	}
+
 	// Deny-all: a zero-value Capability grants nothing.
 	var zero Capability
 	if zero.Permits("foo", OpPublish) {
@@ -106,6 +136,12 @@ func TestCapabilityIntersect(t *testing.T) {
 		{"trailing star absorbs", `{"a:*":["*"]}`, `{"a:b":["publish"]}`, `{"a:b":["publish"]}`},
 		{"interior star matches one", `{"a:*:c":["publish","subscribe"]}`, `{"a:b:c":["publish"]}`, `{"a:b:c":["publish"]}`},
 		{"op intersection", `{"a":["publish","subscribe"]}`, `{"a":["subscribe","history"]}`, `{"a":["subscribe"]}`},
+		// Token narrowing (§3.3) against the sandbox all-access key: the
+		// "[*]" wildcard qualifier yields the other side's, so narrowing
+		// keys[5] to a concrete requested capability keeps working.
+		{"[*]* ∩ concrete request", `{"[*]*":["*"]}`, `{"chat:*":["publish","subscribe"]}`, `{"chat:*":["publish","subscribe"]}`},
+		{"concrete request ∩ [*]*", `{"chat:*":["publish"]}`, `{"[*]*":["*"]}`, `{"chat:*":["publish"]}`},
+		{"[*]* ∩ [*]*", `{"[*]*":["*"]}`, `{"[*]*":["*"]}`, `{"[*]*":["*"]}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -134,6 +170,12 @@ func TestCapabilityIntersect(t *testing.T) {
 	r2, _ := ParseCapability(`{"a:b:c":["publish"]}`)
 	if got := l2.Intersect(r2); !got.IsEmpty() {
 		t.Errorf("*:c ∩ a:b:c should be empty, got %s", got)
+	}
+	// Two differing concrete qualifiers cannot both be satisfied.
+	l3, _ := ParseCapability(`{"[meta]*":["subscribe"]}`)
+	r3, _ := ParseCapability(`{"[queue]*":["subscribe"]}`)
+	if got := l3.Intersect(r3); !got.IsEmpty() {
+		t.Errorf("[meta]* ∩ [queue]* should be empty, got %s", got)
 	}
 }
 

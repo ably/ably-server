@@ -202,23 +202,31 @@ func (c Capability) String() string {
 
 // Intersect narrows c against other, returning the capability granting
 // only what both grant (DESIGN.md §3.1, §3.3): for every pair of resource
-// patterns it intersects the op sets (the wildcard op acts as identity)
-// and the resource paths (mirroring Ably's path intersection), keeping
-// the more specific resulting resource. Used to narrow a token request's
-// requested capability against the signing key's capability (§3.3).
+// patterns it intersects the op sets (the wildcard op acts as identity),
+// the resource qualifiers (a "[*]" wildcard qualifier yielding the other
+// side's), and the resource paths (mirroring Ably's path intersection),
+// keeping the more specific resulting resource. Used to narrow a token
+// request's requested capability against the signing key's capability
+// (§3.3).
 func (c Capability) Intersect(other Capability) Capability {
 	out := Capability{perms: map[string]map[Op]bool{}}
 	for lPat, lOps := range c.perms {
+		lQual, lPath := parseResource(lPat)
 		for rPat, rOps := range other.perms {
 			ops := intersectOps(lOps, rOps)
 			if len(ops) == 0 {
 				continue
 			}
-			path, ok := intersectPath(strings.Split(lPat, ":"), strings.Split(rPat, ":"))
+			rQual, rPath := parseResource(rPat)
+			qual, ok := intersectQualifier(lQual, rQual)
 			if !ok {
 				continue
 			}
-			joined := strings.Join(path, ":")
+			path, ok := intersectPath(lPath, rPath)
+			if !ok {
+				continue
+			}
+			joined := encodeResource(qual, path)
 			if out.perms[joined] == nil {
 				out.perms[joined] = map[Op]bool{}
 			}
@@ -228,6 +236,34 @@ func (c Capability) Intersect(other Capability) Capability {
 		}
 	}
 	return out
+}
+
+// intersectQualifier mirrors the reference Intersect's qualifier rule: a
+// wildcard qualifier ("*") on either side yields the other side's
+// qualifier; two concrete qualifiers intersect only when equal. ok is
+// false when two differing concrete qualifiers cannot both be satisfied.
+func intersectQualifier(l, r string) (qualifier string, ok bool) {
+	switch {
+	case l == "*":
+		return r, true
+	case r == "*":
+		return l, true
+	case l == r:
+		return l, true
+	default:
+		return "", false
+	}
+}
+
+// encodeResource re-encodes a qualifier + name path into a capability
+// resource string, prefixing "[qualifier]" only for a non-default
+// qualifier (mirrors the reference resource.ID.String()).
+func encodeResource(qualifier string, path []string) string {
+	name := strings.Join(path, ":")
+	if qualifier == "" {
+		return name
+	}
+	return "[" + qualifier + "]" + name
 }
 
 // intersectOps intersects two op sets, preserving the wildcard op: "*"
@@ -256,9 +292,46 @@ func intersectOps(a, b map[Op]bool) map[Op]bool {
 	return res
 }
 
+// parseResource splits an Ably capability resource of the form
+// "[qualifier]name" into its qualifier TYPE token and the ':'-delimited
+// name path (DESIGN.md §3.1), mirroring the reference resource.ParseID. An
+// unqualified resource (no leading "[…]") has the default qualifier "". A
+// malformed bracket (no closing "]") is treated as a literal name, so it
+// matches nothing but a channel of that exact name.
+func parseResource(res string) (qualifier string, path []string) {
+	name := res
+	if strings.HasPrefix(res, "[") {
+		if end := strings.IndexByte(res, ']'); end > 0 {
+			qualifier = res[1:end]
+			name = res[end+1:]
+			// The qualifier TYPE is the token before any "=param" or
+			// "?query" (mirrors resource.ParseQualifier); only the type
+			// participates in matching here.
+			if i := strings.IndexAny(qualifier, "=?"); i >= 0 {
+				qualifier = qualifier[:i]
+			}
+		}
+	}
+	return qualifier, strings.Split(name, ":")
+}
+
+// qualifierMatches mirrors the reference resource.QualifierType.Matches:
+// two qualifier types match when they are equal or either is the wildcard
+// "*". So "[*]" matches any resource type (including the default), while a
+// concrete qualifier like "[meta]" matches only that same type.
+func qualifierMatches(x, y string) bool {
+	return x == y || x == "*" || y == "*"
+}
+
 // matchResource reports whether a resource pattern matches a concrete
 // channel name using Ably's wildcard semantics (DESIGN.md §3.1), mirroring
-// the reference implementation's pathsMatch:
+// the reference implementation's qualifier + pathsMatch. A pattern may
+// carry a leading "[qualifier]" prefix scoping the resource TYPE; requests
+// here target plain channel names, which carry the default qualifier "",
+// so the pattern's qualifier must match it: "[*]…" and unqualified
+// patterns match, while "[meta]…"/"[queue]…" match no channel (those
+// resource types do not exist). The name path then matches per Ably's
+// wildcard rules:
 //
 //   - wildcards replace whole ':'-delimited segments; only the exact
 //     segment "*" is a wildcard, so "foo*" is a literal channel name;
@@ -267,10 +340,19 @@ func intersectOps(a, b map[Op]bool) map[Op]bool {
 //     "foo", "foo:bar" and "foo:bar:baz";
 //   - a "*" elsewhere matches exactly one segment — so "foo:*:baz"
 //     matches "foo:bar:baz" but not "foo:bar:bam:baz";
-//   - "*" alone matches every channel.
+//   - "*" alone matches every channel, as does the sandbox all-access
+//     key's "[*]*".
 func matchResource(pattern, channel string) bool {
-	pSegs := strings.Split(pattern, ":")
-	cSegs := strings.Split(channel, ":")
+	qual, pSegs := parseResource(pattern)
+	if !qualifierMatches(qual, "") {
+		return false
+	}
+	return pathsMatch(pSegs, strings.Split(channel, ":"))
+}
+
+// pathsMatch reports whether the pattern segment slice matches the channel
+// segment slice under Ably's wildcard rules (see matchResource).
+func pathsMatch(pSegs, cSegs []string) bool {
 	for i, p := range pSegs {
 		if p == "*" {
 			if i == len(pSegs)-1 {

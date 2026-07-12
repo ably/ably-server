@@ -226,8 +226,15 @@ modes are deliberately distinct so the SDK reacts correctly:
   `foo:bar` and `foo:bar:baz`, and `foo:*:baz` matches `foo:bar:baz` but
   not `foo:bar:bam:baz`. `foo*` (no `:` before the `*`) is a literal
   channel name. Character classes (`[a-z]`) and `**` are not supported.
-  The `[queue]*` / `[meta]*` resource prefixes do not apply since neither
-  queues nor metachannels are in scope.
+  A resource may carry a leading `[qualifier]` prefix scoping the resource
+  TYPE (`[qualifier]name`); the qualifier is parsed and matched per Ably
+  semantics. `[*]` matches any type, so the standard sandbox all-access key
+  `{"[*]*":["*"]}` grants everything a plain channel needs (equivalent to
+  `{"*":["*"]}` over the channel surface here). A concrete qualifier such
+  as `[queue]*` / `[meta]*` parses but matches no channel, since neither
+  queues nor metachannels exist as resources. When intersecting
+  capabilities (§3.3) a `[*]` qualifier on either side yields the other's,
+  and two differing concrete qualifiers do not intersect.
 - `<op>` is one of `publish`, `subscribe`, `presence`, `history`,
   `stats`, `annotation-publish`, `annotation-subscribe`,
   `message-update-own`, `message-update-any`,
