@@ -4,8 +4,10 @@ title: Run the ably-js test suite against ably-server and triage the gaps
 status: To Do
 assignee: []
 created_date: '2026-07-09 11:06'
+updated_date: '2026-07-12 10:39'
 labels: []
-dependencies: []
+dependencies:
+  - TASK-95
 documentation:
   - 'https://ably.atlassian.net/wiki/spaces/product/pages/5171281935'
 priority: high
@@ -15,7 +17,7 @@ ordinal: 68000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-PDR-090's experimental release explicitly requires 'full client SDK (eg ably-js) test coverage (for the functional scope)'. Only ably-go has been exercised so far (COMPAT_REPORT.md). Stand up a harness that points ably-js's realtime/REST test suite at a local ably-server (endpoint/port/TLS overrides, sandbox app-provisioning bypassed), run the suite, and produce a compatibility report mapping each failure to an existing backlog task, a new task, or an explicit non-goal — following the file-tasks-for-incompatibilities convention.
+PDR-090's experimental release explicitly requires 'full client SDK (eg ably-js) test coverage (for the functional scope)'. Scouting (2026-07-12) established: the node suite (~22 realtime + 19 rest spec files, fanned out across transports and json/msgpack) is env-routable with ABLY_ENDPOINT=localhost ABLY_USE_TLS=false ABLY_PORT=<port> — fallback hosts self-disable and test-app provisioning follows the same endpoint via POST /apps (test/common/modules/testapp_manager.js). Strategy agreed with Lewis: run it against the TASK-95 sandbox provisioner. One small upstreamable harness change in ably-js (branch, like ably-go's server-testing): testapp_manager/client_module honour endpoint/port/tls fields on the app-creation response so clients route at the provisioned child server. Build first (grunt build:node build:push build:liveobjects, or npm run test:node which does both). Then run the full node suite, triage every failure into: existing backlog task, new task, documented artifact, or documented non-goal (expected permanent reds: push, stats-data assertions, LiveObjects), and produce a compatibility report in this repo.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria
