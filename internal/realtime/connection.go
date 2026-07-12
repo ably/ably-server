@@ -346,8 +346,22 @@ func (c *connection) handleClose(ctx context.Context) {
 // the live MESSAGE forwarding loop (subject to the replay cap).
 func (c *connection) handleAttach(ctx context.Context, msg *protocol.ProtocolMessage) {
 	name := msg.Channel
-	if name == "" {
-		c.logger.Warn("ATTACH with empty channel name; ignoring")
+	// An invalid channel name (empty, a reserved leading character such as
+	// ':' or '[', a line break) is rejected with ERROR 40010 (DESIGN.md §4,
+	// mirroring the reference's channel-name predicate). The channel goes
+	// FAILED on the SDK while the connection stays open; no attachment is
+	// created.
+	if !core.ValidChannelName(name) {
+		c.logger.Warn("ATTACH with invalid channel name; rejecting", "channel", name)
+		c.queue(ctx, &protocol.ProtocolMessage{
+			Action:  protocol.ActionError,
+			Channel: name,
+			Error: &protocol.ErrorInfo{
+				Message:    "invalid channel name",
+				Code:       40010,
+				StatusCode: 400,
+			},
+		})
 		return
 	}
 	// A repeat ATTACH for a channel this connection is already attached to
@@ -454,9 +468,16 @@ func (c *connection) handleDetach(ctx context.Context, name string) {
 // still-pending publishes on this connection (TASK-20).
 func (c *connection) handleMessage(ctx context.Context, msg *protocol.ProtocolMessage) {
 	msgSerial := msg.PublishSerial()
-	if msg.Channel == "" {
-		c.logger.Warn("MESSAGE with empty channel name; rejecting", "msgSerial", msgSerial)
-		c.enqueueNack(ctx, msgSerial, nil)
+	// A publish to an invalid channel name (empty, reserved leading
+	// character, line break) is NACKed with 40010 (DESIGN.md §4) — the SDK
+	// publishes without a prior attach, so the name is validated here.
+	if !core.ValidChannelName(msg.Channel) {
+		c.logger.Warn("MESSAGE with invalid channel name; rejecting", "channel", msg.Channel, "msgSerial", msgSerial)
+		c.enqueueNack(ctx, msgSerial, &protocol.ErrorInfo{
+			Message:    "invalid channel name",
+			Code:       40010,
+			StatusCode: 400,
+		})
 		return
 	}
 	if len(msg.Messages) == 0 {

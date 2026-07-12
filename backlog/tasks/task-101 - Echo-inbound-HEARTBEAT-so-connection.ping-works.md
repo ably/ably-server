@@ -1,7 +1,7 @@
 ---
 id: TASK-101
 title: Echo inbound HEARTBEAT so connection.ping() works
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-07-12 13:58'

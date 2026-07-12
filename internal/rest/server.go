@@ -76,6 +76,12 @@ func (s *Server) HandlePublish(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "channel name required", http.StatusBadRequest)
 		return
 	}
+	// Reject an invalid channel name with Ably 40010 (DESIGN.md §4), the
+	// same predicate the realtime ATTACH/publish paths apply.
+	if !core.ValidChannelName(name) {
+		s.writeErrorInfo(w, r, http.StatusBadRequest, 40010, "invalid channel name")
+		return
+	}
 	if !s.authorize(w, r, principal, name, auth.OpPublish) {
 		return
 	}
