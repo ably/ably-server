@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -277,15 +278,15 @@ func TestMintTokenNarrowsAgainstKeyCapability(t *testing.T) {
 	a := NewAuthenticator(key)
 
 	// Requesting publish (which the key does not grant) is rejected.
-	if _, _, _, err := a.MintToken(&TokenRequest{
+	if _, _, _, _, err := a.MintToken(&TokenRequest{
 		KeyName:    "app.key",
 		Capability: `{"chat:*":["publish"]}`,
-	}); !errors.Is(err, ErrInvalidToken) {
-		t.Errorf("minting a capability the key cannot grant: err = %v, want ErrInvalidToken", err)
+	}); !errors.Is(err, ErrCapabilityDenied) {
+		t.Errorf("minting a capability the key cannot grant: err = %v, want ErrCapabilityDenied", err)
 	}
 
 	// Requesting subscribe on all channels is clamped to the key's chat:*.
-	tok, _, _, err := a.MintToken(&TokenRequest{
+	tok, _, _, _, err := a.MintToken(&TokenRequest{
 		KeyName:    "app.key",
 		Capability: `{"*":["subscribe"]}`,
 	})
@@ -389,14 +390,29 @@ func TestAuthenticateJWT(t *testing.T) {
 		}
 	})
 
-	t.Run("within-leeway clock skew accepted", func(t *testing.T) {
+	t.Run("forward iat clock skew accepted", func(t *testing.T) {
+		// A small forward clock skew on iat is tolerated; exp is not given
+		// any grace, so the token must still be unexpired.
 		tok := mintToken(t, testSecret, jwt.MapClaims{
-			"iat": now.Add(30 * time.Second).Unix(),  // slightly future, within leeway
-			"exp": now.Add(-30 * time.Second).Unix(), // slightly past, within leeway
+			"iat": now.Add(30 * time.Second).Unix(), // slightly future, within leeway
+			"exp": now.Add(time.Hour).Unix(),
 		})
 		r := httptest.NewRequest(http.MethodGet, "/?access_token="+tok, nil)
 		if _, err := a.Authenticate(r); err != nil {
-			t.Fatalf("Authenticate: %v, want success within leeway", err)
+			t.Fatalf("Authenticate: %v, want success within iat leeway", err)
+		}
+	})
+
+	t.Run("expired token rejected with no grace", func(t *testing.T) {
+		// A token expired by a second is rejected outright (no leeway on exp),
+		// and surfaced as the renewable token-expired error (DESIGN.md §3).
+		tok := mintToken(t, testSecret, jwt.MapClaims{
+			"iat": now.Add(-time.Minute).Unix(),
+			"exp": now.Add(-time.Second).Unix(),
+		})
+		r := httptest.NewRequest(http.MethodGet, "/?access_token="+tok, nil)
+		if _, err := a.Authenticate(r); !errors.Is(err, ErrTokenExpired) {
+			t.Fatalf("Authenticate err = %v, want ErrTokenExpired", err)
 		}
 	})
 
@@ -584,8 +600,12 @@ func signTokenRequestForTest(tr *TokenRequest, secret string) string {
 func TestValidateTokenRequest(t *testing.T) {
 	parsed, _ := ParseAPIKey(testKey)
 	a := NewAuthenticator(parsed)
+	// A fresh timestamp per request keeps it inside the recency window; a
+	// distinct nonce avoids the replay guard tripping across subtests.
+	var nonceSeq int
 	base := func() *TokenRequest {
-		return &TokenRequest{KeyName: "app.key", TTL: 3600000, Capability: `{"*":["*"]}`, Timestamp: 1700000000000, Nonce: "abc123"}
+		nonceSeq++
+		return &TokenRequest{KeyName: "app.key", TTL: 3600000, Capability: `{"*":["*"]}`, Timestamp: time.Now().UnixMilli(), Nonce: fmt.Sprintf("nonce-%d", nonceSeq)}
 	}
 
 	t.Run("valid mac accepted", func(t *testing.T) {
@@ -629,6 +649,26 @@ func TestValidateTokenRequest(t *testing.T) {
 			t.Fatalf("err = %v, want ErrInvalidToken", err)
 		}
 	})
+
+	t.Run("stale timestamp rejected", func(t *testing.T) {
+		tr := base()
+		tr.Timestamp = time.Now().Add(-30 * time.Minute).UnixMilli()
+		tr.MAC = signTokenRequestForTest(tr, testSecret)
+		if err := a.ValidateTokenRequest(tr, httptest.NewRequest(http.MethodPost, "/", nil)); !errors.Is(err, ErrTimestampNotCurrent) {
+			t.Fatalf("err = %v, want ErrTimestampNotCurrent", err)
+		}
+	})
+
+	t.Run("replayed nonce rejected", func(t *testing.T) {
+		tr := base()
+		tr.MAC = signTokenRequestForTest(tr, testSecret)
+		if err := a.ValidateTokenRequest(tr, httptest.NewRequest(http.MethodPost, "/", nil)); err != nil {
+			t.Fatalf("first use: %v", err)
+		}
+		if err := a.ValidateTokenRequest(tr, httptest.NewRequest(http.MethodPost, "/", nil)); !errors.Is(err, ErrNonceReplayed) {
+			t.Fatalf("err = %v, want ErrNonceReplayed", err)
+		}
+	})
 }
 
 func TestMintTokenRoundTrip(t *testing.T) {
@@ -636,7 +676,7 @@ func TestMintTokenRoundTrip(t *testing.T) {
 	a := NewAuthenticator(parsed)
 
 	tr := &TokenRequest{KeyName: "app.key", TTL: 3600000, Capability: `{"*":["*"]}`, ClientID: "alice", Nonce: "n1"}
-	tok, _, _, err := a.MintToken(tr)
+	tok, _, _, _, err := a.MintToken(tr)
 	if err != nil {
 		t.Fatalf("MintToken: %v", err)
 	}
@@ -655,7 +695,7 @@ func TestMintTokenRoundTrip(t *testing.T) {
 
 	// Distinct nonces yield distinct tokens.
 	tr2 := &TokenRequest{KeyName: "app.key", TTL: 3600000, Nonce: "n2"}
-	tok2, _, _, _ := a.MintToken(tr2)
+	tok2, _, _, _, _ := a.MintToken(tr2)
 	if tok == tok2 {
 		t.Errorf("tokens with different nonces should differ")
 	}

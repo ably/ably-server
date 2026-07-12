@@ -1080,7 +1080,10 @@ func (s *Server) HandleRequestToken(w http.ResponseWriter, r *http.Request) {
 	}
 	var tr auth.TokenRequest
 	if err := unmarshal(body, format, &tr); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		// A malformed body (e.g. a non-numeric ttl) is a client error; emit
+		// the Ably envelope with a code so the SDK reads statusCode 400
+		// rather than normalising a code-less error to 401 (RSA4e).
+		s.writeErrorInfo(w, r, http.StatusBadRequest, 40001, "invalid token request body")
 		return
 	}
 	if tr.KeyName == "" {
@@ -1097,14 +1100,32 @@ func (s *Server) HandleRequestToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.authn.ValidateTokenRequest(&tr, r); err != nil {
-		w.Header().Set("WWW-Authenticate", `Basic realm="ably-server"`)
-		http.Error(w, "invalid token request", http.StatusUnauthorized)
+	// Validate the request shape (400s) before authenticating: a requested
+	// capability must be well-formed, and the ttl in range (DESIGN.md §3.3).
+	if tr.Capability != "" {
+		if err := auth.ValidateCapability(tr.Capability); err != nil {
+			s.writeTokenRequestError(w, r, err)
+			return
+		}
+	}
+	if err := auth.ValidateTTL(tr.TTL); err != nil {
+		s.writeTokenRequestError(w, r, err)
 		return
 	}
 
-	token, issued, expires, err := s.authn.MintToken(&tr)
+	if err := s.authn.ValidateTokenRequest(&tr, r); err != nil {
+		s.writeTokenRequestError(w, r, err)
+		return
+	}
+
+	token, issued, expires, capability, err := s.authn.MintToken(&tr)
 	if err != nil {
+		// A requested capability the key cannot grant is an authorisation
+		// failure (401), not a server error; everything else is a 500.
+		if errors.Is(err, auth.ErrCapabilityDenied) {
+			s.writeTokenRequestError(w, r, err)
+			return
+		}
 		s.logger.Warn("mint token failed", "err", err)
 		http.Error(w, "token minting failed", http.StatusInternalServerError)
 		return
@@ -1112,14 +1133,15 @@ func (s *Server) HandleRequestToken(w http.ResponseWriter, r *http.Request) {
 
 	// The SDK decodes the requestToken response as a TokenDetails; the
 	// minted JWT rides in its Token field (DESIGN.md §3). issued/expires
-	// are milliseconds since epoch.
+	// are milliseconds since epoch. capability is the granted (narrowed)
+	// capability — always present so the SDK can JSON.parse it (§3.3).
 	respBody, err := marshalValue(tokenDetailsResponse{
 		Token:      token,
 		KeyName:    tr.KeyName,
 		Issued:     issued.UnixMilli(),
 		Expires:    expires.UnixMilli(),
 		ClientID:   tr.ClientID,
-		Capability: tr.Capability,
+		Capability: capability,
 	}, respFormat)
 	if err != nil {
 		s.logger.Warn("token encode failed", "err", err)
@@ -1176,6 +1198,18 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, p *auth.Princ
 	}
 	s.writeCapabilityError(w, r, fmt.Sprintf("insufficient capability: %q required for channel %q", op, channel))
 	return false
+}
+
+// writeTokenRequestError writes an Ably-shaped error for a failed token
+// request, mapping the auth failure to its code/status via
+// auth.AuthErrorInfo (DESIGN.md §3.3). A 401 also carries the
+// WWW-Authenticate challenge.
+func (s *Server) writeTokenRequestError(w http.ResponseWriter, r *http.Request, err error) {
+	code, status, msg := auth.AuthErrorInfo(err)
+	if status == http.StatusUnauthorized {
+		w.Header().Set("WWW-Authenticate", `Basic realm="ably-server"`)
+	}
+	s.writeErrorInfo(w, r, status, code, msg)
 }
 
 // writeCapabilityError writes a 401 carrying the Ably error shape with the

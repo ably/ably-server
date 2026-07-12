@@ -7,11 +7,13 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -24,19 +26,67 @@ var (
 	ErrInvalidToken  = errors.New("invalid token")
 )
 
+// ErrTokenExpired is returned by verification when a token's exp has
+// passed. It wraps ErrInvalidToken (so callers matching ErrInvalidToken
+// still match) but is distinguished so the WS/REST layers can surface the
+// renewable token-expired code 40142 rather than a generic auth failure
+// (DESIGN.md §3).
+var ErrTokenExpired = fmt.Errorf("%w: token expired", ErrInvalidToken)
+
 // ErrClientIDMismatch is returned by ResolveClientID when the requested
 // clientId is not permitted by the credential.
 var ErrClientIDMismatch = errors.New("clientId not permitted by credential")
+
+// Errors returned by token-request validation and minting (DESIGN.md §3.3).
+var (
+	// ErrTimestampNotCurrent is a token request whose timestamp is outside
+	// the accepted window (Ably 40104).
+	ErrTimestampNotCurrent = errors.New("token request timestamp not current")
+	// ErrNonceReplayed is a token request reusing a nonce already seen
+	// within the timestamp window (Ably 40105).
+	ErrNonceReplayed = errors.New("token request nonce replayed")
+	// ErrInvalidCapability is a malformed or structurally invalid requested
+	// capability (bad op name, "*" mixed with other ops, empty op list, or
+	// unparseable JSON) — a client error (Ably 40000, status 400).
+	ErrInvalidCapability = errors.New("invalid capability")
+	// ErrInvalidTTL is a negative, excessive, or otherwise invalid requested
+	// ttl — a client error (status 400).
+	ErrInvalidTTL = errors.New("invalid ttl")
+	// ErrCapabilityDenied is a requested capability the signing key cannot
+	// grant at all (empty intersection): insufficient capability (Ably 40160).
+	ErrCapabilityDenied = fmt.Errorf("%w: requested capability is not permitted by the key", ErrInvalidToken)
+)
 
 // WildcardClientID is the clientId marker (DESIGN.md §3.2) meaning the
 // credential's bearer may assume any identity, choosing it per operation.
 // It is never itself stamped as a message or member identity.
 const WildcardClientID = "*"
 
-// clockSkewLeeway is the tolerance applied to time-based JWT claims
-// (iat, exp) to absorb small clock differences between token issuer and
-// this server.
+// jwt validates and (de)serialises time claims at TimePrecision
+// granularity, truncating anything finer. The default is one second, which
+// would collapse a sub-second token exp back to a whole second (a 1 ms
+// token would appear valid for up to a second). Set millisecond precision
+// so a short-lived token expires when it should (DESIGN.md §3.3, TASK-100).
+func init() {
+	jwt.TimePrecision = time.Millisecond
+}
+
+// clockSkewLeeway is the tolerance applied to a token's iat (issued-at)
+// claim to absorb a small forward clock difference between the token
+// issuer and this server. It is NOT applied to exp: an expired token is
+// rejected outright (no grace), matching Ably (DESIGN.md §3) so a
+// short-lived token is unusable the instant it lapses.
 const clockSkewLeeway = 60 * time.Second
+
+// maxTokenTTL bounds the lifetime a token request may ask for; a larger
+// ttl is rejected as excessive (DESIGN.md §3.3), matching Ably's 24h
+// default cap.
+const maxTokenTTL = 24 * time.Hour
+
+// tokenRequestTimestampWindow bounds how far a token request's timestamp
+// may sit from server time before it is rejected as not-current (DESIGN.md
+// §3.3), guarding against stale/replayed requests.
+const tokenRequestTimestampWindow = 2 * time.Minute
 
 // APIKey is a parsed Ably-format API key in the form
 // `appId.keyId:keySecret`, carrying the capability it grants (DESIGN.md
@@ -47,8 +97,9 @@ type APIKey struct {
 	KeyID     string
 	KeySecret string
 
-	cap Capability // the capability this key grants; bounds any token minted from it
-	raw string     // cached `appId.keyId:keySecret` for constant-time compare
+	cap    Capability // the capability this key grants; bounds any token minted from it
+	capRaw string     // the key's capability as its original JSON string (the granted capability echoed on requestToken)
+	raw    string     // cached `appId.keyId:keySecret` for constant-time compare
 }
 
 // Name returns the key's `appId.keyId` portion — the value carried as a
@@ -62,6 +113,14 @@ func (k APIKey) Name() string {
 // resolves to (DESIGN.md §3.1, §3.3).
 func (k APIKey) Capability() Capability {
 	return k.cap
+}
+
+// CapabilityString returns the key's capability as its original JSON
+// string — the granted capability a token minted from this key with no
+// narrowing carries, echoed verbatim on requestToken so it matches the
+// capability the app was provisioned with (DESIGN.md §3.3).
+func (k APIKey) CapabilityString() string {
+	return k.capRaw
 }
 
 // ParseAPIKey validates and decomposes an Ably-format API key, granting
@@ -98,12 +157,14 @@ func ParseAPIKeyWithCapability(s, capJSON string) (APIKey, error) {
 	}
 
 	cap := AllowAllCapability()
+	capRaw := AllowAllCapability().String()
 	if capJSON != "" {
 		c, err := ParseCapability(capJSON)
 		if err != nil {
 			return APIKey{}, fmt.Errorf("api key capability: %w", err)
 		}
 		cap = c
+		capRaw = capJSON
 	}
 
 	return APIKey{
@@ -111,6 +172,7 @@ func ParseAPIKeyWithCapability(s, capJSON string) (APIKey, error) {
 		KeyID:     keyID,
 		KeySecret: secret,
 		cap:       cap,
+		capRaw:    capRaw,
 		raw:       s,
 	}, nil
 }
@@ -170,6 +232,13 @@ type Authenticator struct {
 	keys   []APIKey
 	byName map[string]APIKey // appId.keyId -> key, for kid / keyName lookup
 	parser *jwt.Parser
+
+	// nonceMu guards seenNonces, the set of token-request nonces accepted
+	// within the timestamp window, used to reject replays (DESIGN.md §3.3).
+	// The map value is the entry's expiry, after which it is evicted.
+	nonceMu     sync.Mutex
+	seenNonces  map[string]time.Time
+	nonceReaped time.Time
 }
 
 // NewAuthenticator constructs an Authenticator accepting any of the
@@ -181,12 +250,15 @@ func NewAuthenticator(keys ...APIKey) *Authenticator {
 		byName[k.Name()] = k
 	}
 	return &Authenticator{
-		keys:   keys,
-		byName: byName,
+		keys:       keys,
+		byName:     byName,
+		seenNonces: make(map[string]time.Time),
 		parser: jwt.NewParser(
 			jwt.WithValidMethods([]string{"HS256"}),
-			jwt.WithLeeway(clockSkewLeeway),
-			jwt.WithIssuedAt(),           // reject iat in the future (beyond leeway)
+			// No leeway: exp is checked with zero grace so an expired token
+			// is rejected the instant it lapses (Ably behaviour, DESIGN.md §3).
+			// iat is validated separately (verifyToken) with a small forward
+			// leeway; iat-future rejection is not left to the library.
 			jwt.WithExpirationRequired(), // exp must be present
 		),
 	}
@@ -269,10 +341,23 @@ func (a *Authenticator) verifyToken(tokenString string) (*Principal, error) {
 		return set, nil
 	})
 	if err != nil {
+		// An expired token is renewable (40142); surface it distinctly from a
+		// generic invalid-token failure (DESIGN.md §3).
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return nil, fmt.Errorf("%w: %v", ErrTokenExpired, err)
+		}
 		return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
 	}
 	if _, ok := claims["iat"]; !ok {
 		return nil, fmt.Errorf("%w: missing iat claim", ErrInvalidToken)
+	}
+	// Reject a token issued in the future beyond the clock-skew leeway. The
+	// parser no longer validates iat (so exp can be checked without grace),
+	// so this is enforced here.
+	if iat, ierr := claims.GetIssuedAt(); ierr == nil && iat != nil {
+		if iat.Time.After(time.Now().Add(clockSkewLeeway)) {
+			return nil, fmt.Errorf("%w: iat in the future", ErrInvalidToken)
+		}
 	}
 
 	// An absent capability claim inherits the signing key's capability;
@@ -304,6 +389,38 @@ func (a *Authenticator) verifyToken(tokenString string) (*Principal, error) {
 // HTTP request. It is the token half of Authenticate.
 func (a *Authenticator) VerifyToken(tokenString string) (*Principal, error) {
 	return a.verifyToken(tokenString)
+}
+
+// AuthErrorInfo maps an authentication / token-request failure to the
+// Ably error code, HTTP status code, and message the SDK expects
+// (DESIGN.md §3). Order matters: the more specific wrapped sentinels
+// (ErrTokenExpired, ErrCapabilityDenied) are tested before the
+// ErrInvalidToken they wrap.
+func AuthErrorInfo(err error) (code, statusCode int, message string) {
+	switch {
+	case errors.Is(err, ErrTokenExpired):
+		return 40142, 401, "token expired"
+	case errors.Is(err, ErrCapabilityDenied):
+		return 40160, 401, "requested capability not permitted by the key"
+	case errors.Is(err, ErrTimestampNotCurrent):
+		return 40104, 401, "token request timestamp not current"
+	case errors.Is(err, ErrNonceReplayed):
+		return 40105, 401, "token request nonce replayed"
+	case errors.Is(err, ErrInvalidCapability):
+		return 40000, 400, "invalid capability"
+	case errors.Is(err, ErrInvalidTTL):
+		return 40003, 400, "invalid ttl"
+	case errors.Is(err, ErrClientIDMismatch):
+		return 40102, 401, "clientId not permitted by credential"
+	case errors.Is(err, ErrInvalidToken):
+		return 40101, 401, "invalid credentials"
+	case errors.Is(err, ErrInvalidKey):
+		return 40101, 401, "invalid credentials"
+	case errors.Is(err, ErrNoCredentials):
+		return 40101, 401, "no credentials provided"
+	default:
+		return 40101, 401, "invalid credentials"
+	}
 }
 
 // ResolveClientID derives a connection's (or REST request's) clientId
@@ -389,6 +506,62 @@ type TokenRequest struct {
 	MAC        string `json:"mac"        msgpack:"mac"`
 }
 
+// UnmarshalJSON decodes a TokenRequest, accepting ttl and timestamp as
+// either a JSON number or a quoted numeric string. Ably's authUrl exchange
+// (e.g. echo's qs_to_body) reassembles a signed TokenRequest from query
+// params, so those numeric fields arrive as strings; a plain int64 field
+// would fail to decode and the whole exchange would 400. A non-numeric ttl
+// (the SDK's "invalid ttl" case) still errors, surfacing as a 400.
+func (tr *TokenRequest) UnmarshalJSON(data []byte) error {
+	var aux struct {
+		KeyName    string          `json:"keyName"`
+		TTL        json.RawMessage `json:"ttl"`
+		Capability string          `json:"capability"`
+		ClientID   string          `json:"clientId"`
+		Timestamp  json.RawMessage `json:"timestamp"`
+		Nonce      string          `json:"nonce"`
+		MAC        string          `json:"mac"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	ttl, err := flexibleInt64(aux.TTL)
+	if err != nil {
+		return fmt.Errorf("ttl: %w", err)
+	}
+	ts, err := flexibleInt64(aux.Timestamp)
+	if err != nil {
+		return fmt.Errorf("timestamp: %w", err)
+	}
+	tr.KeyName, tr.Capability, tr.ClientID = aux.KeyName, aux.Capability, aux.ClientID
+	tr.Nonce, tr.MAC, tr.TTL, tr.Timestamp = aux.Nonce, aux.MAC, ttl, ts
+	return nil
+}
+
+// flexibleInt64 decodes a JSON value that may be a number, a quoted
+// numeric string, null, or absent into an int64 (0 when empty/absent).
+func flexibleInt64(raw json.RawMessage) (int64, error) {
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "null" {
+		return 0, nil
+	}
+	if s[0] == '"' {
+		var str string
+		if err := json.Unmarshal(raw, &str); err != nil {
+			return 0, err
+		}
+		if str == "" {
+			return 0, nil
+		}
+		return strconv.ParseInt(str, 10, 64)
+	}
+	var n int64
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // tokenRequestText builds the canonical string a TokenRequest's mac is
 // computed over (Ably RSA9): each field followed by a newline, in order.
 // ttl is empty when unset; the other fields are echoed verbatim so the
@@ -417,18 +590,54 @@ func (a *Authenticator) ValidateTokenRequest(tr *TokenRequest, r *http.Request) 
 	if !ok {
 		return fmt.Errorf("%w: unknown key %q", ErrInvalidToken, tr.KeyName)
 	}
+	// Authenticate the request: a matching mac, or Basic auth for the same
+	// key (the holder is explicitly authenticated, so a mac is unnecessary).
 	if tr.MAC != "" {
 		expected := base64.StdEncoding.EncodeToString(hmacOf(key, tr.tokenRequestText()))
 		if subtle.ConstantTimeCompare([]byte(tr.MAC), []byte(expected)) != 1 {
 			return fmt.Errorf("%w: request mac does not match", ErrInvalidToken)
 		}
-		return nil
+	} else if k, ok := extractKey(r); !ok || subtle.ConstantTimeCompare([]byte(k), []byte(key.raw)) != 1 {
+		return fmt.Errorf("%w: request mac not provided", ErrInvalidToken)
 	}
-	// Unsigned: only a Basic-auth request for the same key is trusted.
-	if k, ok := extractKey(r); ok && subtle.ConstantTimeCompare([]byte(k), []byte(key.raw)) == 1 {
-		return nil
+
+	// The request is authenticated. Enforce timestamp recency and nonce
+	// uniqueness (DESIGN.md §3.3): a stale/future timestamp or a replayed
+	// nonce is rejected so a captured request cannot be re-minted later.
+	if tr.Timestamp != 0 {
+		ts := time.UnixMilli(tr.Timestamp)
+		if d := time.Since(ts); d > tokenRequestTimestampWindow || d < -tokenRequestTimestampWindow {
+			return fmt.Errorf("%w: %v", ErrTimestampNotCurrent, ts)
+		}
 	}
-	return fmt.Errorf("%w: request mac not provided", ErrInvalidToken)
+	if tr.Nonce != "" && !a.recordNonce(tr.Nonce) {
+		return fmt.Errorf("%w: %q", ErrNonceReplayed, tr.Nonce)
+	}
+	return nil
+}
+
+// recordNonce records a token-request nonce and reports whether it was
+// previously unseen within the timestamp window. A repeat (still within
+// the window) returns false so the caller rejects the replay. Expired
+// entries are reaped opportunistically to keep the set bounded — a nonce
+// older than the window would fail the timestamp check regardless.
+func (a *Authenticator) recordNonce(nonce string) bool {
+	now := time.Now()
+	a.nonceMu.Lock()
+	defer a.nonceMu.Unlock()
+	if now.Sub(a.nonceReaped) > tokenRequestTimestampWindow {
+		for n, exp := range a.seenNonces {
+			if now.After(exp) {
+				delete(a.seenNonces, n)
+			}
+		}
+		a.nonceReaped = now
+	}
+	if exp, seen := a.seenNonces[nonce]; seen && now.Before(exp) {
+		return false
+	}
+	a.seenNonces[nonce] = now.Add(tokenRequestTimestampWindow)
+	return true
 }
 
 // MintToken issues an HS256 JWT for a validated TokenRequest, signed with
@@ -440,10 +649,10 @@ func (a *Authenticator) ValidateTokenRequest(tr *TokenRequest, r *http.Request) 
 // rejected. A request with no capability leaves the claim unset, so the
 // minted token inherits the key's capability at verification time.
 // Returns the signed token and its expiry.
-func (a *Authenticator) MintToken(tr *TokenRequest) (token string, issued, expires time.Time, err error) {
+func (a *Authenticator) MintToken(tr *TokenRequest) (token string, issued, expires time.Time, capability string, err error) {
 	key, ok := a.byName[tr.KeyName]
 	if !ok {
-		return "", time.Time{}, time.Time{}, fmt.Errorf("%w: unknown key %q", ErrInvalidToken, tr.KeyName)
+		return "", time.Time{}, time.Time{}, "", fmt.Errorf("%w: unknown key %q", ErrInvalidToken, tr.KeyName)
 	}
 	issued = time.Now()
 	ttl := time.Duration(tr.TTL) * time.Millisecond
@@ -454,18 +663,27 @@ func (a *Authenticator) MintToken(tr *TokenRequest) (token string, issued, expir
 
 	claims := jwt.MapClaims{
 		"iat": issued.Unix(),
-		"exp": expires.Unix(),
+		// exp carries sub-second precision so a short (sub-second) ttl yields
+		// a token that actually expires when it should, rather than staying
+		// valid for up to a whole second (DESIGN.md §3.3).
+		"exp": float64(expires.UnixNano()) / float64(time.Second),
 	}
+
+	// The granted capability defaults to the key's own (echoed verbatim so it
+	// matches how the key was provisioned); a requested capability narrows it
+	// via intersection and is stamped on the token (DESIGN.md §3.3).
+	capability = key.CapabilityString()
 	if tr.Capability != "" {
 		requested, perr := ParseCapability(tr.Capability)
 		if perr != nil {
-			return "", time.Time{}, time.Time{}, fmt.Errorf("%w: %v", ErrInvalidToken, perr)
+			return "", time.Time{}, time.Time{}, "", fmt.Errorf("%w: %v", ErrInvalidCapability, perr)
 		}
 		narrowed := requested.Intersect(key.Capability())
 		if narrowed.IsEmpty() {
-			return "", time.Time{}, time.Time{}, fmt.Errorf("%w: requested capability is not permitted by the key", ErrInvalidToken)
+			return "", time.Time{}, time.Time{}, "", ErrCapabilityDenied
 		}
-		claims["x-ably-capability"] = narrowed.String()
+		capability = narrowed.String()
+		claims["x-ably-capability"] = capability
 	}
 	if tr.ClientID != "" {
 		claims["x-ably-clientId"] = tr.ClientID
@@ -478,7 +696,21 @@ func (a *Authenticator) MintToken(tr *TokenRequest) (token string, issued, expir
 	t := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	t.Header["kid"] = key.Name()
 	token, err = t.SignedString([]byte(key.KeySecret))
-	return token, issued, expires, err
+	return token, issued, expires, capability, err
+}
+
+// ValidateTTL checks a requested token ttl (milliseconds) is neither
+// negative nor excessive (DESIGN.md §3.3). A zero ttl means "use the
+// default" and is accepted; anything above maxTokenTTL is rejected.
+// Returns ErrInvalidTTL on violation.
+func ValidateTTL(ttlMs int64) error {
+	if ttlMs < 0 {
+		return fmt.Errorf("%w: negative ttl %d", ErrInvalidTTL, ttlMs)
+	}
+	if time.Duration(ttlMs)*time.Millisecond > maxTokenTTL {
+		return fmt.Errorf("%w: ttl %d exceeds maximum", ErrInvalidTTL, ttlMs)
+	}
+	return nil
 }
 
 // hmacOf returns the HMAC-SHA256 of text keyed with the given key's

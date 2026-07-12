@@ -178,8 +178,8 @@ JWT claims:
 
 | Claim | Required | Purpose |
 |---|---|---|
-| `iat` | ✓ | issued-at; server rejects clock-skewed tokens beyond a small leeway |
-| `exp` | ✓ | expiry |
+| `iat` | ✓ | issued-at; a token issued in the future beyond a small clock-skew leeway is rejected |
+| `exp` | ✓ | expiry; checked with no grace, so an expired token is rejected the instant it lapses |
 | `x-ably-capability` | | JSON object granting per-channel ops (see §3.1). Present → the token's capability is the claim **intersected with** the signing key's capability. Absent → the token inherits the signing key's capability outright (for a full-capability key that is `{"*":["*"]}`, so the claim is only needed to *narrow* access; for a scoped key the token is bounded by the key regardless) |
 | `x-ably-clientId` | | string; controls the connection's `clientId` (see §3.2) |
 
@@ -317,7 +317,10 @@ select a concrete `clientId` to enter (see §12.3).
 
 `POST /keys/{keyName}/requestToken` mints a token for a key holder. The
 body is an Ably `TokenRequest` (`keyName`, `ttl`, `capability`, `clientId`,
-`timestamp`, `nonce`, `mac`). The request is authenticated one of two ways:
+`timestamp`, `nonce`, `mac`); `ttl` and `timestamp` are accepted as either
+a JSON number or a numeric string (the `authUrl` exchange reassembles a
+signed request from query params, so they arrive as strings). The request
+is authenticated one of two ways:
 
 - **Signed** — the `mac` is `base64(HMAC-SHA256(text, keySecret))` over the
   canonical text `keyName"\n" ttl"\n" capability"\n" clientId"\n"
@@ -327,24 +330,45 @@ body is an Ably `TokenRequest` (`keyName`, `ttl`, `capability`, `clientId`,
   also carries Basic auth for the same key (the holder is explicitly
   authenticated, so the mac is unnecessary).
 
+An authenticated request is then validated (client errors, not server
+errors):
+
+- **`capability`** — must be well-formed: parseable JSON, every op list
+  non-empty, `*` never combined with another op, and every op a recognised
+  Ably operation name. A violation is a `400` (`40000`). (A configured
+  key's own capability is trusted and not subject to this check, so it may
+  carry ops this server does not itself enforce, e.g. push.)
+- **`ttl`** — a negative ttl or one above the 24-hour maximum is a `400`; a
+  non-numeric ttl is a `400`. Zero/absent means the 60-minute default.
+- **`timestamp`** — must be within two minutes of server time, else `40104`
+  (`401`) — guarding against stale or replayed requests.
+- **`nonce`** — a nonce reused within the timestamp window is a replay,
+  rejected with `40105` (`401`). Seen nonces are tracked in-memory and
+  evicted once past the window (a later reuse fails the timestamp check
+  regardless).
+
 The minted token is an **HS256 JWT** signed with the key secret, `kid` set
 to the key name, carrying `iat`/`exp` (from `ttl`, default 60 min), the
 request `nonce` as `jti` (so distinct requests yield distinct tokens), and
-`x-ably-capability` / `x-ably-clientId` when supplied. It is returned in a
-`TokenDetails` response body (`token` holds the JWT), which the SDK then
-presents as an `access_token` verified by the path above.
+`x-ably-capability` / `x-ably-clientId` when supplied. `exp` carries
+sub-second precision, so a short (sub-second) ttl yields a token that
+actually expires when it should rather than lasting up to a whole second.
+It is returned in a `TokenDetails` response body (`token` holds the JWT),
+which the SDK then presents as an `access_token` verified by the path
+above.
 
 The requested `capability` is *narrowed* against the signing key's
 capability before it is stamped on the token (§3.1): the token grants
 only the intersection of what was requested and what the key permits. A
 full-capability key (`{"*":["*"]}`) passes a requested capability through
 unchanged; a scoped key clamps it to the key's own grants; either way a
-request whose capability the key cannot grant at all is rejected. A
-request with no capability leaves the claim unset, so the minted token
-inherits the key's capability when it is later verified.
-
-> Nonce replay tracking is not implemented; the mac alone guarantees
-> integrity.
+request whose capability the key cannot grant at all (empty intersection)
+is rejected with `40160` (`401`). A request with no capability leaves the
+claim unset, so the minted token inherits the key's capability when it is
+later verified. The `TokenDetails` response always carries the **granted**
+capability as a JSON string — the narrowed value stamped on the token, or
+the key's own capability verbatim when none was requested — so the SDK can
+always parse it.
 
 ## 4. Attachments
 

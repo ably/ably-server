@@ -18,7 +18,10 @@ import (
 func signToken(t *testing.T, capability, clientID string, ttl time.Duration) string {
 	t.Helper()
 	now := time.Now()
-	claims := jwt.MapClaims{"iat": now.Unix(), "exp": now.Add(ttl).Unix()}
+	// exp carries sub-second precision (as MintToken does) so a sub-second
+	// ttl is honoured exactly rather than truncated to a whole second — with
+	// no exp leeway a truncated exp could land in the past at connect.
+	claims := jwt.MapClaims{"iat": now.Unix(), "exp": float64(now.Add(ttl).UnixNano()) / float64(time.Second)}
 	if capability != "" {
 		claims["x-ably-capability"] = capability
 	}
