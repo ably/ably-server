@@ -6,13 +6,14 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-09 20:59'
+updated_date: '2026-07-12 16:37'
 labels:
   - auth
   - realtime
   - compat
 dependencies:
   - TASK-78
-priority: medium
+priority: low
 ordinal: 88000
 ---
 
@@ -28,3 +29,9 @@ Found during TASK-78: the RTC8a1 'capabilities downgrade' subtest expects that w
 - [ ] #2 The RTC8a1 capabilities-downgrade subtest passes against a local server
 - [ ] #3 Unit test in internal/realtime pins the downgrade behaviour
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Per Lewis (2026-07-12): out of scope for the experimental release.
+<!-- SECTION:NOTES:END -->

@@ -6,11 +6,13 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-12 13:59'
+updated_date: '2026-07-12 16:37'
 labels:
   - compat
   - ably-js
   - scoping
 dependencies: []
+priority: low
 ordinal: 110000
 ---
 
@@ -24,3 +26,9 @@ rest/batch (2026-07-12 ably-js run): batchPublish 'when invoked with an array of
 <!-- AC:BEGIN -->
 - [ ] #1 Decision recorded for batchPublish, batchPresence, and revokeTokens: in scope or documented non-goal
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Decision (Lewis, 2026-07-12): token revocation is a non-goal (documented in DESIGN §1) — it presupposes revocable tokens the single-app model doesn't have. Batch publish / batch presence fetch: deferred pending real demand (AIT or a customer); not release-blocking.
+<!-- SECTION:NOTES:END -->

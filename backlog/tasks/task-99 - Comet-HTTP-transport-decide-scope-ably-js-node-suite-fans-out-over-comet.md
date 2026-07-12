@@ -1,9 +1,11 @@
 ---
 id: TASK-99
 title: 'Comet/HTTP transport: decide scope (ably-js node suite fans out over comet)'
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@claude'
 created_date: '2026-07-12 13:58'
+updated_date: '2026-07-12 16:37'
 labels:
   - compat
   - ably-js
@@ -23,3 +25,9 @@ The ably-js node suite runs most realtime specs on both web_socket and comet (HT
 - [ ] #1 Decision recorded: comet transport is in scope or an explicit documented non-goal
 - [ ] #2 If non-goal: DESIGN.md section 1 documents it and the compat-run recipe excludes comet variants
 <!-- AC:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Decision (Lewis, 2026-07-12): comet/HTTP-streaming transport is NOT needed for the experimental release — as a dev server or a deployment inside a customer's own network, SDKs will always use WebSocket; comet is a restricted-network fallback that doesn't apply. Documented as an explicit DESIGN.md §1 non-goal (realtime transport is WebSocket-only). Revisit only if a concrete deployment surfaces that needs it. The ~67 comet test variants in the ably-js suite are permanently excluded from compatibility tallies.
+<!-- SECTION:FINAL_SUMMARY:END -->

@@ -6,11 +6,12 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-12 13:59'
+updated_date: '2026-07-12 16:37'
 labels:
   - compat
   - ably-js
 dependencies: []
-priority: medium
+priority: low
 ordinal: 107000
 ---
 
@@ -26,3 +27,9 @@ Three REST-surface conformance gaps from the 2026-07-12 ably-js run, grouped bec
 - [ ] #2 /time (and other REST endpoints) honour the msgpack Accept header
 - [ ] #3 rest/history paginated tests and rest/request request_time pass
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Per Lewis (2026-07-12): approved as cheap cleanups; do opportunistically, not release-blocking.
+<!-- SECTION:NOTES:END -->

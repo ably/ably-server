@@ -1,9 +1,11 @@
 ---
 id: TASK-103
 title: Echo negotiated channel params/modes on ATTACHED
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-07-12 13:58'
+updated_date: '2026-07-12 16:06'
 labels:
   - compat
   - ably-js

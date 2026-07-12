@@ -4,11 +4,12 @@ title: Carry extras on Message and PresenceMessage
 status: To Do
 assignee: []
 created_date: '2026-07-12 13:59'
+updated_date: '2026-07-12 16:37'
 labels:
   - compat
   - ably-js
 dependencies: []
-priority: medium
+priority: high
 ordinal: 105000
 ---
 
@@ -24,3 +25,9 @@ Neither protocol.Message nor protocol.PresenceMessage has an Extras field, so cl
 - [ ] #2 PresenceMessage extras round-trip enter -> presence event
 - [ ] #3 extras_field and presenceMessageExtras pass
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Per Lewis (2026-07-12): AIT depends on setting extras.ai on messages, so this is a hard blocker for the AIT suite run (TASK-96) and for AIT demos — land this BEFORE TASK-96. Extras must round-trip verbatim on publish, fan-out, storage, history, and REST reads, for Message, PresenceMessage and (check) Annotation.
+<!-- SECTION:NOTES:END -->

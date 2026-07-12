@@ -27,6 +27,11 @@ This document describes how it works, section by section. The task list in
 - Hard durability or HA guarantees beyond what the chosen database provides.
 - Backwards compatibility with arbitrary historical Ably protocol versions —
   we target v2 and later.
+- Realtime transports other than WebSocket. Comet/HTTP-streaming and SSE
+  are restricted-network fallbacks that do not apply to a local dev server
+  or a deployment inside the operator's own network; SDKs use WebSocket.
+- Token revocation. Revocable tokens presuppose per-token server-side
+  state the single-app model does not keep.
 
 ## 2. External surface
 
@@ -403,18 +408,30 @@ receives a new `ATTACHED` (plus any replay).
 `ATTACHED` is the **first** frame the server emits in response to `ATTACH`;
 any replay or live messages follow it. Its fields:
 
-- `flags` — the **effective** mode set (see §4.2).
+- `flags` — the **effective** mode set (see §4.2). The SDK reads
+  `channel.modes` from these bits (RTL4m).
 - `channelSerial` — the **confirmed attach point**: the serial *from which*
   the message stream the client is now subscribed to begins. Subsequent
   `MESSAGE` frames carry their own serials advancing from that point, and
   the SDK uses the most recent serial it has seen as its cursor for any
   future re-`ATTACH`.
+- `params` — the channel params the client requested, echoed back so the
+  SDK can populate `channel.params` (RTL4k1). The `modes` entry, when the
+  client requested modes via the params map, is rewritten to the effective
+  mode set (§4.2); other requested params (e.g. `rewind`) pass through
+  unchanged. A re-`ATTACH` (including one triggered by `setOptions`)
+  rebuilds the attachment, so the new `ATTACHED` reflects the updated
+  params and modes.
 
 ### 4.2 Modes
 
-The `ATTACH.flags` bitfield selects the subset of the channel modes the
-client wants on this attachment. The mode bits occupy the high end of
-the flags word, matching Ably's wire constants:
+A client requests modes two ways: the `ATTACH.flags` bitfield, or a
+comma-separated `modes` channel param (e.g. `params.modes =
+"subscribe,presence"`, how ably-js sends `ChannelOptions.params.modes`).
+The `modes` param takes precedence over the flags mode bits, which take
+precedence over the default set; an unrecognised param token is ignored.
+The mode bits occupy the high end of the flags word, matching Ably's wire
+constants:
 
 | Mode | Bit | Grants |
 |---|---|---|
@@ -443,7 +460,8 @@ Empty intersection → the attach is rejected with `ERROR` (`code: 40160`)
 and no channel state is created. Otherwise `ATTACHED.flags` carries the
 effective set, plus the `HAS_PRESENCE` flag (`1 << 0`) when the channel
 has a non-empty presence set, so the SDK knows a `SYNC` will follow
-(§12.4).
+(§12.4). When the modes were requested via the `modes` param, the
+effective set is also echoed back in `ATTACHED.params.modes` (§4.1).
 
 Once attached, modes gate frame flow:
 

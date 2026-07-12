@@ -4,6 +4,7 @@ title: 'AIT SDK: run the integration suite against ably-server via the provision
 status: To Do
 assignee: []
 created_date: '2026-07-12 10:39'
+updated_date: '2026-07-12 16:37'
 labels:
   - compat
   - ait
@@ -25,3 +26,9 @@ ably-ai-transport-js's integration suite (~61 tests across 5 specs) stresses exa
 - [ ] #2 A compatibility report maps every failure to a backlog task or documented artifact
 - [ ] #3 New tasks filed for in-scope server gaps
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Per Lewis (2026-07-12): the goal of this task is THE central question for the experimental release — can the server be used with the AIT SDK and power demos. Everything else is secondary. Run after TASK-105 (extras.ai is a hard AIT dependency).
+<!-- SECTION:NOTES:END -->

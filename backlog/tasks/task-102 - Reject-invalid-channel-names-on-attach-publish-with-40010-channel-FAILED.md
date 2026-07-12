@@ -1,7 +1,7 @@
 ---
 id: TASK-102
 title: 'Reject invalid channel names on attach/publish with 40010, channel FAILED'
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-07-12 13:58'
