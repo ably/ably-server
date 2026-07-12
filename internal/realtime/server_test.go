@@ -199,32 +199,42 @@ func TestInboundFrameDoesNotCrashConnection(t *testing.T) {
 	}
 }
 
-func TestUpgradeRejectedWithoutCredentials(t *testing.T) {
+// A fatal WS auth failure completes the upgrade and is surfaced as an
+// in-band ERROR frame (not an HTTP 401 that rejects the upgrade), so the
+// SDK moves the connection to FAILED rather than retrying the transport
+// (DESIGN.md §2.1, §3; TASK-98).
+func TestUpgradeErrorWithoutCredentials(t *testing.T) {
 	srv, _ := newTestServer(t, time.Hour)
 
 	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1)
-	_, resp, err := websocket.DefaultDialer.DialContext(context.Background(), wsURL, nil)
-	if err == nil {
-		t.Fatal("dial succeeded; expected 401")
+	ws, resp, err := websocket.DefaultDialer.DialContext(context.Background(), wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial failed (%v); the upgrade should complete, resp=%v", err, resp)
 	}
-	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %v, want 401", resp)
-	}
-	if got := resp.Header.Get("WWW-Authenticate"); !strings.Contains(got, "Basic") {
-		t.Errorf("WWW-Authenticate = %q, want Basic challenge", got)
+	defer ws.Close()
+
+	f := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if f.Action != protocol.ActionError || f.Error == nil || f.Error.Code != 40101 {
+		t.Fatalf("frame = %+v, want in-band ERROR 40101", f)
 	}
 }
 
-func TestUpgradeRejectedWithWrongKey(t *testing.T) {
+func TestUpgradeErrorWithWrongKey(t *testing.T) {
 	srv, _ := newTestServer(t, time.Hour)
 
 	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "?key=app.key:wrong"
-	_, resp, err := websocket.DefaultDialer.DialContext(context.Background(), wsURL, nil)
-	if err == nil {
-		t.Fatal("dial succeeded; expected 401")
+	ws, resp, err := websocket.DefaultDialer.DialContext(context.Background(), wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial failed (%v); the upgrade should complete, resp=%v", err, resp)
 	}
-	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %v, want 401", resp)
+	defer ws.Close()
+
+	f := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+	if f.Action != protocol.ActionError || f.Error == nil || f.Error.Code != 40101 {
+		t.Fatalf("frame = %+v, want in-band ERROR 40101", f)
+	}
+	if f.Error.StatusCode != 401 {
+		t.Errorf("ERROR statusCode = %d, want 401", f.Error.StatusCode)
 	}
 }
 

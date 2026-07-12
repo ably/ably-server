@@ -3,7 +3,6 @@ package realtime
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -64,31 +63,39 @@ func NewServer(keys []auth.APIKey, manager *core.Manager, heartbeatInterval time
 }
 
 // HandleWebSocket authenticates the request, upgrades to a WebSocket,
-// and runs the connection loop. Auth failures are returned as HTTP 401
-// before the upgrade.
+// and runs the connection loop. A fatal auth failure does NOT reject the
+// upgrade with HTTP 401 — ably-js (and Ably) treat a failed upgrade as a
+// transport error and retry (DISCONNECTED), never reaching FAILED. Instead
+// the upgrade completes and the server sends an in-band ERROR frame
+// carrying the Ably auth error (40101 invalid credentials, 40142 token
+// expired, etc.), which the SDK maps to the FAILED state, then closes
+// (DESIGN.md §2.1, §3; mirrors the reference frontdoor's closeWithError).
 func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
-	principal, err := s.authn.Authenticate(r)
-	if err != nil {
-		s.writeAuthError(w, err)
-		return
-	}
-
-	clientID, err := auth.ResolveClientID(principal, r.URL.Query().Get("clientId"))
-	if err != nil {
-		s.writeAuthError(w, err)
-		return
-	}
-
+	// Resolve the wire format before upgrading; a bad format is a genuine
+	// bad request, not an auth failure, so it stays an HTTP-level rejection.
 	format, err := protocol.FormatFromQuery(r.URL.Query().Get("format"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
+	// Authenticate and resolve the clientId, but defer surfacing any failure
+	// until after the upgrade so it can be sent as an in-band ERROR.
+	principal, authErr := s.authn.Authenticate(r)
+	var clientID string
+	if authErr == nil {
+		clientID, authErr = auth.ResolveClientID(principal, r.URL.Query().Get("clientId"))
+	}
+
 	ws, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		// Upgrade has already written the error response.
 		s.logger.Debug("websocket upgrade failed", "err", err)
+		return
+	}
+
+	if authErr != nil {
+		s.rejectWithError(ws, format, authErr)
 		return
 	}
 
@@ -232,14 +239,39 @@ func echoFromQuery(v string) bool {
 	return b
 }
 
-func (s *Server) writeAuthError(w http.ResponseWriter, err error) {
-	w.Header().Set("WWW-Authenticate", `Basic realm="ably-server"`)
-	switch {
-	case errors.Is(err, auth.ErrNoCredentials):
-		http.Error(w, "no credentials presented", http.StatusUnauthorized)
-	case errors.Is(err, auth.ErrClientIDMismatch):
-		http.Error(w, "clientId not permitted by credential", http.StatusUnauthorized)
-	default:
-		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+// rejectWithError sends a connection-level ERROR frame carrying the Ably
+// auth error (code/statusCode from auth.AuthErrorInfo) on the freshly
+// upgraded socket, then closes it. No CONNECTED precedes it, so the SDK
+// treats the connection as never established and moves it to FAILED for a
+// non-renewable error (40101/40102), or attempts token renewal for a
+// renewable one (40142) — never a plain transport retry (DESIGN.md §3).
+// The close code mirrors the reference: a normal closure for renewable
+// token errors, a policy violation otherwise.
+func (s *Server) rejectWithError(ws *websocket.Conn, format protocol.Format, err error) {
+	code, statusCode, msg := auth.AuthErrorInfo(err)
+	frame := &protocol.ProtocolMessage{
+		Action: protocol.ActionError,
+		Error: &protocol.ErrorInfo{
+			Message:    msg,
+			Code:       code,
+			StatusCode: statusCode,
+		},
 	}
+	if data, mErr := protocol.Marshal(frame, format); mErr == nil {
+		wsType := websocket.TextMessage
+		if format == protocol.FormatMsgpack {
+			wsType = websocket.BinaryMessage
+		}
+		_ = ws.WriteMessage(wsType, data)
+	}
+	closeCode := websocket.ClosePolicyViolation
+	if code >= 40140 && code < 40150 {
+		closeCode = websocket.CloseNormalClosure
+	}
+	_ = ws.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(closeCode, msg),
+		time.Now().Add(time.Second),
+	)
+	_ = ws.Close()
 }
