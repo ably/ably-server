@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"sync"
 	"testing"
@@ -1048,6 +1049,62 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 		}
 	})
 
+	t.Run("ExtrasRoundTripsThroughStorage", func(t *testing.T) {
+		// Client-supplied extras must survive the storage payload encoding
+		// (msgpack) verbatim for messages, presence and annotations, so
+		// history/presence/annotation reads carry it back (TASK-105,
+		// DESIGN.md §8). The AI Transport SDK sets extras.ai on ~every message.
+		extras := map[string]any{"headers": map[string]any{"some": "metadata"}}
+		s := f(t)
+		ch := mustChannel(t, s, "foo")
+
+		// Message publish -> history.
+		created := mustCreate(t, ch, &protocol.Message{Name: "m", Data: "body", ClientID: "alice", Extras: extras})
+		if !reflect.DeepEqual(created.Extras, extras) {
+			t.Errorf("stored message extras = %#v, want %#v", created.Extras, extras)
+		}
+		page, err := ch.History(context.Background(), storage.HistoryQuery{Direction: storage.DirectionForwards})
+		if err != nil {
+			t.Fatalf("History: %v", err)
+		}
+		if len(page.ChannelMessages) != 1 || len(page.ChannelMessages[0].Messages) != 1 ||
+			!reflect.DeepEqual(page.ChannelMessages[0].Messages[0].Extras, extras) {
+			t.Errorf("history dropped/altered message extras: %+v", page.ChannelMessages)
+		}
+
+		// Presence enter -> members.
+		room := mustChannel(t, s, "room")
+		mustPresence(t, room, &protocol.PresenceMessage{
+			Action: protocol.PresenceEnter, ConnectionID: "conn-1", ClientID: "alice", Extras: extras,
+		})
+		members, _, err := room.Members(context.Background())
+		if err != nil {
+			t.Fatalf("Members: %v", err)
+		}
+		if len(members) != 1 || !reflect.DeepEqual(members[0].Extras, extras) {
+			t.Errorf("presence member extras = %#v, want %#v", members, extras)
+		}
+
+		// Annotation publish -> annotations read.
+		acm, _, err := ch.StoreAnnotation(context.Background(), []*protocol.Annotation{
+			{Action: protocol.AnnotationCreate, ClientID: "bob", Type: "reaction:multiple.v1", Name: "👍", MessageSerial: created.Serial, Extras: extras},
+		})
+		if err != nil {
+			t.Fatalf("StoreAnnotation: %v", err)
+		}
+		if !reflect.DeepEqual(acm.Annotations[0].Extras, extras) {
+			t.Errorf("stored annotation extras = %#v, want %#v", acm.Annotations[0].Extras, extras)
+		}
+		apage, err := ch.Annotations(context.Background(), created.Serial, storage.HistoryQuery{Direction: storage.DirectionForwards})
+		if err != nil {
+			t.Fatalf("Annotations: %v", err)
+		}
+		if len(apage.ChannelMessages) != 1 || len(apage.ChannelMessages[0].Annotations) != 1 ||
+			!reflect.DeepEqual(apage.ChannelMessages[0].Annotations[0].Extras, extras) {
+			t.Errorf("annotations read dropped/altered extras: %+v", apage.ChannelMessages)
+		}
+	})
+
 	// ---- Mutable messages (DESIGN.md §13) ------------------------------
 
 	t.Run("CreateStampsActionAndVersion", func(t *testing.T) {
@@ -1102,20 +1159,35 @@ func RunChannelStoreTests(t *testing.T, f Factory) {
 	t.Run("MutateShallowMixinCarriesForwardUnsuppliedFields", func(t *testing.T) {
 		s := f(t)
 		ch := mustChannel(t, s, "foo")
-		created := mustCreate(t, ch, &protocol.Message{Name: "title", Data: "body", ClientID: "alice"})
+		origExtras := map[string]any{"headers": map[string]any{"some": "metadata"}}
+		created := mustCreate(t, ch, &protocol.Message{Name: "title", Data: "body", ClientID: "alice", Extras: origExtras})
 
-		// Update only data — name must carry forward.
+		// Update only data — name and extras must carry forward.
 		mustMutate(t, ch, &protocol.Message{Action: protocol.MessageUpdate, Serial: created.Serial, Data: "body2", ClientID: "alice"})
 		latest, _ := ch.LatestVersion(context.Background(), created.Serial)
 		if latest.Name != "title" || latest.Data != "body2" {
 			t.Errorf("after data-only update: name=%q data=%v, want title/body2", latest.Name, latest.Data)
 		}
+		if !reflect.DeepEqual(latest.Extras, origExtras) {
+			t.Errorf("after data-only update: extras=%#v, want carried-forward %#v", latest.Extras, origExtras)
+		}
 
-		// Update only name — data must carry forward.
+		// Update only name — data and extras must carry forward.
 		mustMutate(t, ch, &protocol.Message{Action: protocol.MessageUpdate, Serial: created.Serial, Name: "title2", ClientID: "alice"})
 		latest, _ = ch.LatestVersion(context.Background(), created.Serial)
 		if latest.Name != "title2" || latest.Data != "body2" {
 			t.Errorf("after name-only update: name=%q data=%v, want title2/body2", latest.Name, latest.Data)
+		}
+		if !reflect.DeepEqual(latest.Extras, origExtras) {
+			t.Errorf("after name-only update: extras=%#v, want carried-forward %#v", latest.Extras, origExtras)
+		}
+
+		// A supplied extras replaces the whole object (shallow-mixin, §13.2).
+		newExtras := map[string]any{"push": map[string]any{"notification": map[string]any{"title": "hi"}}}
+		mustMutate(t, ch, &protocol.Message{Action: protocol.MessageUpdate, Serial: created.Serial, ClientID: "alice", Extras: newExtras})
+		latest, _ = ch.LatestVersion(context.Background(), created.Serial)
+		if !reflect.DeepEqual(latest.Extras, newExtras) {
+			t.Errorf("after extras-replacing update: extras=%#v, want %#v", latest.Extras, newExtras)
 		}
 	})
 

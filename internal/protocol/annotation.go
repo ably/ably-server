@@ -57,7 +57,12 @@ type Annotation struct {
 	Count         int              `json:"count,omitempty"         msgpack:"count,omitempty"`
 	Data          any              `json:"data,omitempty"          msgpack:"data,omitempty"`
 	Encoding      string           `json:"encoding,omitempty"      msgpack:"encoding,omitempty"`
-	Timestamp     int64            `json:"timestamp,omitempty"     msgpack:"timestamp,omitempty"`
+	// Extras is a free-form JSON object attached to the annotation,
+	// preserved verbatim through publish, fan-out and storage (DESIGN.md
+	// §8, §14.1). Carried as a map for the same round-trip reason as
+	// Message.Extras; the reference's ablyrpc.Annotation carries it too.
+	Extras    map[string]any `json:"extras,omitempty"        msgpack:"extras,omitempty"`
+	Timestamp int64          `json:"timestamp,omitempty"     msgpack:"timestamp,omitempty"`
 	// Summary is the post-fold summary snapshot of this annotation's target
 	// message, stamped by StoreAnnotation for the MESSAGE/summary (action 4)
 	// delivery frame (DESIGN.md §14.2, §14.3). It is server-internal: never

@@ -1175,7 +1175,7 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 		return nil, false, fmt.Errorf("storage/postgres: advance channel serial: %w", err)
 	}
 	for i, p := range presence {
-		p.Serial = serial.MessageSerial(channelSerial, i)
+		storage.StampPresenceMember(p, channelSerial, i)
 	}
 	cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Presence: presence}
 

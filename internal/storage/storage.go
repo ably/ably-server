@@ -359,6 +359,21 @@ func StampCreateVersion(m *protocol.Message) {
 	}
 }
 
+// StampPresenceMember stamps a freshly-published presence message's
+// server-assigned identity: its Serial (`<channelSerial>:<idx>`) and a
+// server-authoritative Timestamp derived from that serial. Every backend's
+// StorePresence calls it so presence frames carry a timestamp on the wire.
+// SDKs order presence members and decide a leave's newness against the
+// existing member by timestamp when the message has no id (Ably RTP2b1); an
+// unstamped (zero) timestamp makes a leave compare as not-newer than its own
+// enter, so the SDK never removes the member and never emits the leave
+// (DESIGN.md §12.1).
+func StampPresenceMember(p *protocol.PresenceMessage, channelSerial string, idx int) {
+	p.Serial = serial.MessageSerial(channelSerial, idx)
+	ts, _ := serial.Timestamp(p.Serial)
+	p.Timestamp = ts
+}
+
 // MergeVersion produces the new merged version of a message for a
 // mutation (DESIGN.md §13.2, §13.3). current is the target's current
 // latest version (a complete Message); mut is the inbound mutation
@@ -381,6 +396,14 @@ func MergeVersion(current, mut *protocol.Message, versionSerial string) (*protoc
 	v.Serial = current.Serial
 	v.ConnectionID = current.ConnectionID
 	v.Alt = nil // any prior append delta does not carry forward
+
+	// Extras follows the same shallow-mixin as data/name (§13.2), mirroring
+	// the reference's buildUpdateMessage: the copy above carries the current
+	// extras forward, and a mutation that supplies its own extras replaces
+	// the whole field. Applies to update, append and delete alike.
+	if mut.Extras != nil {
+		v.Extras = mut.Extras
+	}
 
 	ts, _ := serial.Timestamp(versionSerial)
 	ver := &protocol.MessageVersion{
@@ -415,6 +438,7 @@ func MergeVersion(current, mut *protocol.Message, versionSerial string) (*protoc
 			ConnectionID: current.ConnectionID,
 			Data:         mut.Data,
 			Encoding:     mut.Encoding,
+			Extras:       v.Extras, // delta carries the merged extras (matches the aggregate)
 			Version:      ver,
 		}
 		v.Action = protocol.MessageUpdate

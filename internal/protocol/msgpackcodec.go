@@ -69,6 +69,7 @@ func (m *Message) EncodeMsgpack(enc *msgpack.Encoder) error {
 		{"name", m.Name != "", func(e *msgpack.Encoder) error { return e.EncodeString(m.Name) }},
 		{"data", m.Data != nil, func(e *msgpack.Encoder) error { return e.Encode(m.Data) }},
 		{"encoding", m.Encoding != "", func(e *msgpack.Encoder) error { return e.EncodeString(m.Encoding) }},
+		{"extras", len(m.Extras) > 0, func(e *msgpack.Encoder) error { return e.Encode(m.Extras) }},
 		{"timestamp", m.Timestamp != 0, func(e *msgpack.Encoder) error { return e.EncodeInt(m.Timestamp) }},
 		{"version", m.Version != nil, func(e *msgpack.Encoder) error { return e.Encode(m.Version) }},
 		{"summary", len(m.Summary) > 0, func(e *msgpack.Encoder) error { return e.Encode(m.Summary) }},
@@ -100,6 +101,7 @@ func (p *PresenceMessage) EncodeMsgpack(enc *msgpack.Encoder) error {
 		{"connectionId", p.ConnectionID != "", func(e *msgpack.Encoder) error { return e.EncodeString(p.ConnectionID) }},
 		{"data", p.Data != nil, func(e *msgpack.Encoder) error { return e.Encode(p.Data) }},
 		{"encoding", p.Encoding != "", func(e *msgpack.Encoder) error { return e.EncodeString(p.Encoding) }},
+		{"extras", len(p.Extras) > 0, func(e *msgpack.Encoder) error { return e.Encode(p.Extras) }},
 		{"timestamp", p.Timestamp != 0, func(e *msgpack.Encoder) error { return e.EncodeInt(p.Timestamp) }},
 	})
 }
@@ -131,6 +133,7 @@ func (a *Annotation) EncodeMsgpack(enc *msgpack.Encoder) error {
 		{"count", a.Count != 0, func(e *msgpack.Encoder) error { return e.EncodeInt(int64(a.Count)) }},
 		{"data", a.Data != nil, func(e *msgpack.Encoder) error { return e.Encode(a.Data) }},
 		{"encoding", a.Encoding != "", func(e *msgpack.Encoder) error { return e.EncodeString(a.Encoding) }},
+		{"extras", len(a.Extras) > 0, func(e *msgpack.Encoder) error { return e.Encode(a.Extras) }},
 		{"timestamp", a.Timestamp != 0, func(e *msgpack.Encoder) error { return e.EncodeInt(a.Timestamp) }},
 	})
 }

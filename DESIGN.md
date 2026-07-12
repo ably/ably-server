@@ -1185,6 +1185,13 @@ should use Ably or fork.
   it is always treated as new. `batchID` is opaque to the server —
   clients typically use a UUID or a deterministic hash of payload +
   intent.
+- **Message.extras**: an optional free-form JSON object the client
+  attaches to a message — headers, push metadata, and the AI Transport
+  SDK's `extras.ai`. The server treats it as opaque and preserves it
+  verbatim through publish, fan-out, storage, history and REST reads; a
+  mutation carries the target's extras forward unless it supplies its own,
+  which replaces the whole object (shallow-mixin, §13.2). `PresenceMessage`
+  and `Annotation` carry the same `extras` field with identical semantics.
 
 Replay on `ATTACH` is a bounded history read from storage between the
 client-supplied `channelSerial` and the channel's current head, streamed

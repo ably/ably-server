@@ -23,6 +23,7 @@ func fullMessage() *Message {
 		Name:         "greeting",
 		Data:         "hello",
 		Encoding:     "utf-8",
+		Extras:       map[string]any{"headers": map[string]any{"some": "metadata"}},
 		Timestamp:    1700000000000,
 		Version:      &MessageVersion{Serial: "s:000", Timestamp: 1700000000000, ClientID: "alice"},
 		Summary:      Summary{"reaction:total.v1": {Method: "total.v1", Total: &TotalAggregation{Total: 1}}},
@@ -39,6 +40,7 @@ func fullPresenceMessage() *PresenceMessage {
 		ConnectionID: "conn-1",
 		Data:         "hello",
 		Encoding:     "utf-8",
+		Extras:       map[string]any{"headers": map[string]any{"some": "metadata"}},
 		Timestamp:    1700000000000,
 	}
 }
@@ -56,6 +58,7 @@ func fullAnnotation() *Annotation {
 		Count:         3,
 		Data:          "hello",
 		Encoding:      "utf-8",
+		Extras:        map[string]any{"headers": map[string]any{"some": "metadata"}},
 		Timestamp:     1700000000000,
 		// Summary is server-internal (msgpack:"-") and must NOT be emitted.
 		Summary: Summary{"reaction:total.v1": {Method: "total.v1", Total: &TotalAggregation{Total: 1}}},

@@ -44,5 +44,10 @@ type PresenceMessage struct {
 	ConnectionID string         `json:"connectionId,omitempty" msgpack:"connectionId,omitempty"`
 	Data         any            `json:"data,omitempty"         msgpack:"data,omitempty"`
 	Encoding     string         `json:"encoding,omitempty"     msgpack:"encoding,omitempty"`
-	Timestamp    int64          `json:"timestamp,omitempty"    msgpack:"timestamp,omitempty"`
+	// Extras is a free-form JSON object attached to the presence message,
+	// preserved verbatim through publish, presence sync/fan-out and storage
+	// (DESIGN.md §8, §12.1). Carried as a map for the same round-trip reason
+	// as Message.Extras.
+	Extras    map[string]any `json:"extras,omitempty"       msgpack:"extras,omitempty"`
+	Timestamp int64          `json:"timestamp,omitempty"    msgpack:"timestamp,omitempty"`
 }

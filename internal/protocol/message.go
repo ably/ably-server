@@ -21,16 +21,26 @@ package protocol
 // strictly-greater Version.Serial. Action carries no omitempty: a create
 // must emit action=0 on the wire to match Ably's SDKs.
 type Message struct {
-	ID           string          `json:"id,omitempty"           msgpack:"id,omitempty"`
-	Serial       string          `json:"serial,omitempty"       msgpack:"serial,omitempty"`
-	Action       MessageAction   `json:"action"                 msgpack:"action"`
-	ClientID     string          `json:"clientId,omitempty"     msgpack:"clientId,omitempty"`
-	ConnectionID string          `json:"connectionId,omitempty" msgpack:"connectionId,omitempty"`
-	Name         string          `json:"name,omitempty"         msgpack:"name,omitempty"`
-	Data         any             `json:"data,omitempty"         msgpack:"data,omitempty"`
-	Encoding     string          `json:"encoding,omitempty"     msgpack:"encoding,omitempty"`
-	Timestamp    int64           `json:"timestamp,omitempty"    msgpack:"timestamp,omitempty"`
-	Version      *MessageVersion `json:"version,omitempty"      msgpack:"version,omitempty"`
+	ID           string        `json:"id,omitempty"           msgpack:"id,omitempty"`
+	Serial       string        `json:"serial,omitempty"       msgpack:"serial,omitempty"`
+	Action       MessageAction `json:"action"                 msgpack:"action"`
+	ClientID     string        `json:"clientId,omitempty"     msgpack:"clientId,omitempty"`
+	ConnectionID string        `json:"connectionId,omitempty" msgpack:"connectionId,omitempty"`
+	Name         string        `json:"name,omitempty"         msgpack:"name,omitempty"`
+	Data         any           `json:"data,omitempty"         msgpack:"data,omitempty"`
+	Encoding     string        `json:"encoding,omitempty"     msgpack:"encoding,omitempty"`
+	// Extras is a free-form JSON object the client attaches to a message
+	// (headers, push metadata, and — for the AI Transport SDK — extras.ai).
+	// The server treats it as opaque and preserves it verbatim through
+	// publish, fan-out, storage, history and mutations (DESIGN.md §8, §13.2).
+	// It is a map rather than a raw-JSON carrier so it round-trips both the
+	// JSON and msgpack wire/storage encodings — json.RawMessage would not
+	// survive the msgpack storage payload. This mirrors the reference's
+	// extras object (ablyrpc holds it as structpb.Struct, wire-encoded as a
+	// plain object under either format).
+	Extras    map[string]any  `json:"extras,omitempty"       msgpack:"extras,omitempty"`
+	Timestamp int64           `json:"timestamp,omitempty"    msgpack:"timestamp,omitempty"`
+	Version   *MessageVersion `json:"version,omitempty"      msgpack:"version,omitempty"`
 	// Summary is the fold of this message's annotations (DESIGN.md §14.2),
 	// keyed by annotation type. It rides the latest-version projection so
 	// message reads (GET .../messages, .../messages/{serial}, history)
@@ -107,11 +117,11 @@ type ChannelMessage struct {
 
 // ProtocolMessage is one frame on the realtime WebSocket connection.
 type ProtocolMessage struct {
-	Action        Action             `json:"action"                  msgpack:"action"`
-	ID            string             `json:"id,omitempty"            msgpack:"id,omitempty"`
-	ConnectionID  string             `json:"connectionId,omitempty"  msgpack:"connectionId,omitempty"`
-	Channel       string             `json:"channel,omitempty"       msgpack:"channel,omitempty"`
-	ChannelSerial string             `json:"channelSerial,omitempty" msgpack:"channelSerial,omitempty"`
+	Action        Action `json:"action"                  msgpack:"action"`
+	ID            string `json:"id,omitempty"            msgpack:"id,omitempty"`
+	ConnectionID  string `json:"connectionId,omitempty"  msgpack:"connectionId,omitempty"`
+	Channel       string `json:"channel,omitempty"       msgpack:"channel,omitempty"`
+	ChannelSerial string `json:"channelSerial,omitempty" msgpack:"channelSerial,omitempty"`
 	// MsgSerial is the per-connection publish counter (§8), a pointer so
 	// the server can emit msgSerial:0 while every non-publish frame omits
 	// the field. pointer+omitempty emits the value whenever it is non-nil
@@ -120,20 +130,20 @@ type ProtocolMessage struct {
 	// if it is absent (TASK-97) — while HEARTBEAT/CONNECTED/MESSAGE
 	// deliveries, which never set it, stay free of a spurious msgSerial:0.
 	// Read an inbound frame's serial via PublishSerial (absent means 0).
-	MsgSerial     *int64             `json:"msgSerial,omitempty"     msgpack:"msgSerial,omitempty"`
-	Timestamp     int64              `json:"timestamp,omitempty"     msgpack:"timestamp,omitempty"`
-	Count         int                `json:"count,omitempty"         msgpack:"count,omitempty"`
+	MsgSerial *int64 `json:"msgSerial,omitempty"     msgpack:"msgSerial,omitempty"`
+	Timestamp int64  `json:"timestamp,omitempty"     msgpack:"timestamp,omitempty"`
+	Count     int    `json:"count,omitempty"         msgpack:"count,omitempty"`
 	// Res carries the per-message publish results back to the publisher
 	// on an ACK (Ably's TR4s shape): one entry per message in the ack
 	// window, each holding the server-assigned serials. SDKs read it to
 	// populate publish/update results (DESIGN.md §8, §13.1).
-	Res           []*PublishResult   `json:"res,omitempty"           msgpack:"res,omitempty"`
-	Flags         int64              `json:"flags,omitempty"         msgpack:"flags,omitempty"`
-	Messages      []*Message         `json:"messages,omitempty"      msgpack:"messages,omitempty"`
-	Presence      []*PresenceMessage `json:"presence,omitempty"      msgpack:"presence,omitempty"`
-	Annotations   []*Annotation      `json:"annotations,omitempty"   msgpack:"annotations,omitempty"`
-	Error         *ErrorInfo         `json:"error,omitempty"         msgpack:"error,omitempty"`
-	Params        map[string]string  `json:"params,omitempty"        msgpack:"params,omitempty"`
+	Res         []*PublishResult   `json:"res,omitempty"           msgpack:"res,omitempty"`
+	Flags       int64              `json:"flags,omitempty"         msgpack:"flags,omitempty"`
+	Messages    []*Message         `json:"messages,omitempty"      msgpack:"messages,omitempty"`
+	Presence    []*PresenceMessage `json:"presence,omitempty"      msgpack:"presence,omitempty"`
+	Annotations []*Annotation      `json:"annotations,omitempty"   msgpack:"annotations,omitempty"`
+	Error       *ErrorInfo         `json:"error,omitempty"         msgpack:"error,omitempty"`
+	Params      map[string]string  `json:"params,omitempty"        msgpack:"params,omitempty"`
 	// ConnectionDetails carries the resolved identity and connection
 	// limits on the CONNECTED frame (DESIGN.md §2.1, §8).
 	ConnectionDetails *ConnectionDetails `json:"connectionDetails,omitempty" msgpack:"connectionDetails,omitempty"`

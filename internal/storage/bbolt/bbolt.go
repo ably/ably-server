@@ -747,7 +747,7 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 
 		channelSerial := cs.gen.Mint()
 		for i, p := range presence {
-			p.Serial = serial.MessageSerial(channelSerial, i)
+			storage.StampPresenceMember(p, channelSerial, i)
 		}
 		cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Presence: presence}
 		blob, err := msgpack.Marshal(cm)

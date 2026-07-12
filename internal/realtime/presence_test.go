@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -443,5 +444,67 @@ func TestPresenceDetachLeaves(t *testing.T) {
 	fwd := readFrame(t, sub, protocol.FormatJSON, 2*time.Second)
 	if fwd.Action != protocol.ActionPresence || fwd.Presence[0].Action != protocol.PresenceLeave {
 		t.Fatalf("expected PRESENCE LEAVE after detach, got %v", fwd.Action)
+	}
+}
+
+// TestPresenceExtrasAndTimestampSelfEcho locks the wire contract the ably-js
+// presenceMessageExtras test exercises (TASK-105): a single connection that
+// enters then leaves with extras receives its own echoes carrying the extras
+// verbatim, and each echo carries a server timestamp with leave >= enter.
+// SDKs order presence and decide leave-vs-enter newness by timestamp when the
+// message has no id (RTP2b1); without a stamped timestamp the client never
+// applies the leave, so this guards that regression.
+func TestPresenceExtrasAndTimestampSelfEcho(t *testing.T) {
+	srv, _ := newTestServer(t, time.Hour)
+
+	ws := dialClient(t, srv, "testclient")
+	drainConnected(t, ws)
+	attach(t, ws, "room", 0) // full modes incl. presence subscribe -> self echo
+
+	enterExtras := map[string]any{"headers": map[string]any{"key": "value"}}
+	leaveExtras := map[string]any{"headers": map[string]any{"otherKey": "otherValue"}}
+
+	readPresence := func(action protocol.PresenceAction, wantExtras map[string]any) *protocol.PresenceMessage {
+		t.Helper()
+		for {
+			f := readFrame(t, ws, protocol.FormatJSON, 2*time.Second)
+			if f.Action == protocol.ActionAck {
+				continue
+			}
+			if f.Action != protocol.ActionPresence || len(f.Presence) != 1 {
+				t.Fatalf("expected PRESENCE, got %v", f.Action)
+			}
+			p := f.Presence[0]
+			if p.Action != action {
+				t.Fatalf("delivered action = %v, want %v", p.Action, action)
+			}
+			if !reflect.DeepEqual(p.Extras, wantExtras) {
+				t.Errorf("delivered %v extras = %#v, want %#v", action, p.Extras, wantExtras)
+			}
+			if p.Timestamp == 0 {
+				t.Errorf("delivered %v carries no timestamp (SDK newness check fails)", action)
+			}
+			return p
+		}
+	}
+
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:    protocol.ActionPresence,
+		Channel:   "room",
+		MsgSerial: msgSerialPtr(1),
+		Presence:  []*protocol.PresenceMessage{{Action: protocol.PresenceEnter, Extras: enterExtras}},
+	})
+	enter := readPresence(protocol.PresenceEnter, enterExtras)
+
+	sendFrame(t, ws, protocol.FormatJSON, &protocol.ProtocolMessage{
+		Action:    protocol.ActionPresence,
+		Channel:   "room",
+		MsgSerial: msgSerialPtr(2),
+		Presence:  []*protocol.PresenceMessage{{Action: protocol.PresenceLeave, Extras: leaveExtras}},
+	})
+	leave := readPresence(protocol.PresenceLeave, leaveExtras)
+
+	if leave.Timestamp < enter.Timestamp {
+		t.Errorf("leave timestamp %d < enter timestamp %d (SDK would not apply the leave)", leave.Timestamp, enter.Timestamp)
 	}
 }
