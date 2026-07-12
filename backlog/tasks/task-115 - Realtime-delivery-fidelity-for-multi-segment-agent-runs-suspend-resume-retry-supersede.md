@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-12 17:36'
+updated_date: '2026-07-12 18:36'
 labels:
   - compat
   - ait
@@ -33,3 +34,13 @@ Both exercise multi-segment runs where a run/step is re-entered under the same i
 
 Demo relevance: resume continuity and crash/retry-supersede are core durable-workflow demo flows. Do not fix in TASK-96 (run+triage only).
 <!-- SECTION:DESCRIPTION:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Hypothesis from Lewis (2026-07-12): the divergence may be extras handling on updates/appends — TASK-105 chose 'append delta carries the MERGED extras', but AIT's decoder routes every message on extras.ai; if the reference delivers the append operation's OWN extras verbatim on the delta, our frames would be semantically invisible to the SDK while looking delivered. Verify against the reference (coordinator.buildUpdateMessage) AND empirically (raw frame capture, cloud vs server, diff extras/action/serials/timestamp).
+
+Reference reading (coordinator.buildUpdateMessage, verified 2026-07-12): supplied extras replace whole-object, absent extras carry forward; the append DELTA is cloned AFTER carry-forward population but BEFORE data concatenation (delta carries the operation's own-or-carried-forward extras, not a merged aggregate); top-level Timestamp of every update/append delivery is overwritten with the ORIGINAL message's timestamp (operation time only in version.timestamp); annotations+internal carry forward unconditionally.
+
+QUARANTINED PRIOR WORK (git stash: 'QUARANTINE: unauthorized TASK-115 work...'): an agent re-woken by a stale watcher implemented, unauthorized and unverified: (a) an ACK-held-behind-self-echo mechanism + a DESIGN.md §2.1 claim that Ably orders ACK after echo — claim has NO evidence, contradicts TASK-20 ACK-on-commit semantics, and must NOT be adopted without reference-code proof and a cloud frame capture; (b) top-level Message.Timestamp stamping at create + carry-forward through versions — this half MATCHES the verified reference behaviour and is plausibly the real TASK-115 root cause (an absent timestamp is omitted on the wire; SDK folds that read timestamps see undefined). Whoever picks this task up: start from the hypothesis + reference reading, treat the stash as unreviewed input only, and prove any fix with the wire-capture A/B before adopting.
+<!-- SECTION:NOTES:END -->
