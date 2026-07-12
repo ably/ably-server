@@ -1162,7 +1162,15 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --log-format {text|json}
 --debug-listen                pprof on a separate port; disabled if unset
 --config ably-server.toml     optional TOML file, see below
+--addr-file                   path to write the bound listener address to once listening
 ```
+
+`--addr-file` writes the listener's resolved `host:port` to the given path
+once the bind succeeds, then keeps running. It exists so a parent process
+that started the server on `--listen 127.0.0.1:0` can discover the
+ephemeral port the OS assigned — the sandbox provisioner (§15) relies on
+it. The write is atomic (a sibling temp file renamed into place), so a
+reader polling the path never sees a partial address.
 
 Configuration may also be supplied via an optional TOML config file
 (`--config ably-server.toml`), covering the same keys as the flags above
@@ -1783,7 +1791,68 @@ annotation, WS or REST) and `annotation-subscribe` (receive raw
 `ANNOTATION` frames). Summaries require only `subscribe` — they are
 message deliveries. Reading annotations via REST requires `history`.
 
-## 15. Testing strategy
+## 15. Sandbox provisioner
+
+The `ably-server` binary is strictly single-app: one app's keys, one
+channel namespace. Ably's SDK test suites, however, provision a fresh app
+per test run against a sandbox REST host (`POST /apps`), then point clients
+at the returned keys. The `ably-sandbox` command bridges the two — it is
+the disposable-instance-per-test-run role from PDR-090. Its working name
+rides TASK-75's final naming decision.
+
+`ably-sandbox` is a separate process that serves the harness-facing
+provisioning API (default `:9080`) and spawns **one `ably-server` child
+per provisioned app**, so the core server never grows multi-app
+machinery. It keeps the core single-app while giving the harness the
+multi-app surface it expects.
+
+**`POST /apps`** accepts the Ably *test-app-setup* `post_apps` body — keys
+(each with an optional capability, carried either as a stringified JSON
+object or a nested object; unrecognised fields such as `revocableTokens`
+are echoed back untouched), `namespaces`, and `channels` with presence
+members. For each request the provisioner:
+
+- generates an `appId`/`accountId` and, per key, an `appId.keyId:keySecret`
+  triple in the exact format the SDKs parse (the random tokens use a
+  base64url alphabet, so they never contain `.` or `:`);
+- translates the body into a temporary TOML config expressing the
+  `[[keys]]` (with capabilities), `[[namespaces]]`, and
+  `[[channels]]`/presence sections (§9), emitted through the same
+  `internal/config` types the server parses, so escaping round-trips;
+- boots a child `ably-server --config <tmp> --mode memory --listen
+  127.0.0.1:0 --addr-file <tmp>`, discovers the bound port from the
+  addr-file (§9), and
+- responds `201` with the sandbox app JSON — `appId`, `accountId`, `keys[]`
+  (each carrying `keyName`, `keySecret`, `keyStr`, and the capability as a
+  JSON string), the echoed `namespaces`/`channels`/`cipher` blocks —
+  **extended** with `endpoint`/`port`/`tls` fields so the harness can route
+  clients straight at the child. The response preserves the harness
+  invariant that `keys` and `namespaces` count-match the request.
+
+**`DELETE /apps/{appId}`** terminates that child (SIGTERM to its process
+group, escalating to SIGKILL after a grace window) and is idempotent
+(`204` whether or not the app is known). **`POST /stats`** accepts and
+discards stats fixtures (`201`), mirroring the server's stub (§1): the
+harness posts them at the provisioning host.
+
+Children run in their own process group so a single signal reaches the
+real server even under the `go run` fallback, and inherit an environment
+with `ABLY_SERVER_*` stripped so a variable set for the provisioner can't
+override the per-app config. Each child's stdout/stderr and its config go
+to a per-app directory under a temp dir. The provisioner tracks
+`appId → process + port + last-touched`; an idle-TTL reaper (default 30m)
+kills children not provisioned or deleted within the window, and a SIGTERM
+to the provisioner tears down every child before it exits. Concurrent
+`POST /apps` calls produce independent children on distinct OS-assigned
+ports with no shared state.
+
+The provisioner finds the `ably-server` binary via `--server-bin`; absent
+that, a sibling named `ably-server` next to its own executable; absent
+that, it falls back to `go run ./cmd/ably-server` (which assumes the
+working directory is the module root, the case when the provisioner itself
+runs under `go run`).
+
+## 16. Testing strategy
 
 - **Unit**: per-package; mock-free where practical (the storage interface
   has an in-memory implementation, exercised by the same test suite as the
@@ -1798,7 +1867,7 @@ There is no existing Ably protocol conformance suite to target; the
 ably-go integration tests are the de-facto external check on SDK
 compatibility.
 
-## 16. Project layout & licensing
+## 17. Project layout & licensing
 
 - License: **Apache 2.0** (matches ably-go).
 - Module: `github.com/ably/ably-server`.

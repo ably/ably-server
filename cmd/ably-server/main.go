@@ -46,6 +46,7 @@ const (
 	shutdownGraceEnv = "ABLY_SERVER_SHUTDOWN_GRACE"
 	logLevelEnv      = "ABLY_SERVER_LOG_LEVEL"
 	configPathEnv    = "ABLY_SERVER_CONFIG"
+	addrFileEnv      = "ABLY_SERVER_ADDR_FILE"
 )
 
 func main() {
@@ -127,6 +128,7 @@ func run(ctx context.Context, opts runOpts) int {
 	logLevel := fs.String("log-level", config.Default(opts.Getenv(logLevelEnv), file.LogLevel, "info"), "log level: debug, info, warn, error (env: "+logLevelEnv+")")
 	logFormat := fs.String("log-format", config.Default(opts.Getenv(logFormatEnv), file.LogFormat, "text"), "log format: text or json (env: "+logFormatEnv+")")
 	debugListen := fs.String("debug-listen", config.Default(opts.Getenv(debugListenEnv), file.DebugListen, ""), "address for the pprof debug listener; disabled if empty (env: "+debugListenEnv+")")
+	addrFile := fs.String("addr-file", opts.Getenv(addrFileEnv), "path to write the bound listener address to once listening; used by a parent process to discover an ephemeral (--listen :0) port (env: "+addrFileEnv+")")
 	if err := fs.Parse(opts.Args); err != nil {
 		return 2
 	}
@@ -248,6 +250,18 @@ func run(ctx context.Context, opts runOpts) int {
 	if err != nil {
 		logger.Error("failed to listen", "addr", *listen, "err", err)
 		return 1
+	}
+
+	// Publish the bound address so a parent process (the sandbox
+	// provisioner, DESIGN.md §15) can discover the port a `--listen
+	// 127.0.0.1:0` bind resolved to. Written atomically so a reader
+	// polling the path never observes a partial address.
+	if *addrFile != "" {
+		if err := writeAddrFile(*addrFile, listener.Addr().String()); err != nil {
+			logger.Error("failed to write addr-file", "path", *addrFile, "err", err)
+			_ = listener.Close()
+			return 1
+		}
 	}
 
 	if opts.Ready != nil {
@@ -421,6 +435,27 @@ func fixtureSpec(file config.File) (*fixtures.Spec, error) {
 		spec.Channels = append(spec.Channels, fixtures.Channel{Name: ch.Name, Presence: members})
 	}
 	return spec, nil
+}
+
+// writeAddrFile atomically writes addr to path. It writes to a temp file
+// in the same directory and renames it into place, so a parent process
+// polling the path reads a complete address rather than a truncated one.
+func writeAddrFile(path, addr string) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".addr-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if _, err := tmp.WriteString(addr); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	return os.Rename(name, path)
 }
 
 // openStorage constructs the storage.Storage selected by mode:
