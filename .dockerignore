@@ -1,0 +1,7 @@
+# Keep the build context small and reproducible.
+.git
+data
+*.md
+backlog
+prompts
+.claude

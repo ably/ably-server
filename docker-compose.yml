@@ -1,0 +1,67 @@
+# Local cluster-mode topology: one PostgreSQL instance plus three
+# stateless ably-server nodes sharing it for both state and pub/sub
+# (LISTEN/NOTIFY). See DESIGN.md §6.2 / §7.2.
+#
+#   docker compose up --build
+#
+# Each node is reachable on its own host port (8081/8082/8083) and all
+# three share one key, so a client can attach to any of them. The
+# nodes auto-migrate the empty database on boot under a Postgres
+# advisory lock (TASK-23), so the stack needs no manual setup.
+
+name: ably-cluster
+
+# Shared definition for every ably-server node. Compose builds the image
+# once (the explicit `image:` tag is reused) and each node differs only
+# in its published host port.
+x-ably-node: &ably-node
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: ably-server:local
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+  environment:
+    ABLY_SERVER_KEYS: app.key:secret
+    ABLY_SERVER_POSTGRES_DSN: postgres://ably:ably@postgres:5432/ably?sslmode=disable
+  command:
+    - --mode=cluster
+    - --listen=:8080
+    - --log-level=info
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://localhost:8080/readyz >/dev/null 2>&1 || exit 1"]
+    interval: 2s
+    timeout: 3s
+    retries: 15
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ably
+      POSTGRES_PASSWORD: ably
+      POSTGRES_DB: ably
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ably -d ably"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  node1:
+    <<: *ably-node
+    ports:
+      - "8081:8080"
+
+  node2:
+    <<: *ably-node
+    ports:
+      - "8082:8080"
+
+  node3:
+    <<: *ably-node
+    ports:
+      - "8083:8080"

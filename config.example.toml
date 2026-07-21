@@ -1,0 +1,88 @@
+# Example ably-server config file (DESIGN.md §9).
+#
+# Every key below is optional and shown commented-out with its
+# hardcoded default. Resolution order across every source, highest
+# priority first:
+#
+#   flag > env > config file > hardcoded default
+#
+# So a flag always wins, an env var beats this file, and this file
+# only supplies a value nothing more specific set.
+#
+# Pass this file's path via --config (or ABLY_SERVER_CONFIG):
+#
+#   ably-server --config config.example.toml
+#
+# All entries in this file are commented out; an all-commented copy
+# of this file parses to the same zero-value config as an empty file.
+
+# Storage backend: memory, disk, or cluster (env: ABLY_SERVER_MODE).
+# mode = "memory"
+
+# Address for the HTTP/WS listener (env: ABLY_SERVER_LISTEN).
+# listen = ":8080"
+
+# Data directory for disk mode, holds the bbolt file (env: ABLY_SERVER_DATA_DIR).
+# data-dir = "./data"
+
+# libpq DSN for cluster mode (env: ABLY_SERVER_POSTGRES_DSN). Required
+# when --mode=cluster and not supplied by a flag or env var.
+# postgres-dsn = "postgres://user:pw@host:5432/db?sslmode=disable"
+
+# Window to disconnect existing connections on SIGTERM, as a duration
+# string (env: ABLY_SERVER_SHUTDOWN_GRACE).
+# shutdown-grace = "10s"
+
+# Log level: trace, debug, info, warn, or error (env: ABLY_SERVER_LOG_LEVEL).
+# log-level = "info"
+
+# Log format: text or json (env: ABLY_SERVER_LOG_FORMAT).
+# log-format = "text"
+
+# Address for the pprof debug listener; disabled if unset (env: ABLY_SERVER_DEBUG_LISTEN).
+# debug-listen = "127.0.0.1:6060"
+
+# Register the GET/POST /stats compatibility stub used by SDK test
+# flows; unregistered (falls through to the Ably-shaped 40400 catch-all)
+# by default (env: ABLY_SERVER_ENABLE_STATS_STUB). Sandbox/SDK-suite runs
+# enable this so compat suites' stats round-trip doesn't wedge.
+# enable-stats-stub = false
+
+# [[keys]] entries are the only file-tier source of API keys, and the
+# only one that can carry a narrowing capability. Each entry is an
+# Ably-format key spec plus an optional `capability` — an
+# `x-ably-capability`-format JSON object string (DESIGN.md §3.1) that
+# scopes what the key grants; omitting it grants the full capability,
+# like a --keys flag or ABLY_SERVER_KEYS entry. A malformed capability
+# string is a startup error. At least one key must be configured across
+# all sources (flag, env, or this file).
+#
+# [[keys]]
+# key = "app.subscriber:s3cr3t"
+# capability = '{"chat:*":["subscribe"]}'
+
+# [[namespaces]] entries mirror the Ably test-app-setup post_apps shape:
+# a namespace `id` plus feature flags. These are parsed and recorded but
+# behaviourally inert today — no behaviour keys off them yet.
+#
+# [[namespaces]]
+# id = "persisted"
+# persisted = true
+# mutableMessages = false
+# pushEnabled = false
+
+# [[channels]] entries seed presence members at startup, before the
+# listener opens, via the normal StorePresence path (static membership
+# fixtures, DESIGN.md §12.5) — replacing the retired --fixtures JSON
+# path. A channel with no `name` or a member with no `clientId` is a
+# startup error. `data`/`encoding` round-trip verbatim; encoding is
+# opaque and never decoded, so a cipher payload is seeded exactly as
+# given.
+#
+# [[channels]]
+# name = "persisted:presence_fixtures"
+#
+#   [[channels.presence]]
+#   clientId = "client_string"
+#   data = "This is a string clientData payload"
+#   encoding = ""

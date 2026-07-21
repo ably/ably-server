@@ -1,0 +1,62 @@
+# Known-failures list for the ably-go compatibility harness
+# (compat/runners/ably-go/run.sh, run from ably-server).
+#
+# Every test currently failing against a local ably-server must have an
+# entry here, with a reason. cmd/compat-gate diffs the runner's JSON
+# report against this file: a failing test not listed here is treated as
+# a regression (or an untracked gap); a listed test that ISN'T currently
+# failing is treated as stale and must be pruned. See the "SDK
+# compatibility harness" backlog doc for how to run the harness and this
+# gate.
+
+[[failure]]
+test = "TestAuth_BasicAuth"
+reason = "RSA1 subtest asserts basic auth over non-TLS is rejected client-side, but the harness must run with WithInsecureAllowBasicAuthWithoutTLS to reach the plaintext local server at all — environment-incompatible (a single local, non-TLS server can't exercise TLS enforcement), not a server bug."
+
+[[failure]]
+test = "TestGetChannelLifecycleStatus_RSL8"
+reason = "A channel lifecycle/status REST endpoint is a documented non-goal (DESIGN.md §1, decided TASK-35)."
+
+[[failure]]
+test = "TestRealtimeChannel_SubscriptionFilters"
+reason = "Filtered/derived-channel subscriptions are a documented non-goal (DESIGN.md §1, decided TASK-143)."
+
+[[failure]]
+test = "TestRealtimeConn_RTN15e_ConnKeyUpdatedOnReconnect"
+reason = "Hard-asserts Connection#key differs after every reconnect, but RTN15e's spec text says the key 'may change', not must. ably-server's connectionKey is deterministic in (connectionId, secret) by design (TASK-150), so a resumed connection's key is stable — matching the spec, not violating it. The reference server's own key does carry a component that changes on every reconnect, but it's a cosmetic per-transport-instance counter its own verification never checks, not a requirement any behaviour depends on."
+
+[[failure]]
+test = "TestRealtime_RTN17_HostFallback"
+reason = "Multi-host fallback can't be exercised against a single local server instance — environment-incompatible, not a server bug."
+
+[[failure]]
+test = "TestRealtime_RTN17_Integration_HostFallback_Internal_Server_Error"
+reason = "Multi-host fallback can't be exercised against a single local server instance — environment-incompatible, not a server bug."
+
+[[failure]]
+test = "TestRealtime_RTN17_Integration_HostFallback_Timeout"
+reason = "Multi-host fallback can't be exercised against a single local server instance — environment-incompatible, not a server bug."
+
+[[failure]]
+test = "TestRestClient"
+reason = "Exercises stats retrieval; stats is a documented non-goal stub (DESIGN.md §1) that always returns an empty array."
+
+[[failure]]
+test = "TestRest_RSC15_HostFallback"
+reason = "Multi-host fallback can't be exercised against a single local server instance — environment-incompatible, not a server bug."
+
+[[failure]]
+test = "TestStatsPagination_RSC6a_RSCb3"
+reason = "Stats is a documented non-goal stub (DESIGN.md §1) that always returns an empty array."
+
+[[failure]]
+test = "TestStats_Direction_RSC6b2"
+reason = "Stats is a documented non-goal stub (DESIGN.md §1) that always returns an empty array."
+
+[[failure]]
+test = "TestStats_StartEnd_RSC6b1"
+reason = "Stats is a documented non-goal stub (DESIGN.md §1) that always returns an empty array."
+
+[[failure]]
+test = "TestStats_Unit_RSC6b4"
+reason = "Stats is a documented non-goal stub (DESIGN.md §1) that always returns an empty array."

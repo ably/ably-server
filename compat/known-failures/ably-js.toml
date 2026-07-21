@@ -1,0 +1,212 @@
+# Known-failures list for the ably-js compatibility harness
+# (compat/runners/ably-js/run.mjs, run from ably-server).
+#
+# Baselined against the 2026-07-21 web_socket run (--transports web_socket,
+# ABLY_TEST_TRANSPORTS=web_socket), including the ably-js upstream harness
+# fixes for the echo.ably.io (checkdelete/patch/put) and presence_sync_interruptus
+# tests. The comet transport is excluded by that flag, so comet variants never
+# appear in the results and are not listed here.
+#
+# This baseline supersedes the initial 2026-07-20 triage: the gaps filed as
+# TASK-107, TASK-112, TASK-113, TASK-153, TASK-154, TASK-155 (plus a channel-
+# params decode fix that unblocked resume_rewind_1) have been fixed and their
+# tests now pass. What remains is non-goals, undecided-scope items, environment
+# mismatches, and upstream ably-js/harness bugs.
+#
+# CAVEAT — flaky entry: realtime/connection connectionPingWithCallback is
+# intermittent (a given run may show it passing, which makes compat-gate
+# report it "stale"); don't prune it on a single green run. (The echo.ably.io
+# checkdelete/patch/put and presence_sync_interruptus flakes were fixed
+# upstream in ably-js and are no longer listed.)
+
+# --- Non-goals (DESIGN.md §1) ------------------------------------------------
+
+[[failure]]
+test = "test/rest/push.test.js::rest/push Get subscriptions"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push Publish"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push channelSubscriptions get"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push channelSubscriptions listChannels"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push channelSubscriptions save"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push deviceRegistrations get and list"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push deviceRegistrations remove removeWhere"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push deviceRegistrations save"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push push activation device_push"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push push activation direct_publish_client_id"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push push activation direct_publish_device_id"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push push activation failed_registration"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push push activation push_activation_succeeds"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push push activation push_channel_subscription_client_id"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push push activation push_channel_subscription_device_id"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push push activation subscribe_client"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push push activation subscribe_client_without_clientId"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push push activation subscribe_device"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push push activation unsubscribe_client"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push push activation unsubscribe_device"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+[[failure]]
+test = "test/rest/push.test.js::rest/push push_channelSubscriptions_remove"
+reason = "Push notifications are a documented DESIGN.md §1 non-goal."
+
+[[failure]]
+test = "test/rest/stats.test.js::rest/stats appstats_hour0"
+reason = "Stats is a documented non-goal stub (DESIGN.md §1) that always returns an empty array."
+[[failure]]
+test = "test/rest/stats.test.js::rest/stats appstats_limit_backwards"
+reason = "Stats is a documented non-goal stub (DESIGN.md §1) that always returns an empty array."
+[[failure]]
+test = "test/rest/stats.test.js::rest/stats appstats_limit_forwards"
+reason = "Stats is a documented non-goal stub (DESIGN.md §1) that always returns an empty array."
+[[failure]]
+test = "test/rest/stats.test.js::rest/stats appstats_minute0"
+reason = "Stats is a documented non-goal stub (DESIGN.md §1) that always returns an empty array."
+[[failure]]
+test = "test/rest/stats.test.js::rest/stats appstats_minute1"
+reason = "Stats is a documented non-goal stub (DESIGN.md §1) that always returns an empty array."
+[[failure]]
+test = "test/rest/stats.test.js::rest/stats appstats_pagination_backwards"
+reason = "Stats is a documented non-goal stub (DESIGN.md §1) that always returns an empty array."
+[[failure]]
+test = "test/rest/stats.test.js::rest/stats appstats_pagination_forwards"
+reason = "Stats is a documented non-goal stub (DESIGN.md §1) that always returns an empty array."
+[[failure]]
+test = "test/rest/stats.test.js::rest/stats appstats_pagination_omitted"
+reason = "Stats is a documented non-goal stub (DESIGN.md §1) that always returns an empty array."
+[[failure]]
+test = "test/rest/stats.test.js::rest/stats contains expected fields"
+reason = "Stats is a documented non-goal stub (DESIGN.md §1) that always returns an empty array."
+
+# LiveObjects (test/{realtime,rest}/liveobjects.test.js) is a documented
+# DESIGN.md §1 non-goal: with no plugin/backend the files error out ("file
+# did not run") rather than producing per-test failures, and compat-gate does
+# not gate on an "error" verdict, so no entry is needed.
+
+[[failure]]
+test = "test/rest/status.test.js::rest/status status0 with binary protocol"
+reason = "Channel lifecycle/status endpoint is a documented non-goal (DESIGN.md §1, decided TASK-35)."
+[[failure]]
+test = "test/rest/status.test.js::rest/status status0 with text protocol"
+reason = "Channel lifecycle/status endpoint is a documented non-goal (DESIGN.md §1, decided TASK-35)."
+
+[[failure]]
+test = "test/realtime/message.test.js::realtime/message subscribes to filtered channel"
+reason = "Filtered/derived-channel subscriptions are a documented DESIGN.md §1 non-goal (Ably-cloud-only product surface); scope tracked by TASK-143. channels.getDerived() builds a '[filter=...]'-qualified channel name, which the server rejects with 'invalid channel name' (40010)."
+
+# --- Undecided scope, already tracked ---------------------------------------
+
+[[failure]]
+test = "test/realtime/delta.test.js::realtime/delta deltaPlugin"
+reason = "delta=vcdiff scope not yet decided (TASK-34, open)."
+[[failure]]
+test = "test/realtime/delta.test.js::realtime/delta lastMessageNotFoundRecovery"
+reason = "delta=vcdiff scope not yet decided (TASK-34, open)."
+[[failure]]
+test = "test/realtime/delta.test.js::realtime/delta noPlugin"
+reason = "delta=vcdiff scope not yet decided (TASK-34, open)."
+
+[[failure]]
+test = "test/rest/batch.test.js::rest/batchPresence performs a batch presence fetch and returns a result"
+reason = "REST batch API scope not yet decided (TASK-110, open)."
+[[failure]]
+test = "test/rest/batch.test.js::rest/batchPublish when invoked with a single spec performs a batch publish and returns a single result"
+reason = "REST batch API scope not yet decided (TASK-110, open)."
+[[failure]]
+test = "test/rest/batch.test.js::rest/batchPublish when invoked with an array of specs performs a batch publish and returns an array of results"
+reason = "REST batch API scope not yet decided (TASK-110, open)."
+[[failure]]
+test = "test/rest/batch.test.js::rest/revokeTokens accepts optional issuedBefore and allowReauthMargin parameters"
+reason = "Token revocation scope not yet decided (TASK-110, open)."
+[[failure]]
+test = "test/rest/batch.test.js::rest/revokeTokens revokes tokens matching the given specifiers"
+reason = "Token revocation scope not yet decided (TASK-110, open)."
+[[failure]]
+test = "test/rest/request.test.js::rest/request request_batch_api_success with binary protocol"
+reason = "Same missing POST /messages batch endpoint as TASK-110 (open), hit via the generic request() proxy instead of the dedicated batchPublish() method."
+[[failure]]
+test = "test/rest/request.test.js::rest/request request_batch_api_success with text protocol"
+reason = "Same missing POST /messages batch endpoint as TASK-110 (open), hit via the generic request() proxy instead of the dedicated batchPublish() method."
+
+# --- Genuine ably-server gap, still tracked ---------------------------------
+
+[[failure]]
+test = "test/realtime/updates-deletes.test.js::realtime/message-operations Should append to a message over realtime"
+reason = "TASK-144 (open): rewind/history replay omits the collapsed append aggregate. Live append fan-out passes; only the post-detach rewind:1 replay of the latest-version projection is missing."
+
+# --- Environment-incompatible -------------------------------------------------
+
+[[failure]]
+test = "test/rest/fallbacks.test.js::rest/fallbacks Should use the primary domain as the first attempted for every connection attempt"
+reason = "Multi-host fallback can't be exercised against a single local server instance -- environment-incompatible, not a server bug."
+
+[[failure]]
+test = "test/realtime/init.test.js::realtime/init node_transports"
+reason = "Environment-incompatible with the --transports web_socket restriction: the test asserts node's default transports include 'comet', but ABLY_TEST_TRANSPORTS=web_socket removes it, so the assertion sees no comet. Not a server bug -- an artifact of the transport-restricted run this list is baselined against."
+
+[[failure]]
+test = "test/rest/init.test.js::rest/init Init without any tls key should enable tls"
+reason = "Client-side default-option test (rest.baseUri() with no network calls); the local-sandbox harness's global endpoint/tls overrides mask the plain-default this test checks. Confirmed still failing under the 2026-07-20 web_socket run; a harness/config-shape mismatch rather than a server behaviour."
+
+# --- ably-js/harness bugs, not ably-server ----------------------------------
+
+[[failure]]
+test = "test/realtime/connection.test.js::realtime/connection connectionPingWithCallback"
+reason = "ably-js test bug, not ably-server: this test asserts the pre-deprecation v1 callback style still works, which now directly conflicts with the new v1-callback-throws-synchronously guard (DX-1204) landed on this branch. Needs updating/removing upstream, not a server concern. (Intermittent: a given run may show it passing, so compat-gate may flag it stale.)"
+
+[[failure]]
+test = "test/realtime/resume.test.js::realtime/resume recover multiple channels"
+reason = "ably-js test over-assertion, not a server gap: recover itself works against this server -- a valid recover key retains its connectionId (TASK-150) and the gap messages replay correctly on re-attach (both confirmed by live repro). The test fails only on RTN16d's `expect(connection.key).to.not.equal(originalKey)`, i.e. it requires the connectionKey to CHANGE on recover. The spec says the key MAY change, not MUST (same as the ably-go RTN15e case dismissed in TASK-150), and this server's connectionKey is deterministic (connID + HMAC), so it is byte-identical on recover. Not worth a per-connection nonce; the assertion is stronger than the spec. The swallowed throw makes it hang ~120s."
+
+# --- Embedded-token JWTs (RSA4f) -- scope undecided, TASK-158 ----------------
+
+[[failure]]
+test = "test/rest/auth.test.js::rest/auth Rest embedded JWT"
+reason = "TASK-158 (open): the test presents a JWT that carries an Ably token in a claim (RSA4f). verifyToken only accepts HS256 JWTs signed with a configured key secret; it has no embedded/inner-token handling, so it rejects the echo-signed JWT and the SDK fails trying to renew. Scope decision pending. (Also depends on reaching echo.ably.io to build the JWT.)"
+[[failure]]
+test = "test/rest/auth.test.js::rest/auth Rest embedded JWT with encryption"
+reason = "TASK-158, same root cause as 'Rest embedded JWT' (embedded-token/RSA4f auth not implemented)."
+
+# --- No presence grace period (DESIGN.md §12.5) -- scope decision under reconsideration, TASK-156 ---
+
+[[failure]]
+test = "test/realtime/presence.test.js::realtime/presence presence_auto_reenter"
+reason = "TASK-156 (open, reconsidering this scope decision): no presence grace period across a connection resume (DESIGN.md §12.5) -- a member lives exactly as long as the connection that entered it, and connection-state resume is a non-goal, so a suspend+reconnect within any window doesn't preserve old members the way real Ably's ~2min liveness lease does. Confirmed via live repro."
+[[failure]]
+test = "test/realtime/presence.test.js::realtime/presence suspended_preserves_presence"
+reason = "TASK-156 (open, reconsidering this scope decision): same root cause as presence_auto_reenter -- a reconnecting client's own membership isn't preserved across suspend, so its own reconnect synthesises a self-leave/re-enter the test doesn't expect. Confirmed via live repro."
