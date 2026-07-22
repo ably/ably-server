@@ -7,12 +7,14 @@ against a checked-in list of known failures so CI can catch regressions.
 ```
 compat/
   runners/
-    ably-go/run.sh              # drives an ably-go checkout's integration suite
-    ably-js/run.mjs             # drives an ably-js checkout's node suite
-    ably-js/ndjson-reporter.cjs # streaming mocha reporter (loaded by abs path)
+    ably-go/run.sh                    # drives an ably-go checkout's integration suite
+    ably-js/run.mjs                   # drives an ably-js checkout's node suite
+    ably-js/ndjson-reporter.cjs       # streaming mocha reporter (loaded by abs path)
+    ably-ai-transport-js/run.mjs      # drives ably-ai-transport-js's integration specs (vitest)
   known-failures/
-    ably-go.toml                # tests currently expected to fail, with reasons
+    ably-go.toml                      # tests currently expected to fail, with reasons
     ably-js.toml
+    ably-ai-transport-js.toml
 ```
 
 The gate itself is `cmd/compat-gate` (implemented in `internal/compatgate`).
@@ -34,9 +36,9 @@ app through the local sandbox's `POST /apps` and routes that test's clients at t
 isolated server the sandbox booted for it.
 
 A runner takes the SDK checkout to test as a parameter (`--sdk-dir`, defaulting to
-`../ably-go` / `../ably-js` beside ably-server) and drives that checkout's own test
-toolchain — so CI can pin each SDK to a specific commit and check it out
-deterministically.
+`../ably-go` / `../ably-js` / `../ably-ai-transport-js` beside ably-server) and
+drives that checkout's own test toolchain — so CI can pin each SDK to a specific
+commit and check it out deterministically.
 
 ## The local sandbox is a prerequisite (treat it like a database)
 
@@ -55,8 +57,8 @@ probe). Point a runner at it with `--url` / `ABLY_LOCAL_SANDBOX_URL` (default
 
 Each test gets a fresh, isolated app and its own server child, so tests never
 contend over shared state and run concurrently across a worker pool. Every test
-(ably-go) or test file (ably-js) runs in its own process, so a panic or crash
-against an unimplemented endpoint doesn't abort the batch.
+(ably-go) or test file (ably-js, ably-ai-transport-js) runs in its own process,
+so a panic or crash against an unimplemented endpoint doesn't abort the batch.
 
 ## Running
 
@@ -71,9 +73,15 @@ compat/runners/ably-go/run.sh --out compat-results-ably-go.json
 (cd ../ably-js && npm run build:node && npm run build:push && npm run build:liveobjects)
 node compat/runners/ably-js/run.mjs --out compat-results-ably-js.json
 
+# 2c. ably-ai-transport-js (no build — vitest runs the TypeScript source directly;
+#     just install deps in the checkout first)
+(cd ../ably-ai-transport-js && pnpm install)
+node compat/runners/ably-ai-transport-js/run.mjs --out compat-results-ably-ai-transport-js.json
+
 # 3. gate each report against its known-failures list
 go run ./cmd/compat-gate --results compat-results-ably-go.json --ignore compat/known-failures/ably-go.toml
 go run ./cmd/compat-gate --results compat-results-ably-js.json --ignore compat/known-failures/ably-js.toml
+go run ./cmd/compat-gate --results compat-results-ably-ai-transport-js.json --ignore compat/known-failures/ably-ai-transport-js.toml
 ```
 
 Run any runner with `--help` for its full option list (`--sdk-dir`, `--jobs`,
@@ -81,13 +89,13 @@ Run any runner with `--help` for its full option list (`--sdk-dir`, `--jobs`,
 
 ## The shared report shape
 
-Both runners emit the **same JSON report object**, which `compat-gate` consumes
+All runners emit the **same JSON report object**, which `compat-gate` consumes
 directly — no per-SDK reshaping:
 
 ```jsonc
 {
   "generatedAt": "2026-07-21T...",
-  "sdk": "ably-go",              // or "ably-js"
+  "sdk": "ably-go",              // or "ably-js" / "ably-ai-transport-js"
   "sdkRev": "<git HEAD of the SDK checkout>",
   "localSandboxURL": "http://localhost:9010",
   "jobs": 8,
@@ -101,8 +109,9 @@ directly — no per-SDK reshaping:
 ```
 
 `compat-gate` reads only `results[]` (`name` + `verdict`); the rest is metadata
-for humans reading the CI artifact. The ably-js report additionally carries a
-`files[]` per-file summary and a `file`/`err` on each result for triage.
+for humans reading the CI artifact. The two JS runners (ably-js,
+ably-ai-transport-js) additionally carry a `files[]` per-file summary and a
+`file`/`err` on each result for triage.
 
 **Verdicts:** `pass`, `fail`, `skip` per test, plus `timeout` (killed at its cap),
 `panic` (ably-go), and `error` (ably-js file produced no reporter output —
