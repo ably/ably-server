@@ -245,21 +245,12 @@ func (c *connection) connectionDetails() *protocol.ConnectionDetails {
 // readLoop decodes inbound frames and dispatches on Action.
 func (c *connection) readLoop(ctx context.Context) {
 	for {
-		typ, data, err := c.ws.ReadMessage()
+		_, data, err := c.ws.ReadMessage()
 		if err != nil {
 			if !isExpectedClose(err) {
 				c.logger.Debug("read error", "err", err)
 			}
 			return
-		}
-
-		expected := websocket.TextMessage
-		if c.format == protocol.FormatMsgpack {
-			expected = websocket.BinaryMessage
-		}
-		if typ != expected {
-			c.logger.Warn("unexpected frame type", "got", typ, "want", expected)
-			continue
 		}
 
 		var msg protocol.ProtocolMessage
