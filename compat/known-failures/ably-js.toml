@@ -163,12 +163,6 @@ reason = "Same missing POST /messages batch endpoint as TASK-110 (open), hit via
 test = "test/rest/request.test.js::rest/request request_batch_api_success with text protocol"
 reason = "Same missing POST /messages batch endpoint as TASK-110 (open), hit via the generic request() proxy instead of the dedicated batchPublish() method."
 
-# --- Genuine ably-server gap, still tracked ---------------------------------
-
-[[failure]]
-test = "test/realtime/updates-deletes.test.js::realtime/message-operations Should append to a message over realtime"
-reason = "TASK-144 (open): rewind/history replay omits the collapsed append aggregate. Live append fan-out passes; only the post-detach rewind:1 replay of the latest-version projection is missing."
-
 # --- Environment-incompatible -------------------------------------------------
 
 [[failure]]
@@ -192,6 +186,10 @@ reason = "ably-js test bug, not ably-server: this test asserts the pre-deprecati
 [[failure]]
 test = "test/realtime/resume.test.js::realtime/resume recover multiple channels"
 reason = "ably-js test over-assertion, not a server gap: recover itself works against this server -- a valid recover key retains its connectionId (TASK-150) and the gap messages replay correctly on re-attach (both confirmed by live repro). The test fails only on RTN16d's `expect(connection.key).to.not.equal(originalKey)`, i.e. it requires the connectionKey to CHANGE on recover. The spec says the key MAY change, not MUST (same as the ably-go RTN15e case dismissed in TASK-150), and this server's connectionKey is deterministic (connID + HMAC), so it is byte-identical on recover. Not worth a per-connection nonce; the assertion is stronger than the spec. The swallowed throw makes it hang ~120s."
+
+[[failure]]
+test = "test/realtime/updates-deletes.test.js::realtime/message-operations Should append to a message over realtime"
+reason = "ably-js test relies on an initial-attach race, not a server gap (TASK-144, investigated 2026-07-22). Phase 1 (live append fan-out) passes. Phase 2 detaches then does channel.subscribe() + await setOptions({rewind:'1'}) + attach(): subscribe() auto-attaches with NO rewind, then setOptions re-attaches with rewind. rewind is an initial-attach directive -- it only takes effect if present when the attachment's initial stream is built, and a genuine reattach never re-applies it. Confirmed against the real reference server (port 8081): the raced sequence replays, but inserting a delay so the initial attach completes first makes the reference NOT replay (matching us). The cloud passes only because its async/latency-heavy initial attach keeps the race window open long enough for the rewind frame to arrive first; our synchronous attach closes it. A fix must be in the test (await the subscribe()/attach() before setOptions, or set rewind before subscribing), not the server. Flagged upstream in ../ably-js/TASK-144-rewind-setoptions-race.md. Our rewind-attach itself correctly surfaces the collapsed append aggregate -- pinned by internal/realtime TestRewindReplaysCollapsedAppendAggregate."
 
 # --- Embedded-token JWTs (RSA4f) -- scope undecided, TASK-158 ----------------
 
