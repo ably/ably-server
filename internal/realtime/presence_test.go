@@ -502,7 +502,10 @@ func TestPresenceRequiresPresenceMode(t *testing.T) {
 // TestPresenceImplicitLeaveOnDisconnect: when a member's connection
 // drops, subscribers receive a synthesised LEAVE.
 func TestPresenceImplicitLeaveOnDisconnect(t *testing.T) {
-	srv, _ := newTestServer(t, time.Hour)
+	// An abrupt drop leaves after the grace window (DESIGN.md §12.5); a short
+	// window keeps the test fast. The delayed/immediate split itself is
+	// covered by the presence_grace tests.
+	srv, _ := newPresenceGraceServer(t, 300*time.Millisecond)
 
 	sub := dial(t, srv, "")
 	drainConnected(t, sub)

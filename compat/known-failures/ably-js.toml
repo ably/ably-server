@@ -199,12 +199,3 @@ reason = "TASK-158 (open): the test presents a JWT that carries an Ably token in
 [[failure]]
 test = "test/rest/auth.test.js::rest/auth Rest embedded JWT with encryption"
 reason = "TASK-158, same root cause as 'Rest embedded JWT' (embedded-token/RSA4f auth not implemented)."
-
-# --- No presence grace period (DESIGN.md §12.5) -- scope decision under reconsideration, TASK-156 ---
-
-[[failure]]
-test = "test/realtime/presence.test.js::realtime/presence presence_auto_reenter"
-reason = "TASK-156 (open, reconsidering this scope decision): no presence grace period across a connection resume (DESIGN.md §12.5) -- a member lives exactly as long as the connection that entered it, and connection-state resume is a non-goal, so a suspend+reconnect within any window doesn't preserve old members the way real Ably's ~2min liveness lease does. Confirmed via live repro."
-[[failure]]
-test = "test/realtime/presence.test.js::realtime/presence suspended_preserves_presence"
-reason = "TASK-156 (open, reconsidering this scope decision): same root cause as presence_auto_reenter -- a reconnecting client's own membership isn't preserved across suspend, so its own reconnect synthesises a self-leave/re-enter the test doesn't expect. Confirmed via live repro."

@@ -125,6 +125,7 @@ func Run(ctx context.Context, opts Opts) int {
 	dataDir := fs.String("data-dir", config.Default(opts.Getenv(dataDirEnv), file.DataDir, "./data"), "data directory for disk mode (holds the bbolt file) (env: "+dataDirEnv+")")
 	postgresDSN := fs.String("postgres-dsn", config.Default(opts.Getenv(postgresDSNEnv), file.PostgresDSN, ""), "libpq DSN for cluster mode, e.g. postgres://user:pw@host:5432/db?sslmode=disable (env: "+postgresDSNEnv+")")
 	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
+	remainPresentFor := fs.Duration("presence-remain-for", realtime.DefaultRemainPresentFor, "how long a presence member survives an abrupt disconnect before its LEAVE is synthesised, so a resume+re-enter avoids a flicker (DESIGN.md §12.5)")
 	shutdownGrace := fs.Duration("shutdown-grace", shutdownGraceDefault, "window to disconnect existing connections on SIGTERM (env: "+shutdownGraceEnv+")")
 	logLevel := fs.String("log-level", config.Default(opts.Getenv(logLevelEnv), file.LogLevel, "info"), "log level: "+logging.LevelNames+" (env: "+logLevelEnv+")")
 	logFormat := fs.String("log-format", config.Default(opts.Getenv(logFormatEnv), file.LogFormat, "text"), "log format: text or json (env: "+logFormatEnv+")")
@@ -226,6 +227,7 @@ func Run(ctx context.Context, opts Opts) int {
 	}
 
 	rt := realtime.NewServer(parsedKeys, manager, *hbInterval, logger, m, tracer)
+	rt.SetRemainPresentFor(*remainPresentFor)
 	// ready is non-nil only for backends with an external dependency
 	// worth probing (currently postgres.Storage); memory/disk leave it
 	// nil and /readyz reports 200 unconditionally.

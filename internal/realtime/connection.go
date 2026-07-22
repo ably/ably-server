@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -64,6 +65,25 @@ type connection struct {
 	// on DETACH and on connection teardown (DESIGN.md §12.5). Only
 	// touched from the single read-loop goroutine (dispatch + teardown).
 	entered map[string]map[string]struct{}
+
+	// srv is the owning Server, used at teardown to schedule the delayed
+	// presence LEAVE for an abrupt disconnect (DESIGN.md §12.5). Set once
+	// at construction.
+	srv *Server
+
+	// clientClosed records that the client sent a CLOSE frame — a clean,
+	// intentional departure, so teardown synthesises presence LEAVEs
+	// immediately rather than delaying them for a possible resume
+	// (DESIGN.md §12.5). Written only by the read goroutine in handleClose,
+	// read only by the same goroutine after the read loop exits.
+	clientClosed bool
+
+	// shuttingDown records that this connection is being closed by a
+	// graceful server Shutdown (§11) — a deliberate departure, so teardown
+	// leaves its presence members immediately rather than delaying them
+	// (DESIGN.md §12.5). Set on the Shutdown goroutine and read on the run
+	// goroutine at teardown, so it is atomic.
+	shuttingDown atomic.Bool
 
 	// authMu guards the mutable authorisation state that inband re-auth
 	// (DESIGN.md §3) updates — the capability set and token
@@ -179,8 +199,18 @@ func (c *connection) run(ctx context.Context) {
 	// Synthesise LEAVE for every presence member this connection still
 	// holds, so other subscribers see the departures (DESIGN.md §12.5).
 	// The worker has stopped and only the read goroutine ever touches the
-	// entered set, so this runs race-free on a fresh, bounded context.
-	c.emitTeardownLeaves()
+	// entered set, so this runs race-free.
+	//
+	// Deliberate departures — a clean client CLOSE or a graceful server
+	// shutdown — leave immediately. An abrupt disconnect (transport drop,
+	// heartbeat/token-expiry disconnect) instead schedules the LEAVE after
+	// a short grace window: if the client resumes and re-enters within it,
+	// the member never flickers out (DESIGN.md §12.5).
+	if c.clientClosed || c.shuttingDown.Load() || c.srv == nil {
+		c.emitTeardownLeaves()
+	} else {
+		c.scheduleTeardownLeaves()
+	}
 
 	<-writeDone
 }
@@ -342,6 +372,9 @@ func (c *connection) handleHeartbeat(ctx context.Context, msg *protocol.Protocol
 // client then closes its end of the WebSocket, which causes readLoop's
 // ReadMessage to return and the connection to terminate normally.
 func (c *connection) handleClose(ctx context.Context) {
+	// A client-initiated CLOSE is a clean departure: teardown leaves its
+	// presence members immediately, with no resume grace (DESIGN.md §12.5).
+	c.clientClosed = true
 	c.queue(ctx, &protocol.ProtocolMessage{Action: protocol.ActionClosed})
 }
 
@@ -768,6 +801,11 @@ func (c *connection) write(msg *protocol.ProtocolMessage) error {
 // goroutine — it never touches per-connection state owned by the read
 // loop.
 func (c *connection) disconnect() {
+	// A graceful shutdown is a deliberate departure: teardown leaves this
+	// connection's presence members immediately, not after the grace window
+	// (DESIGN.md §12.5). Set before the close that unblocks the read loop so
+	// the teardown observes it.
+	c.shuttingDown.Store(true)
 	select {
 	case c.outbound <- &protocol.ProtocolMessage{
 		Action: protocol.ActionDisconnected,

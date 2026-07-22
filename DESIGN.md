@@ -1642,20 +1642,37 @@ cluster mode they are stored with a sentinel owner and a non-expiring
 touches them. They persist for the process's lifetime. This exists only
 for SDK test-suite compatibility.
 
-**Liveness.** A member lives exactly as long as the connection that
-entered it. There is no presence grace period — consistent with §4.3 the
-server holds no per-connection state across disconnects, so there is no
-connection-resume window to keep a member alive for. (SDKs re-enter
-presence on reconnect; the server treats that as a fresh ENTER under the
-new `connectionId`.) Departure:
+**Liveness.** A member lives as long as the connection that entered it,
+plus — for an *abrupt* disconnect — a short grace window,
+`remainPresentFor` (default 15s, `DefaultRemainPresentFor`), before its
+LEAVE is synthesised. The window exists so a client that resumes and
+re-enters within it does not flicker out of and back into presence.
+Departure:
 
-- **Explicit LEAVE, DETACH, or CLOSE** — processed as a LEAVE publish.
-- **Connection drop (read error, heartbeat timeout) and graceful
-  shutdown (§11)** — when the connection loop exits it synthesises a
-  LEAVE for every member it entered (it tracks its own
-  `(channel, clientId)` entries) and publishes them through
-  `StorePresence`, so the departures persist, fold out of the set, and
-  reach every subscriber on every node via the normal NOTIFY path.
+- **Explicit LEAVE, DETACH, clean CLOSE, or graceful shutdown (§11)** — a
+  deliberate departure, processed as an immediate LEAVE publish (no grace):
+  the connection is not coming back, so there is nothing to wait for.
+- **Abrupt disconnect (transport read error, heartbeat/token-expiry
+  disconnect)** — when the connection loop exits it does *not* leave
+  immediately. It captures the member entries it still owns (from the
+  authoritative set, by member serial) and schedules their LEAVE for
+  `remainPresentFor` later. At that point each LEAVE is published through
+  `StorePresence` — *unless* the member has since been superseded: an entry
+  now absent (already left) or carrying a different serial (the same
+  `connectionId` resumed and re-entered, §8/§4.3) is left alone. This
+  suppression is re-checked against the set **at write time**, not by
+  cancelling a timer, so it stays correct when the resume lands on a
+  different node in cluster mode — the re-enter is visible in the shared
+  `presence` table there too. A graceful shutdown abandons any *already*
+  pending delayed LEAVEs (the node is departing).
+
+Because the server holds no other per-connection state across disconnects
+(§4.3), this grace is self-contained — it is the *only* thing kept alive
+for a dropped connection, independent of connection-state resume (still a
+non-goal). A resume that never re-enters presence still leaves after the
+window; a reconnect under a *new* `connectionId` (e.g. from `suspended`)
+leaves the old member to age out over the window while the client re-enters
+afresh.
 
 **Crashed cluster nodes.** A node that dies without running teardown
 leaves orphaned rows in the `presence` table — the one case the LEAVE

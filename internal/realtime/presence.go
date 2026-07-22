@@ -208,6 +208,25 @@ func (c *connection) emitTeardownLeaves() {
 	c.entered = make(map[string]map[string]struct{})
 }
 
+// scheduleTeardownLeaves hands this connection's still-held presence
+// members to the server's delayed-leave reaper (DESIGN.md §12.5), which
+// synthesises their LEAVE after the grace window unless the same
+// connectionId re-enters first. Used when the connection drops abruptly
+// (not a clean CLOSE), so a resume within the window preserves the member.
+// Only the read goroutine touches entered, and it has stopped, so this is
+// race-free.
+func (c *connection) scheduleTeardownLeaves() {
+	if len(c.entered) == 0 {
+		return
+	}
+	channels := make([]string, 0, len(c.entered))
+	for channel := range c.entered {
+		channels = append(channels, channel)
+	}
+	c.srv.scheduleConnectionLeaves(c.id, channels)
+	c.entered = make(map[string]map[string]struct{})
+}
+
 // publishLeaves publishes one LEAVE per clientId in set onto channel,
 // stamped with this connection's id.
 func (c *connection) publishLeaves(ctx context.Context, channel string, set map[string]struct{}) {

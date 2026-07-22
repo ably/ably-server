@@ -24,6 +24,13 @@ import (
 // frames when no other outbound frame has been sent.
 const DefaultHeartbeatInterval = 15 * time.Second
 
+// DefaultRemainPresentFor is how long a member entered by a connection
+// that drops abruptly stays in the presence set before its LEAVE is
+// synthesised (DESIGN.md §12.5) — the grace window that lets a resume +
+// re-enter preserve the member without a flicker. Mirrors the reference
+// server's connection.defaultRemainPresentFor (15s).
+const DefaultRemainPresentFor = 15 * time.Second
+
 // Server holds the realtime endpoint's state. Its HTTP handlers are
 // exported methods; callers register them on their own ServeMux.
 type Server struct {
@@ -51,6 +58,27 @@ type Server struct {
 	mu    sync.Mutex
 	conns map[*connection]struct{}
 	byKey map[string]*connection
+
+	// remainPresentFor is the presence grace window for an abrupt
+	// disconnect (DESIGN.md §12.5); see DefaultRemainPresentFor. Tests
+	// shorten it.
+	remainPresentFor time.Duration
+
+	// reaperDone is closed by Shutdown to abandon any pending delayed
+	// presence LEAVEs (their members go with the departing node); reaperWG
+	// tracks the in-flight reaper goroutines. reaperStop guards the close
+	// against a double Shutdown.
+	reaperDone chan struct{}
+	reaperStop sync.Once
+	reaperWG   sync.WaitGroup
+}
+
+// SetRemainPresentFor overrides the presence grace window (DESIGN.md §12.5,
+// DefaultRemainPresentFor). Intended to be called once, right after
+// NewServer and before the server handles connections; a value <= 0 makes
+// an abrupt disconnect leave immediately (grace disabled).
+func (s *Server) SetRemainPresentFor(d time.Duration) {
+	s.remainPresentFor = d
 }
 
 // NewServer constructs a Server. The Manager pairs each Channel with
@@ -72,6 +100,8 @@ func NewServer(keys []auth.APIKey, manager *core.Manager, heartbeatInterval time
 		connKeySecret:     secret,
 		conns:             make(map[*connection]struct{}),
 		byKey:             make(map[string]*connection),
+		remainPresentFor:  DefaultRemainPresentFor,
+		reaperDone:        make(chan struct{}),
 		upgrader: websocket.Upgrader{
 			// Tests use httptest.Server which sets up a same-origin
 			// connection; production deployments terminate TLS at a
@@ -150,6 +180,7 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	connKey := id.NewConnectionKey(s.connKeySecret, connID)
 
 	conn := &connection{
+		srv:               s,
 		ws:                ws,
 		format:            format,
 		id:                connID,
@@ -211,6 +242,115 @@ func (s *Server) deregister(c *connection) {
 	s.mu.Unlock()
 }
 
+// scheduleConnectionLeaves defers the synthesised presence LEAVE for a
+// connection that dropped abruptly (DESIGN.md §12.5). It captures, now,
+// the member entries the connection still owns on each channel (from the
+// authoritative store, keyed by member serial), then after remainPresentFor
+// writes their LEAVEs — unless a member has since been superseded, i.e. the
+// same connectionId resumed and re-entered, in which case its LEAVE is
+// suppressed at write time. Doing the suppression check against the store at
+// write time (rather than cancelling a local timer) keeps it correct when
+// the resume lands on a different node in cluster mode: the re-enter is
+// visible in the shared presence set there too.
+//
+// Runs synchronously to capture (fast store read) on the terminating
+// connection's goroutine, then hands off to a reaper goroutine for the wait.
+func (s *Server) scheduleConnectionLeaves(connID string, channels []string) {
+	select {
+	case <-s.reaperDone:
+		return // shutting down: the node's presence goes with it
+	default:
+	}
+
+	// Capture the member serials to leave, now, from the authoritative set.
+	capCtx, cancel := context.WithTimeout(context.Background(), teardownLeaveTimeout)
+	stale := make(map[string]map[string]string, len(channels)) // channel -> clientId -> member serial
+	for _, channel := range channels {
+		ch, err := s.manager.GetChannel(capCtx, channel)
+		if err != nil {
+			continue
+		}
+		members, _, err := ch.Members(capCtx)
+		if err != nil {
+			continue
+		}
+		owned := make(map[string]string)
+		for _, m := range members {
+			if m.ConnectionID == connID {
+				owned[m.ClientID] = m.Serial
+			}
+		}
+		if len(owned) > 0 {
+			stale[channel] = owned
+		}
+	}
+	cancel()
+	if len(stale) == 0 {
+		return
+	}
+
+	s.reaperWG.Go(func() {
+		t := time.NewTimer(s.remainPresentFor)
+		defer t.Stop()
+		select {
+		case <-t.C:
+		case <-s.reaperDone:
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), teardownLeaveTimeout)
+		defer cancel()
+		for channel, owned := range stale {
+			s.fireConnectionLeaves(ctx, connID, channel, owned)
+		}
+	})
+}
+
+// fireConnectionLeaves writes the deferred LEAVEs for connID's members on
+// channel, suppressing any member that has been superseded since capture —
+// an entry now absent (already left) or carrying a different serial (the
+// connection resumed and re-entered), which must not be torn down.
+func (s *Server) fireConnectionLeaves(ctx context.Context, connID, channel string, owned map[string]string) {
+	ch, err := s.manager.GetChannel(ctx, channel)
+	if err != nil {
+		s.logger.Warn("delayed leave: GetChannel failed", "channel", channel, "err", err)
+		return
+	}
+	members, _, err := ch.Members(ctx)
+	if err != nil {
+		s.logger.Warn("delayed leave: Members failed", "channel", channel, "err", err)
+		return
+	}
+	current := make(map[string]string, len(members))
+	for _, m := range members {
+		if m.ConnectionID == connID {
+			current[m.ClientID] = m.Serial
+		}
+	}
+	var leaves []*protocol.PresenceMessage
+	for clientID, capturedSerial := range owned {
+		if current[clientID] != capturedSerial {
+			continue // gone or re-entered: suppress
+		}
+		leaves = append(leaves, &protocol.PresenceMessage{
+			Action:       protocol.PresenceLeave,
+			ClientID:     clientID,
+			ConnectionID: connID,
+		})
+	}
+	if len(leaves) == 0 {
+		return
+	}
+	if _, _, err := ch.PublishPresence(ctx, leaves); err != nil {
+		s.logger.Warn("delayed leave publish failed", "channel", channel, "err", err)
+	}
+}
+
+// stopReaper abandons any pending delayed presence LEAVEs. Called from
+// Shutdown: the node is going away, so its connections' members go with it.
+func (s *Server) stopReaper() {
+	s.reaperStop.Do(func() { close(s.reaperDone) })
+}
+
 // ResolveConnectionKey resolves a REST publish's connectionKey to the live
 // connection it names, returning that connection's connectionId (DESIGN.md
 // §13). ok is false when the key doesn't authenticate (VerifyConnectionKey)
@@ -248,6 +388,11 @@ func (s *Server) ResolveConnectionKey(key string) (connID string, ok bool) {
 // force-closed at once. Shutdown returns once every connection has been
 // disconnected (or the deadline forced them closed).
 func (s *Server) Shutdown(ctx context.Context) {
+	// Abandon pending delayed presence LEAVEs first: the connections about
+	// to be disconnected below would otherwise schedule fresh ones, and the
+	// node's presence set departs with the node anyway (DESIGN.md §12.5).
+	s.stopReaper()
+
 	s.mu.Lock()
 	conns := make([]*connection, 0, len(s.conns))
 	for c := range s.conns {
