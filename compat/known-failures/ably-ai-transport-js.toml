@@ -2,7 +2,7 @@
 # (compat/runners/ably-ai-transport-js/run.mjs, run from ably-server).
 #
 # The suite is ably-ai-transport-js's integration specs (test/**/*.integration.test.ts,
-# ~61 tests across 5 files) driven against a local ably-server via the sandbox
+# 73 tests across 7 files) driven against a local ably-server via the sandbox
 # provisioner. It stresses exactly ably-server's newest surface: streamed appends
 # on mutable channels, update/delete, history pagination, resume continuity, and
 # attach modes — no presence/annotations/LiveObjects/push.
@@ -12,16 +12,11 @@
 # currently failing is stale and must be pruned. Every entry carries a reason (a
 # backlog task reference or a non-goal marker) — the list is meant to be read.
 #
-# Baselined 2026-07-22 against a provisioner-booted ably-server (child servers
-# compiled from the working tree via `go run`). The suite is otherwise green:
-# 60/61 or 61/61 per run, the single variable being the flaky entry below.
-#
-# CAVEAT — flaky entry: the one entry below is timing-dependent and a given run
-# may show it PASSING (which makes compat-gate report it "stale"). Don't prune it
-# on a single green run — it is a known upstream ably-ai-transport-js race, not a
-# server regression (see the reason). The proper fix is in the SDK, after which
-# this entry should be removed and the suite gates at a deterministic 61/61.
-
-[[failure]]
-test = "test/core/transport/agent-session.integration.test.ts::AgentSession integration run.messages spans a suspend/resume run: original input then all output"
-reason = "NOT an ably-server gap: a client-side race in ably-ai-transport-js's DefaultTree.applyRunLifecycle (tree.ts), which only emits 'update' for structural tree changes — a terminal run-end is 'content not structure' and never notifies a status-only listener. The test's awaitRunComplete does a synchronous status check then falls back to an 'update' listener; when the publish ACK wins its (intentionally unordered, DESIGN.md §5.2) race against the self-echoed run-end frame on the agent's own connection, the fallback listener is stranded and the test times out. Correlated server+ably-js+SDK traces confirm the server commits and delivers every message correctly and promptly; the fix belongs in the SDK. Flaky (~1-in-3 historically; near-deterministic on a fast machine)."
+# THE LIST IS EMPTY, AND SHOULD STAY THAT WAY. Re-baselined 2026-08-19 against
+# ably-ai-transport-js d7a9ed15 (v0.8.0): the suite is a deterministic 73/73
+# (four consecutive green runs) against a provisioner-booted ably-server. The
+# sole prior entry — a suspend/resume run-completion timeout — was an upstream
+# client-side race in the SDK's own test helper (awaitRunComplete fell back to
+# the tree's structural `update` event, which never fires for a status-only
+# run-end); ably-ai-transport-js#276 fixed it to listen on `run` instead, and the
+# test now passes deterministically. Anything failing here now is a regression.
