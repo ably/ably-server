@@ -17,10 +17,13 @@ package integrationtest
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -41,17 +44,39 @@ const integrationAPIKey = "app.key:secret"
 //
 // For multi-node tests use startServerOnDSN with a shared
 // FreshSchemaDSN so every node speaks to the same database state.
-func startServer(t *testing.T) string {
+func startServer(t *testing.T, extraArgs ...string) string {
 	t.Helper()
 	pgc := pgtest.Start(t)
-	return startServerOnDSN(t, pgc.FreshSchemaDSN(t))
+	return startServerOnDSN(t, pgc.FreshSchemaDSN(t), extraArgs...)
+}
+
+// editableChannelsConfig writes a config file declaring the named namespaces
+// with message editing allowed, and returns its path.
+//
+// A namespace that does not say messages are mutable does not allow editing
+// them (DESIGN.md §13), so a server started with no namespaces configured
+// refuses every edit. That is the protocol's answer rather than this server's,
+// so a test about editing configures a namespace that permits it, exactly as a
+// test app does. An unprefixed channel's namespace is its own name, so the
+// namespaces to declare are the channel names the test uses.
+func editableChannelsConfig(t *testing.T, namespaces ...string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ably-server.toml")
+	var body strings.Builder
+	for _, ns := range namespaces {
+		fmt.Fprintf(&body, "[[namespaces]]\nid = %q\nmutableMessages = true\n\n", ns)
+	}
+	if err := os.WriteFile(path, []byte(body.String()), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
 }
 
 // startServerOnDSN boots one ably-server in cluster mode pointed at
 // the given DSN. The DSN may be a fresh schema (single-node test) or
 // a schema shared with sibling nodes (cluster test). Returns the
 // bound "host:port"; tears down on t.Cleanup.
-func startServerOnDSN(t *testing.T, dsn string) string {
+func startServerOnDSN(t *testing.T, dsn string, extraArgs ...string) string {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -60,13 +85,13 @@ func startServerOnDSN(t *testing.T, dsn string) string {
 	done := make(chan int, 1)
 	go func() {
 		done <- server.Run(ctx, server.Opts{
-			Args: []string{
+			Args: append([]string{
 				"--keys=" + integrationAPIKey,
 				"--mode=cluster",
 				"--postgres-dsn=" + dsn,
 				"--listen=127.0.0.1:0",
 				"--log-level=error",
-			},
+			}, extraArgs...),
 			Getenv: func(string) string { return "" },
 			Out:    io.Discard,
 			Ready:  ready,

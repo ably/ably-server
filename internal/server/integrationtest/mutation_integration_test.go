@@ -76,7 +76,7 @@ func collapsedHistory(t *testing.T, ctx context.Context, ch *ably.RealtimeChanne
 // object on each, the right action values, the version serial returned
 // by each operation, and collapsed history vs getMessageVersions.
 func TestIntegrationMutableMessagesSDK(t *testing.T) {
-	addr := startServer(t)
+	addr := startServer(t, "--config="+editableChannelsConfig(t, "edits"))
 	client := newClientWithID(t, addr, "alice")
 	connect(t, client)
 
@@ -118,7 +118,7 @@ func TestIntegrationMutableMessagesSDK(t *testing.T) {
 		t.Fatalf("UpdateMessage: %v", err)
 	}
 	if updRes.VersionSerial == nil || *updRes.VersionSerial == "" || *updRes.VersionSerial == serial {
-		t.Errorf("UpdateMessage VersionSerial = %v, want a fresh version serial != identity", updRes.VersionSerial)
+		t.Errorf("UpdateMessage VersionSerial = %q, want a fresh version serial != identity %q", deref(updRes.VersionSerial), serial)
 	}
 	update := recvMessage(t, ctx, received, "update")
 	if update.Action != ably.MessageActionUpdate {
@@ -131,7 +131,7 @@ func TestIntegrationMutableMessagesSDK(t *testing.T) {
 		t.Errorf("update data = %v, want v2", update.Data)
 	}
 	if update.Version == nil || update.Version.Serial != *updRes.VersionSerial {
-		t.Errorf("update version = %+v, want serial %v (the operation's VersionSerial)", update.Version, updRes.VersionSerial)
+		t.Errorf("update version = %+v, want serial %q (the operation's VersionSerial)", update.Version, deref(updRes.VersionSerial))
 	}
 
 	// --- delete -------------------------------------------------------
@@ -193,8 +193,9 @@ func TestIntegrationMutableMessagesSDK(t *testing.T) {
 func TestIntegrationClusterMutationAcrossNodes(t *testing.T) {
 	pgc := pgtest.Start(t)
 	dsn := pgc.FreshSchemaDSN(t)
-	addrA := startServerOnDSN(t, dsn)
-	addrB := startServerOnDSN(t, dsn)
+	cfg := "--config=" + editableChannelsConfig(t, "x")
+	addrA := startServerOnDSN(t, dsn, cfg)
+	addrB := startServerOnDSN(t, dsn, cfg)
 
 	ctx, cancel := testCtx(t)
 	defer cancel()
@@ -274,4 +275,12 @@ func TestIntegrationClusterMutationAcrossNodes(t *testing.T) {
 	if da != "v2" || db != "v2" {
 		t.Errorf("single-read latest = A:%v B:%v, want v2 on both", ma.Data, mb.Data)
 	}
+}
+
+// deref is an optional string as a test message prints it.
+func deref(s *string) string {
+	if s == nil {
+		return "<nil>"
+	}
+	return *s
 }

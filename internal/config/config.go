@@ -44,9 +44,9 @@ type File struct {
 	// "zero value means absent" convention costs nothing here.
 	EnableStatsStub bool `toml:"enable-stats-stub"`
 	// Namespaces are [[namespaces]] entries mirroring the test-app-setup
-	// post_apps shape (DESIGN.md §9, §12.5). They are parsed and retained
-	// but behaviourally inert: the feature flags are recorded, not acted
-	// on. They exist so the whole startup state lives in one config file.
+	// post_apps shape (DESIGN.md §9, §12.5). A channel takes the flags of
+	// the namespace selecting it, so what is configured here is what a
+	// channel is then allowed to do.
 	Namespaces []Namespace `toml:"namespaces"`
 	// Channels are [[channels]] entries whose nested presence members are
 	// seeded at startup as static fixtures (DESIGN.md §9, §12.5),
@@ -65,10 +65,18 @@ type KeyEntry struct {
 
 // Namespace is one [[namespaces]] entry (DESIGN.md §9, §12.5): a
 // namespace id plus feature flags mirroring test-app-setup's post_apps
-// shape. The flags are recorded but inert — no behaviour keys off them
-// yet.
+// shape.
+//
+// Mode decides how ID selects channels. Empty — every namespace
+// predating generalised channel rules — means ID is one channel name
+// segment, matching every channel whose first segment is that id.
+// "matcher" means ID is a match expression in its own right, with the
+// same segment semantics as a capability resource: a non-trailing "*"
+// matches one segment, a trailing "*" one or more. Where several
+// namespaces match a channel the most specific applies.
 type Namespace struct {
 	ID              string `toml:"id"`
+	Mode            string `toml:"mode"`
 	Persisted       bool   `toml:"persisted"`
 	MutableMessages bool   `toml:"mutableMessages"`
 	PushEnabled     bool   `toml:"pushEnabled"`

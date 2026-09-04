@@ -47,7 +47,7 @@ type child struct {
 }
 
 // provisioner owns the set of running child servers and their lifecycle
-// (DESIGN.md §15).
+// (DESIGN.md §17).
 type provisioner struct {
 	serverCmd serverCommand
 	logDir    string
@@ -71,7 +71,7 @@ func newProvisioner(cmd serverCommand, logDir string, idleTTL time.Duration, log
 }
 
 // resolveServerCommand decides how to run the ably-server child
-// (DESIGN.md §15): an explicit --server-bin wins; otherwise a sibling
+// (DESIGN.md §17): an explicit --server-bin wins; otherwise a sibling
 // named "ably-server" next to this executable is used; otherwise it falls
 // back to `go run ./cmd/ably-server`, which relies on the working
 // directory being the module root (the case when the provisioner itself

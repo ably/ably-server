@@ -21,7 +21,7 @@ import (
 const fullCapability = `{"*":["*"]}`
 
 // postAppsRequest is the subset of the Ably test-app-setup `post_apps`
-// body the provisioner acts on (DESIGN.md §15). Keys and namespaces are
+// body the provisioner acts on (DESIGN.md §17). Keys and namespaces are
 // decoded as raw maps so unrecognised fields (e.g. revocableTokens)
 // round-trip into the response verbatim; channels are typed since their
 // shape drives the child's presence fixtures. Other fields (limits, …)
@@ -45,7 +45,7 @@ type presenceSpec struct {
 }
 
 // appResponse is the sandbox-shaped app JSON the harness consumes
-// (DESIGN.md §15). It carries the standard fields (appId/accountId/keys/
+// (DESIGN.md §17). It carries the standard fields (appId/accountId/keys/
 // namespaces/channels, plus a cipher echo when present) extended with
 // endpoint/port/tls so a client can route to the child directly.
 type appResponse struct {
@@ -317,7 +317,7 @@ func (p *provisioner) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
 
 // handlePostStats implements POST /stats: the harness posts stats
 // fixtures to the provisioning host, which the provisioner accepts and
-// discards (mirroring the server's stub, DESIGN.md §1, §15).
+// discards (mirroring the server's stub, DESIGN.md §1, §17).
 func (p *provisioner) handlePostStats(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, 1<<20))
 	w.WriteHeader(http.StatusCreated)

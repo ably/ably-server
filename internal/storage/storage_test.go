@@ -4,12 +4,12 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/server-protocol/go/wire"
 )
 
 func TestStampMessageIDs(t *testing.T) {
 	t.Run("GeneratesBatchIDForUnsetIDs", func(t *testing.T) {
-		msgs := []*protocol.Message{{Name: "a"}, {Name: "b"}, {Name: "c"}}
+		msgs := []*wire.Message{{Name: new("a")}, {Name: new("b")}, {Name: new("c")}}
 		batchID, err := StampMessageIDs(msgs)
 		if err != nil {
 			t.Fatalf("StampMessageIDs: %v", err)
@@ -20,14 +20,14 @@ func TestStampMessageIDs(t *testing.T) {
 		// idx is unpadded to match Ably's wire shape ("<batchID>:0").
 		want := []string{batchID + ":0", batchID + ":1", batchID + ":2"}
 		for i, m := range msgs {
-			if m.ID != want[i] {
-				t.Errorf("msgs[%d].ID = %q, want %q", i, m.ID, want[i])
+			if m.GetId() != want[i] {
+				t.Errorf("msgs[%d].GetId() = %q, want %q", i, m.GetId(), want[i])
 			}
 		}
 	})
 
 	t.Run("SingleMessageClientIDKeptAsBatchID", func(t *testing.T) {
-		msgs := []*protocol.Message{{ID: "dup"}}
+		msgs := []*wire.Message{{Id: new("dup")}}
 		batchID, err := StampMessageIDs(msgs)
 		if err != nil {
 			t.Fatalf("StampMessageIDs: %v", err)
@@ -35,13 +35,13 @@ func TestStampMessageIDs(t *testing.T) {
 		if batchID != "dup" {
 			t.Errorf("batchID = %q, want %q", batchID, "dup")
 		}
-		if msgs[0].ID != "dup" {
-			t.Errorf("msgs[0].ID = %q, want it left unchanged", msgs[0].ID)
+		if msgs[0].GetId() != "dup" {
+			t.Errorf("msgs[0].GetId() = %q, want it left unchanged", msgs[0].GetId())
 		}
 	})
 
 	t.Run("SingleMessageTrimsTrailingZeroIndex", func(t *testing.T) {
-		msgs := []*protocol.Message{{ID: "base:0"}}
+		msgs := []*wire.Message{{Id: new("base:0")}}
 		batchID, err := StampMessageIDs(msgs)
 		if err != nil {
 			t.Fatalf("StampMessageIDs: %v", err)
@@ -52,7 +52,7 @@ func TestStampMessageIDs(t *testing.T) {
 	})
 
 	t.Run("ConformingMultiBatchAccepted", func(t *testing.T) {
-		msgs := []*protocol.Message{{ID: "b:0"}, {ID: "b:1"}}
+		msgs := []*wire.Message{{Id: new("b:0")}, {Id: new("b:1")}}
 		batchID, err := StampMessageIDs(msgs)
 		if err != nil {
 			t.Fatalf("StampMessageIDs: %v", err)
@@ -63,11 +63,11 @@ func TestStampMessageIDs(t *testing.T) {
 	})
 
 	t.Run("MismatchedMultiBatchRejected", func(t *testing.T) {
-		for _, tc := range [][]*protocol.Message{
-			{{ID: "b:0"}, {ID: "b:2"}}, // wrong idx
-			{{ID: "b:0"}, {ID: "c:1"}}, // wrong base
-			{{ID: "b:1"}, {ID: "b:2"}}, // first not ":0"
-			{{ID: "b:0"}, {Name: "x"}}, // some ids missing
+		for _, tc := range [][]*wire.Message{
+			{{Id: new("b:0")}, {Id: new("b:2")}}, // wrong idx
+			{{Id: new("b:0")}, {Id: new("c:1")}}, // wrong base
+			{{Id: new("b:1")}, {Id: new("b:2")}}, // first not ":0"
+			{{Id: new("b:0")}, {Name: new("x")}}, // some ids missing
 		} {
 			if _, err := StampMessageIDs(tc); !errors.Is(err, ErrInvalidMessageID) {
 				t.Errorf("StampMessageIDs(%v) err = %v, want ErrInvalidMessageID", tc, err)

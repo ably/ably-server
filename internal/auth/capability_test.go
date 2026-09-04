@@ -184,3 +184,42 @@ func TestParseCapabilityRejectsMalformed(t *testing.T) {
 		t.Errorf("malformed capability should error")
 	}
 }
+
+// TestValidateCapability covers the shape of a client-supplied requested
+// capability. What is well-formed is the shared parser's judgement, so these
+// pin what this server passes on to it — including the two shapes it is
+// lenient about, which a token request is granted rather than refused.
+func TestValidateCapability(t *testing.T) {
+	cases := []struct {
+		name    string
+		cap     string
+		wantErr bool
+	}{
+		{"one op", `{"foo":["publish"]}`, false},
+		{"wildcard op", `{"foo":["*"]}`, false},
+		{"wildcard resource", `{"*":["*"]}`, false},
+		{"nothing granted", `{}`, false},
+
+		// Granted rather than refused: an empty op list grants nothing on the
+		// resource, and a wildcard alongside other ops collapses to the
+		// wildcard, which was asked for anyway. Neither grants more than the
+		// request did.
+		{"resource with no ops", `{"foo":[]}`, false},
+		{"wildcard mixed with an op", `{"foo":["*","publish"]}`, false},
+
+		{"unrecognised op", `{"foo":["fly"]}`, true},
+		{"not an object", `["publish"]`, true},
+		{"not json", `{`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateCapability(tc.cap)
+			if tc.wantErr && err == nil {
+				t.Errorf("ValidateCapability(%s) = nil, want an error", tc.cap)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("ValidateCapability(%s) = %v, want nil", tc.cap, err)
+			}
+		})
+	}
+}

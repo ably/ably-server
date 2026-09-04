@@ -11,6 +11,7 @@ import (
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/storage"
 	"github.com/ably/ably-server/internal/storage/postgres/pgtest"
+	"github.com/ably/server-protocol/go/wire"
 )
 
 // TestCrashedNodePresenceReaped enters a presence member on node A,
@@ -54,10 +55,10 @@ func TestCrashedNodePresenceReaped(t *testing.T) {
 	}
 
 	// Member enters on node A.
-	if _, _, err := chA.StorePresence(ctx, []*protocol.PresenceMessage{{
-		Action:       protocol.PresenceEnter,
-		ClientID:     "alice",
-		ConnectionID: "connA",
+	if _, _, err := chA.StorePresence(ctx, []*wire.PresenceMessage{{
+		Action:       wire.PresenceMessage_ENTER,
+		ClientId:     new("alice"),
+		ConnectionId: "connA",
 	}}); err != nil {
 		t.Fatalf("enter presence: %v", err)
 	}
@@ -123,11 +124,11 @@ func TestStaticFixturePresenceSurvivesReaper(t *testing.T) {
 	}
 
 	// Seed a static fixture member on node A.
-	if _, _, err := chA.StorePresence(storage.WithStaticPresence(ctx), []*protocol.PresenceMessage{{
-		Action:       protocol.PresenceEnter,
-		ClientID:     "fixture_client",
-		ConnectionID: "connFixture",
-		Data:         "true",
+	if _, _, err := chA.StorePresence(storage.WithStaticPresence(ctx), []*wire.PresenceMessage{{
+		Action:       wire.PresenceMessage_ENTER,
+		ClientId:     new("fixture_client"),
+		ConnectionId: "connFixture",
+		Data:         wire.MessageStrData("true"),
 	}}); err != nil {
 		t.Fatalf("seed fixture presence: %v", err)
 	}
@@ -160,12 +161,13 @@ func swapPresenceTimings(lease, bump, reap time.Duration) func() {
 
 func memberPresent(t *testing.T, ctx context.Context, ch storage.ChannelStore, clientID string) bool {
 	t.Helper()
-	members, _, err := ch.Members(ctx)
+	chPage, err := ch.Members(ctx, storage.MembersQuery{})
+	members, _ := chPage.Members, chPage.AsOfSerial
 	if err != nil {
 		t.Fatalf("Members: %v", err)
 	}
 	for _, m := range members {
-		if m.ClientID == clientID {
+		if m.GetClientId() == clientID {
 			return true
 		}
 	}
@@ -188,10 +190,13 @@ func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool)
 // cms so tests can count LEAVEs per client.
 type presenceRecorder struct {
 	mu       sync.Mutex
-	presence []*protocol.PresenceMessage
+	presence []*wire.PresenceMessage
 }
 
 func (r *presenceRecorder) Initialize(current, initial string) {}
+
+// OccupancyChanged is not what this recorder is watching for.
+func (r *presenceRecorder) OccupancyChanged() {}
 
 func (r *presenceRecorder) Append(cm *protocol.ChannelMessage) {
 	r.mu.Lock()
@@ -204,7 +209,7 @@ func (r *presenceRecorder) leaveCount(clientID string) int {
 	defer r.mu.Unlock()
 	n := 0
 	for _, p := range r.presence {
-		if p.Action == protocol.PresenceLeave && p.ClientID == clientID {
+		if p.Action == wire.PresenceMessage_LEAVE && p.GetClientId() == clientID {
 			n++
 		}
 	}

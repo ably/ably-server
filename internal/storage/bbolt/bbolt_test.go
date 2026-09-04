@@ -3,12 +3,14 @@ package bbolt_test
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"testing"
 
-	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/serial"
 	"github.com/ably/ably-server/internal/storage"
 	"github.com/ably/ably-server/internal/storage/bbolt"
 	"github.com/ably/ably-server/internal/storage/storagetest"
+	"github.com/ably/server-protocol/go/wire"
 )
 
 // mustChannel materialises a ChannelStore for name, failing on error.
@@ -53,12 +55,13 @@ func TestBBoltPresenceMembersNotPersisted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open #1: %v", err)
 	}
-	if _, _, err := mustChannel(t, s1, "room").StorePresence(ctx, []*protocol.PresenceMessage{
-		{Action: protocol.PresenceEnter, ConnectionID: "conn-1", ClientID: "alice", Data: "hi"},
+	if _, _, err := mustChannel(t, s1, "room").StorePresence(ctx, []*wire.PresenceMessage{
+		{Action: wire.PresenceMessage_ENTER, ConnectionId: "conn-1", ClientId: new("alice"), Data: wire.MessageStrData("hi")},
 	}); err != nil {
 		t.Fatalf("StorePresence: %v", err)
 	}
-	members, _, err := mustChannel(t, s1, "room").Members(ctx)
+	memberPage, err := mustChannel(t, s1, "room").Members(ctx, storage.MembersQuery{})
+	members := memberPage.Members
 	if err != nil {
 		t.Fatalf("Members #1: %v", err)
 	}
@@ -76,7 +79,8 @@ func TestBBoltPresenceMembersNotPersisted(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s2.Close() })
 
-	members, _, err = mustChannel(t, s2, "room").Members(ctx)
+	memberPage, err = mustChannel(t, s2, "room").Members(ctx, storage.MembersQuery{})
+	members = memberPage.Members
 	if err != nil {
 		t.Fatalf("Members #2: %v", err)
 	}
@@ -94,7 +98,7 @@ func TestBBoltPresenceMembersNotPersisted(t *testing.T) {
 	if len(page.ChannelMessages) != 1 || len(page.ChannelMessages[0].Presence) != 1 {
 		t.Fatalf("presence history = %d cms, want 1 with one presence item", len(page.ChannelMessages))
 	}
-	if got := page.ChannelMessages[0].Presence[0].ClientID; got != "alice" {
+	if got := page.ChannelMessages[0].Presence[0].GetClientId(); got != "alice" {
 		t.Errorf("persisted presence clientId = %q, want alice", got)
 	}
 }
@@ -111,13 +115,13 @@ func TestBBoltSurvivesProcessRestart(t *testing.T) {
 	}
 	var fooSerials []string
 	for i := range 3 {
-		cm, _, err := mustChannel(t, s1, "foo").Store(ctx, []*protocol.Message{{Name: "x", Data: i}})
+		cm, _, err := mustChannel(t, s1, "foo").Store(ctx, []*wire.Message{{Name: new("x"), Data: wire.MessageStrData(strconv.Itoa(i))}})
 		if err != nil {
 			t.Fatalf("foo publish %d: %v", i, err)
 		}
 		fooSerials = append(fooSerials, cm.ChannelSerial)
 	}
-	if _, _, err := mustChannel(t, s1, "bar").Store(ctx, []*protocol.Message{{Name: "y"}}); err != nil {
+	if _, _, err := mustChannel(t, s1, "bar").Store(ctx, []*wire.Message{{Name: new("y")}}); err != nil {
 		t.Fatalf("bar publish: %v", err)
 	}
 	if err := s1.Close(); err != nil {
@@ -146,7 +150,7 @@ func TestBBoltSurvivesProcessRestart(t *testing.T) {
 	}
 
 	// A post-restart publish persists and shows up at the tail.
-	fresh, _, err := mustChannel(t, s2, "foo").Store(ctx, []*protocol.Message{{Name: "z"}})
+	fresh, _, err := mustChannel(t, s2, "foo").Store(ctx, []*wire.Message{{Name: new("z")}})
 	if err != nil {
 		t.Fatalf("post-restart publish: %v", err)
 	}
@@ -159,5 +163,104 @@ func TestBBoltSurvivesProcessRestart(t *testing.T) {
 	}
 	if got := page.ChannelMessages[len(page.ChannelMessages)-1].ChannelSerial; got != fresh.ChannelSerial {
 		t.Errorf("tail ChannelSerial = %q, want %q", got, fresh.ChannelSerial)
+	}
+}
+
+// TestBBoltChannelSeriesSurvivesRestart asserts that reopening the file
+// carries on a channel's existing series rather than starting a new one.
+//
+// The series is how a server tells a client that the serials before it
+// are not ordered against the ones after it. A restart over an intact
+// log has restarted nothing, so saying otherwise would hand every
+// resuming client a discontinuity that did not happen.
+func TestBBoltChannelSeriesSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ably.db")
+	ctx := context.Background()
+
+	s1, err := bbolt.Open(bbolt.Options{Path: path})
+	if err != nil {
+		t.Fatalf("Open #1: %v", err)
+	}
+	before, _, err := mustChannel(t, s1, "room").Store(ctx, []*wire.Message{{Name: new("x")}})
+	if err != nil {
+		t.Fatalf("publish before restart: %v", err)
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatalf("Close #1: %v", err)
+	}
+
+	s2, err := bbolt.Open(bbolt.Options{Path: path})
+	if err != nil {
+		t.Fatalf("Open #2: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+
+	after, _, err := mustChannel(t, s2, "room").Store(ctx, []*wire.Message{{Name: new("y")}})
+	if err != nil {
+		t.Fatalf("publish after restart: %v", err)
+	}
+
+	_, _, wantSeries, err := serial.SplitChannelSerial(before.ChannelSerial)
+	if err != nil {
+		t.Fatalf("split %q: %v", before.ChannelSerial, err)
+	}
+	_, _, gotSeries, err := serial.SplitChannelSerial(after.ChannelSerial)
+	if err != nil {
+		t.Fatalf("split %q: %v", after.ChannelSerial, err)
+	}
+	if gotSeries != wantSeries {
+		t.Errorf("series after restart = %q, want %q (%q then %q)",
+			gotSeries, wantSeries, before.ChannelSerial, after.ChannelSerial)
+	}
+	if after.ChannelSerial <= before.ChannelSerial {
+		t.Errorf("post-restart serial %q is not after %q", after.ChannelSerial, before.ChannelSerial)
+	}
+}
+
+// TestBBoltSerialsStayMonotonicAcrossRestartWithinOneMillisecond pins
+// the case a fresh generator got wrong: a channel reopened while the
+// clock still reads the millisecond its last publish was minted in.
+// The generator resumes from the last persisted serial, so the next
+// mint follows it instead of colliding with it.
+func TestBBoltSerialsStayMonotonicAcrossRestartWithinOneMillisecond(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ably.db")
+	ctx := context.Background()
+	frozen := func() int64 { return 1726585978590 }
+
+	s1, err := bbolt.Open(bbolt.Options{Path: path, Now: frozen})
+	if err != nil {
+		t.Fatalf("Open #1: %v", err)
+	}
+	var serials []string
+	for range 3 {
+		cm, _, err := mustChannel(t, s1, "room").Store(ctx, []*wire.Message{{Name: new("x")}})
+		if err != nil {
+			t.Fatalf("publish before restart: %v", err)
+		}
+		serials = append(serials, cm.ChannelSerial)
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatalf("Close #1: %v", err)
+	}
+
+	s2, err := bbolt.Open(bbolt.Options{Path: path, Now: frozen})
+	if err != nil {
+		t.Fatalf("Open #2: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+
+	for range 3 {
+		cm, _, err := mustChannel(t, s2, "room").Store(ctx, []*wire.Message{{Name: new("y")}})
+		if err != nil {
+			t.Fatalf("publish after restart: %v", err)
+		}
+		serials = append(serials, cm.ChannelSerial)
+	}
+
+	for i := 1; i < len(serials); i++ {
+		if serials[i] <= serials[i-1] {
+			t.Fatalf("serials not monotonic across restart: %q then %q (all: %v)",
+				serials[i-1], serials[i], serials)
+		}
 	}
 }

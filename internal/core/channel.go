@@ -5,9 +5,13 @@ package core
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/storage"
+
+	"github.com/ably/server-protocol/go/live"
+	"github.com/ably/server-protocol/go/wire"
 )
 
 // entry is a node in a Channel's linked list of ChannelMessages. Each
@@ -51,6 +55,12 @@ type Channel struct {
 
 	mu   sync.Mutex
 	tail *entry // never nil: a sentinel is installed at construction
+
+	// occupancy fires when storage says the channel's aggregate occupancy
+	// moved; occupancyGen is what it carries, a counter whose only job is to
+	// differ from the value before it so that watchers are woken.
+	occupancy    *live.Value[uint64]
+	occupancyGen atomic.Uint64
 }
 
 // newChannel constructs a Channel in the not-ready state. The list
@@ -58,9 +68,10 @@ type Channel struct {
 // populate with the watermark serial.
 func newChannel(name string) *Channel {
 	return &Channel{
-		name:  name,
-		ready: make(chan struct{}),
-		tail:  &entry{notify: make(chan struct{})},
+		name:      name,
+		ready:     make(chan struct{}),
+		tail:      &entry{notify: make(chan struct{})},
+		occupancy: live.NewValue(uint64(0)),
 	}
 }
 
@@ -76,7 +87,7 @@ func (c *Channel) Name() string {
 // construction — synchronously in single-process backends,
 // asynchronously via the LISTEN goroutine in cluster mode. The
 // (cm, idempotent, err) tuple is forwarded verbatim from storage.
-func (c *Channel) Publish(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
+func (c *Channel) Publish(ctx context.Context, msgs []*wire.Message) (*protocol.ChannelMessage, bool, error) {
 	return c.store.Store(ctx, msgs)
 }
 
@@ -86,7 +97,7 @@ func (c *Channel) Publish(ctx context.Context, msgs []*protocol.Message) (*proto
 // onto the live list arrives via the Appender callback exactly as for a
 // message publish (DESIGN.md §12.2). The (cm, idempotent, err) tuple is
 // forwarded verbatim from storage.
-func (c *Channel) PublishPresence(ctx context.Context, presence []*protocol.PresenceMessage) (*protocol.ChannelMessage, bool, error) {
+func (c *Channel) PublishPresence(ctx context.Context, presence []*wire.PresenceMessage) (*protocol.ChannelMessage, bool, error) {
 	return c.store.StorePresence(ctx, presence)
 }
 
@@ -98,8 +109,16 @@ func (c *Channel) PublishPresence(ctx context.Context, presence []*protocol.Pres
 // exactly as for a message publish (DESIGN.md §14.1). The
 // (cm, idempotent, err) tuple is forwarded verbatim — notably
 // storage.ErrTargetNotFound when a target message does not exist.
-func (c *Channel) PublishAnnotation(ctx context.Context, annotations []*protocol.Annotation) (*protocol.ChannelMessage, bool, error) {
-	return c.store.StoreAnnotation(ctx, annotations)
+func (c *Channel) PublishAnnotation(ctx context.Context, annotations []*wire.Annotation, fold storage.FoldFunc) (*protocol.ChannelMessage, bool, error) {
+	return c.store.StoreAnnotation(ctx, annotations, fold)
+}
+
+// PublishSummaries publishes the summaries of messages whose annotations have
+// just been folded, so subscribers are told what a message now says about them
+// (DESIGN.md §14.2). It is a publish like any other: logged, given a serial,
+// and delivered through the Appender.
+func (c *Channel) PublishSummaries(ctx context.Context, summaries []*wire.Message) (*protocol.ChannelMessage, error) {
+	return c.store.StoreSummary(ctx, summaries)
 }
 
 // Annotations returns the annotations attached to the message identified
@@ -115,13 +134,13 @@ func (c *Channel) Annotations(ctx context.Context, messageSerial string, q stora
 // exactly as for a publish, so subscribers see the new version in stream
 // order (DESIGN.md §13.2). The (cm, idempotent, err) tuple is forwarded
 // verbatim — notably storage.ErrTargetNotFound for an unknown target.
-func (c *Channel) Mutate(ctx context.Context, mut *protocol.Message) (*protocol.ChannelMessage, bool, error) {
-	return c.store.Mutate(ctx, mut)
+func (c *Channel) Mutate(ctx context.Context, mut *wire.Message, merge storage.MergeFunc) (*protocol.ChannelMessage, bool, error) {
+	return c.store.Mutate(ctx, mut, merge)
 }
 
 // LatestVersion returns the current latest version of the message
 // identified by serial, or storage.ErrTargetNotFound (DESIGN.md §13.4).
-func (c *Channel) LatestVersion(ctx context.Context, serial string) (*protocol.Message, error) {
+func (c *Channel) LatestVersion(ctx context.Context, serial string) (*wire.Message, error) {
 	return c.store.LatestVersion(ctx, serial)
 }
 
@@ -142,8 +161,58 @@ func (c *Channel) History(ctx context.Context, q storage.HistoryQuery) (storage.
 // Members returns the channel's current presence set plus the
 // channelSerial the set is current as-of, delegating to the storage
 // backend. Backs presence sync on attach (DESIGN.md §12.4).
-func (c *Channel) Members(ctx context.Context) ([]*protocol.PresenceMessage, string, error) {
-	return c.store.Members(ctx)
+func (c *Channel) Members(ctx context.Context, q storage.MembersQuery) (storage.MembersPage, error) {
+	return c.store.Members(ctx, q)
+}
+
+// PublishState runs the LiveObjects publish sequence: hand the state
+// messages to the storage backend (which mints the channelSerial, stamps
+// each Serial, applies the operations to the channel's materialised
+// object set via apply, and persists both), then the link onto the live
+// list arrives via the Appender callback exactly as for a message
+// publish (DESIGN.md §15.2). The (cm, idempotent, err) tuple is
+// forwarded verbatim.
+func (c *Channel) PublishState(ctx context.Context, state []*wire.StateMessage, apply storage.ApplyFunc) (*protocol.ChannelMessage, bool, error) {
+	return c.store.StoreState(ctx, state, apply)
+}
+
+// Objects returns one page of the channel's materialised LiveObjects set
+// plus the channelSerial the set is current as-of, delegating to the
+// storage backend. Backs the state sync a client is served on attach
+// (DESIGN.md §15.3).
+func (c *Channel) Objects(ctx context.Context, q storage.ObjectsQuery) (storage.ObjectsPage, error) {
+	return c.store.Objects(ctx, q)
+}
+
+// StoreOccupancy records what this node currently contributes to the
+// channel's occupancy, delegating to the storage backend, which then
+// signals every node holding the channel that the aggregate moved
+// (DESIGN.md §16.2).
+func (c *Channel) StoreOccupancy(ctx context.Context, counts *wire.ChannelOccupancy) error {
+	return c.store.StoreOccupancy(ctx, counts)
+}
+
+// Occupancy returns the channel's occupancy across every node
+// contributing to it (DESIGN.md §16.2).
+func (c *Channel) Occupancy(ctx context.Context) (*wire.ChannelOccupancy, error) {
+	return c.store.Occupancy(ctx)
+}
+
+// OccupancyUpdates fires each time storage reports that the channel's
+// aggregate occupancy may have moved, so whoever is reporting occupancy
+// re-reads it. The value is a generation counter and means nothing on its
+// own — what a watcher acts on is that it changed (DESIGN.md §16.3).
+//
+// It is a watched value rather than a callback because several holders
+// watch it independently and none of them own the channel.
+func (c *Channel) OccupancyUpdates() *live.Value[uint64] {
+	return c.occupancy
+}
+
+// OccupancyChanged is how storage delivers that signal. Implements
+// storage.Appender.
+func (c *Channel) OccupancyChanged() {
+	c.occupancy.Set(c.occupancyGen.Add(1))
 }
 
 // Initialize seeds the sentinel with the channel's current watermark
@@ -189,11 +258,11 @@ func (c *Channel) InitialChannelSerial() string {
 // deliver a persisted cm to subscribers (the publisher's own publish
 // in memory/bbolt; every node's publish in cluster mode).
 //
-// A no-op when cm is nil or carries no items — a presence cm or an
-// annotation cm (DESIGN.md §12.2, §14.1) links onto the list exactly like
-// a message cm.
+// A no-op when cm is nil or carries no items — a presence cm, an
+// annotation cm or a state cm (DESIGN.md §12.2, §14.1, §15.2) links onto
+// the list exactly like a message cm.
 func (c *Channel) Append(cm *protocol.ChannelMessage) {
-	if cm == nil || (len(cm.Messages) == 0 && len(cm.Presence) == 0 && len(cm.Annotations) == 0) {
+	if cm == nil || (len(cm.Messages) == 0 && len(cm.Presence) == 0 && len(cm.Annotations) == 0 && len(cm.State) == 0) {
 		return
 	}
 	c.mu.Lock()
@@ -248,3 +317,25 @@ func (s *Stream) Next(ctx context.Context) (*protocol.ChannelMessage, error) {
 		return nil, ctx.Err()
 	}
 }
+
+// Ready is closed once a further ChannelMessage has been linked after the
+// cursor, so a caller that cannot block can wait on it instead. Advance is
+// then Next without the wait: it moves the cursor if there is something to
+// move to and reports whether it did.
+//
+// Together they are the same traversal Next performs, split so that a caller
+// driving several streams from one goroutine can select across them.
+func (s *Stream) Ready() <-chan struct{} { return s.cursor.notify }
+
+func (s *Stream) Advance() bool {
+	select {
+	case <-s.cursor.notify:
+		s.cursor = s.cursor.next
+		return true
+	default:
+		return false
+	}
+}
+
+// Message is the ChannelMessage at the cursor.
+func (s *Stream) Message() *protocol.ChannelMessage { return s.cursor.cm }

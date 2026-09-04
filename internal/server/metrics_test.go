@@ -80,7 +80,11 @@ func TestMetricsEndpoint(t *testing.T) {
 
 	// WebSocket connect + attach so a subscriber is live for the publish.
 	wsURL := (&url.URL{Scheme: "ws", Host: addr, Path: "/"}).String() +
-		"?key=app.key:secret&v=2&format=json"
+		// v=4 or above: the protocol code serves the shape the version asks
+		// for, and this server's own message type models v4. Before the
+		// protocol moved to the shared module this server ignored the
+		// parameter, so v=2 here was asking for a shape it never got.
+		"?key=app.key:secret&v=4&format=json"
 	ws, _, err := websocket.DefaultDialer.DialContext(context.Background(), wsURL, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -112,8 +116,13 @@ func TestMetricsEndpoint(t *testing.T) {
 
 	// The subscriber should receive the delivered MESSAGE frame; reading
 	// it guarantees the delivered counter has been incremented before we
-	// scrape.
-	if f := readProto(t, ws); f.Action != protocol.ActionMessage {
+	// scrape. An attachment is offered a presence sync first — this server
+	// says every channel may have presence — so skip past that.
+	f := readProto(t, ws)
+	if f.Action == protocol.ActionSync {
+		f = readProto(t, ws)
+	}
+	if f.Action != protocol.ActionMessage {
 		t.Fatalf("frame = %v, want MESSAGE", f.Action)
 	}
 
@@ -135,7 +144,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 
 	// The labelled HTTP counter must carry the publish request.
-	if !strings.Contains(body, `ably_http_requests_total{method="POST",route="/channels/{name}/messages",status="201"}`) {
+	if !strings.Contains(body, `ably_http_requests_total{method="POST",route="/channels/{channelId}/messages",status="201"}`) {
 		t.Errorf("missing ably_http_requests_total series for the REST publish; body:\n%s", body)
 	}
 }

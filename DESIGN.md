@@ -13,8 +13,10 @@ This document describes how it works, section by section.
 
 - Multi-region / global distribution.
 - Ably-cloud-only product surface: integrations / rules, push notifications,
-  Spaces, Chat, LiveObjects/LiveSync, message queues, account/app management
-  APIs, the `/keys` admin API.
+  Spaces, Chat, LiveSync, message queues, account/app management
+  APIs, the `/keys` admin API. (LiveObjects **is** served — see §15 — since
+  it is a channel-level protocol feature rather than a cloud product
+  surface; object garbage collection is the one part left out, §15.3.)
 - Statistics collection. `GET /stats` exists purely as a compatibility
   stub — authenticated like any other REST read, gated by the app-wide
   `stats` op (§3.1), always returning an empty array — so SDK flows that
@@ -27,17 +29,16 @@ This document describes how it works, section by section.
   they are unregistered and `GET`/`POST /stats` fall through to the
   catch-all `40400` (§2.2) like any other unused surface, so a plain
   deployment never exposes routes it doesn't need. The sandbox
-  provisioner (§15) enables it for every child, since SDK compat suites
+  provisioner (§17) enables it for every child, since SDK compat suites
   rely on it.
 - Hard durability or HA guarantees beyond what the chosen database provides.
 - Backwards compatibility with arbitrary historical Ably protocol versions —
   we target v2 and later.
-- Realtime transports other than WebSocket. Comet/HTTP-streaming and SSE
-  are restricted-network fallbacks that do not apply to a local dev server
-  or a deployment inside the operator's own network; SDKs use WebSocket.
 - Token revocation. Revocable tokens presuppose per-token server-side
   state the single-app model does not keep.
 - A channel lifecycle/status REST endpoint (occupancy, metadata) — Ably-cloud-only
+  product surface. Occupancy itself **is** tracked and served over the realtime
+  connection (§16); what is out of scope is the REST surface for reading it.
   product surface.
 - Filtered/derived-channel subscriptions — Ably-cloud-only product surface.
 
@@ -109,6 +110,16 @@ Supported `Action` values:
 | `SYNC` (16) | | ✓ | presence set sync after attach (see §12) |
 | `ANNOTATION` (21) | ✓ | ✓ | annotation publish + delivery (see §14) |
 | `AUTH` (17) | ✓ | ✓ | inband re-auth: the server prompts near token expiry; the client supplies a fresh token (see §3) |
+
+A connection can also be reached over the protocol's two HTTP transports:
+comet, the SDK's polling fallback (`/comet/connect`, then
+`/comet/{connectionKey}/recv`, `/send`, `/close` and `/disconnect`), and SSE
+(`/sse`). Both carry the same `ProtocolMessage`s as the WebSocket and come from
+the same shared module, so what a client may say and be told does not depend on
+which one it reaches the connection through — only the framing differs. Serving
+them is what lets an SDK's own fallback work: without the routes an SDK that
+cannot open a WebSocket got a `404` and gave up. The ably-js suite runs its
+realtime tests over comet as well as WebSocket, and both sets pass.
 
 ### 2.2 REST
 
@@ -245,16 +256,20 @@ modes are deliberately distinct so the SDK reacts correctly:
   and two differing concrete qualifiers do not intersect.
 - `<op>` is one of `publish`, `subscribe`, `presence`, `history`,
   `stats`, `annotation-publish`, `annotation-subscribe`,
+  `object-publish`, `object-subscribe`,
   `message-update-own`, `message-update-any`,
   `message-delete-own`, `message-delete-any`. `*` matches any op.
   The `annotation-*` ops gate annotations (§14): publishing one, and
   receiving the raw `ANNOTATION` stream (summaries need only
-  `subscribe`).
+  `subscribe`). The `object-*` ops gate LiveObjects (§15): publishing an
+  operation, and receiving `STATE` frames plus the post-attach sync.
   `stats` gates the `/stats` stub (§1) and is app-wide rather than
   per-channel, so it must be granted on the `*` resource.
-  `subscribe` covers both
-  receiving messages and receiving presence (events + sync + the current
-  set); `presence` covers registering presence (enter/update/leave);
+  `subscribe` covers every kind of receiving —
+  messages, presence (events + sync + the current set), and LiveObjects
+  (`STATE` frames + the state sync) — so `object-subscribe` is only needed
+  to grant objects *without* granting messages and presence;
+  `presence` covers registering presence (enter/update/leave);
   `history` covers message history, message version history, and
   presence history. The `message-{update,delete}-{own,any}` ops gate
   mutable messages (§13.5): `-own` permits the operation only when the
@@ -279,6 +294,9 @@ operation is rejected:
 | WS `ATTACH` flag `ANNOTATION_PUBLISH` | `annotation-publish` |
 | WS `ATTACH` flag `ANNOTATION_SUBSCRIBE` | `annotation-subscribe` |
 | WS inbound `ANNOTATION` | `annotation-publish` (and the attachment must hold the `ANNOTATION_PUBLISH` mode flag) |
+| WS `ATTACH` flag `OBJECT_PUBLISH` | `object-publish` |
+| WS `ATTACH` flag `OBJECT_SUBSCRIBE` | `object-subscribe` or `subscribe` |
+| WS inbound `STATE` | `object-publish` (and the attachment must hold the `OBJECT_PUBLISH` mode flag) |
 | REST `POST .../messages` | `publish` |
 | REST `PATCH .../messages/{serial}` | `message-{update,delete}-{own,any}` (see §13.5) |
 | REST `GET .../messages`, `GET .../messages/{serial}[/versions]` | `history` |
@@ -507,12 +525,16 @@ constants:
 | `PRESENCE_SUBSCRIBE` | `1 << 19` | receive `PRESENCE` + presence sync |
 | `ANNOTATION_PUBLISH` | `1 << 21` | publish `ANNOTATION` (see §14) |
 | `ANNOTATION_SUBSCRIBE` | `1 << 22` | receive raw `ANNOTATION` frames (see §14.3) |
+| `OBJECT_SUBSCRIBE` | `1 << 24` | receive `STATE` frames + the state sync (see §15) |
+| `OBJECT_PUBLISH` | `1 << 25` | publish `STATE` (see §15.2) |
 
 If `flags` carries no mode bits the server treats it as the default set —
 `PRESENCE`, `PUBLISH`, `SUBSCRIBE`, `PRESENCE_SUBSCRIBE`, and
 `ANNOTATION_PUBLISH` (matching the reference's `MODE_DEFAULT` and the SDK's
-expected default `channel.modes`). Only `ANNOTATION_SUBSCRIBE` is opt-in —
-raw annotation delivery must be requested explicitly (§14.3).
+expected default `channel.modes`). `ANNOTATION_SUBSCRIBE` and the two
+`OBJECT_*` modes are opt-in — raw annotation delivery must be requested
+explicitly (§14.3), and a client that does not use LiveObjects should not
+be sent a state sync it will discard (§15.3).
 
 The effective mode set is `requested ∩ capability-permitted`, where the
 permitted set is derived from the per-op capability mapping in §3:
@@ -523,6 +545,9 @@ permitted set is derived from the per-op capability mapping in §3:
 - `PRESENCE` permitted iff cap grants `presence`.
 - `ANNOTATION_PUBLISH` / `ANNOTATION_SUBSCRIBE` permitted iff cap grants
   `annotation-publish` / `annotation-subscribe`.
+- `OBJECT_PUBLISH` permitted iff cap grants `object-publish`;
+  `OBJECT_SUBSCRIBE` iff cap grants `object-subscribe` **or** `subscribe`
+  (which covers every kind of receiving, §3.1).
 
 Empty intersection → the attach is rejected with `ERROR` (`code: 40160`)
 and no channel state is created. Otherwise `ATTACHED.flags` carries the
@@ -535,6 +560,8 @@ effective set, plus the status flags:
   it as `ChannelStateChange.hasBacklog` (RTL2i); it is cleared on a fresh
   attach that replayed nothing.
 - `RESUMED` (`1 << 2`) — see §4.3.
+- `HAS_STATE` (`1 << 7`) when the attachment holds `OBJECT_SUBSCRIBE`, so
+  the SDK knows a `STATE_SYNC` will follow (§15.3).
 
 When the modes were requested via the `modes` param, the
 effective set is also echoed back in `ATTACHED.params.modes` (§4.1).
@@ -547,6 +574,10 @@ Once attached, modes gate frame flow:
 - Inbound `MESSAGE` from an attachment without `PUBLISH` is rejected with
   `NACK`.
 - Inbound `PRESENCE` from an attachment without `PRESENCE` is rejected
+  with `NACK`.
+- An attachment without `OBJECT_SUBSCRIBE` receives neither live `STATE`
+  frames nor the post-attach `STATE_SYNC`.
+- Inbound `STATE` from an attachment without `OBJECT_PUBLISH` is rejected
   with `NACK`.
 
 ### 4.3 Replay (`channelSerial` and `rewind`)
@@ -686,7 +717,7 @@ Major packages:
 ```
 cmd/ably-server/        # main, flag/env wiring
 cmd/ably-bench/         # pub/sub load benchmark
-cmd/ably-local-sandbox/       # disposable-instance provisioner for SDK test suites (§15)
+cmd/ably-local-sandbox/       # disposable-instance provisioner for SDK test suites (§17)
 cmd/compat-gate/        # known-failures gate for the SDK compatibility harnesses
 internal/protocol/      # wire types + json/msgpack codec; presence and mutable-message types
 internal/auth/          # API-key parsing + Basic auth
@@ -816,8 +847,9 @@ exposing two operations:
 - `History(ctx, query)` — bounded forward range scan ordered by
   channelSerial; backs both the REST history endpoint and attachment
   resume gap-fills (§4.3). Messages and presence share one stream and
-  one channelSerial namespace (§12.1), so the query carries a kind
-  selector: a message-history scan skips presence cms and vice versa.
+  one channelSerial namespace (§12.1) — as do annotations (§14) and
+  LiveObjects operations (§15) — so the query carries a kind selector: a
+  message-history scan skips the other kinds' cms and vice versa.
 - `StorePresence(ctx, presence)` — the presence analogue of `Store`
   (§12.2): mints a channelSerial, stamps each `PresenceMessage.serial`,
   persists the presence cm onto the same stream, and in the same atomic
@@ -829,6 +861,23 @@ exposing two operations:
   REST `GET .../presence` endpoint. The set is owned by the backend
   (§12.5): a map in memory, in-memory in bbolt, a `presence` table in
   Postgres.
+- `StoreState(ctx, state, apply)` — the LiveObjects analogue of
+  `StorePresence` (§15.2): mints a channelSerial, stamps each
+  `StateMessage.serial`, persists the state cm onto the same stream, and
+  in the same atomic step applies the operations to the channel's
+  **object set** via the caller-supplied `apply` (which is where the
+  protocol's object semantics live, §15.2).
+- `Objects(ctx, query)` — returns one page of the object set ordered by
+  object id, plus the channelSerial it is current as-of; backs the state
+  sync (§15.3). The set is owned by the backend: a map in memory, an
+  `objects` bucket in bbolt, a `state_objects` table in Postgres.
+- `StoreOccupancy(ctx, counts)` / `Occupancy(ctx)` — what this node
+  contributes to the channel's occupancy, and the sum across nodes that
+  makes up the channel's own (§16.2). The
+  contributions are owned by the backend: a value in memory for memory and
+  bbolt, a `channel_occupancy` table in Postgres where the sum happens in
+  SQL. Unlike every other facet here, occupancy is not on the channel's
+  stream at all — nothing is published to make a channel occupied.
 - `Store` also handles **mutations** (§13): an `update`/`delete`/`append`
   is a publish whose Message carries an `action` and a target `serial`.
   The backend validates the target exists within retention, applies the
@@ -851,7 +900,9 @@ Each `ChannelStore` is created with an `Appender` callback —
 `Storage.Channel(name, appender) ChannelStore`. The Appender is the
 single delivery path for committed cms: the backend invokes
 `appender.Append(cm)` on every fresh publish (skipped on idempotent
-returns, where the original was delivered when first persisted).
+returns, where the original was delivered when first persisted). It
+carries one thing besides cms: `appender.OccupancyChanged()` says the
+channel's aggregate occupancy is worth re-reading (§16.4).
 Memory and bbolt fire it synchronously after commit. Postgres fires
 it asynchronously from the LISTEN goroutine after the NOTIFY emitted
 inside the commit tx round-trips — including for the publisher's own
@@ -897,13 +948,14 @@ Layout — channel-scoped buckets via composite keys:
   trimmed by the same retention sweep. (Unlike the presence membership
   set, these are durable — they are message state, not connection-scoped.)
 
-Per-process `seriesId` is regenerated on every `Open` and generator
-monotonic state is not persisted. The §8 serial format makes
-post-restart monotonicity fall out naturally: the 14-character
-zero-padded ms timestamp is the leading lex-comparison key, and wall
-clock advances between restarts, so a post-restart Mint sorts after
-all prior serials. The same-millisecond restart with an unlucky new
-seriesId is the only edge case we don't guarantee, and we don't.
+A channel's serial state survives a restart. On first materialisation
+after `Open`, the channel's generator takes its `seriesId` from the
+persisted `initials` entry and resumes its monotonic state from the
+last persisted cm, so the next Mint continues the same series strictly
+after the last one on the log. Both halves matter: the series because a
+change of it tells clients the channel's ordering restarted (§8), and
+the monotonic state because a restart inside the same millisecond would
+otherwise re-mint a serial already on the log.
 
 Retention is enforced by a background sweep goroutine that, per
 channel, walks the ordered `channel_messages` keys from oldest forward and
@@ -939,7 +991,7 @@ CREATE TABLE channel_messages (
   channel_serial TEXT     NOT NULL,    -- "<ts>-<ctr>@<series>" (§8) — this cm's position
   idx            INT      NOT NULL,    -- position within the publish batch
   id             TEXT,                 -- nullable, client-supplied idempotency key
-  kind           TEXT     NOT NULL DEFAULT 'message',  -- 'message' | 'presence' (§12.1) | 'annotation' (§14)
+  kind           TEXT     NOT NULL DEFAULT 'message',  -- 'message' | 'presence' (§12.1) | 'annotation' (§14) | 'state' (§15)
   message_serial TEXT,                 -- message identity (§8); NULL for presence; = channel_serial:idx for a create
   payload        BYTEA    NOT NULL,    -- msgpack protocol.Message or PresenceMessage, per kind
   PRIMARY KEY (channel, channel_serial, idx)
@@ -1025,9 +1077,10 @@ that introduces a new migration file.
 Per-publish writes run inside a transaction that takes a per-channel
 advisory lock (`pg_advisory_xact_lock(hashtext(channel))`), so
 concurrent writers serialise per channel without contending across
-channels. Each node generates its own seriesId at process start; the
-serial format itself (the `@seriesId` suffix) disambiguates concurrent
-mints, so generator state is not shared across nodes.
+channels. A node's own seriesId seeds only the channels it is the first
+to materialise; every later mint reads the series back out of the
+channels row, so a channel keeps one series however many nodes publish
+to it (§8).
 
 Retention is a periodic background job that deletes the oldest log rows
 on each channel using the channelSerial range — the first 14 characters
@@ -1114,13 +1167,12 @@ Notifications for channels that have never been opened on this node
 canonical cm remains in storage and is picked up by the eventual
 `ATTACH` via the history-replay path (§4.3).
 
-The serial's format is itself the global ordering: the `<seriesId>`
-suffix disambiguates serials minted in the same millisecond by
-different processes, so storage's `ORDER BY channel_serial` reflects
-a single global publish order without a central sequence. Local
-linked-list arrival order on a given node approximates this but may
-have small inversions under cross-node interleavings — canonical
-order is the storage scan.
+The serial is itself the ordering: every mint on a channel advances
+that channel's row under its lock, so no two nodes can produce the same
+serial and storage's `ORDER BY channel_serial` is the publish order
+without a central sequence. Local linked-list arrival order on a given
+node approximates this but may have small inversions under cross-node
+interleavings — canonical order is the storage scan.
 
 NOTIFY's 8KB payload limit is why we send pointers `(channel,
 serial)` rather than full payloads. PG delivers notifications
@@ -1238,9 +1290,28 @@ should use Ably or fork.
   - `counter` — zero-padded 3-digit per-`(timestamp, seriesId)` counter,
     incremented when multiple serials are minted within the same
     millisecond. Resets to `000` when the timestamp advances.
-  - `seriesId` — a fixed-length random string generated at process
-    start; disambiguates serials minted in the same millisecond on
-    different nodes in cluster mode.
+  - `seriesId` — a fixed-length string identifying the channel's series,
+    minted once when the channel is first materialised and carried by
+    every serial on it thereafter. It begins with the three-character
+    **site code** and continues with random hex.
+
+  The site-code prefix is not decoration. The protocol reads a serial's
+  site as the first three characters of its series, and a LiveObjects
+  client keys its per-site view of an object's history by it (§15.1) —
+  so the site has to be recoverable from any serial, and the code this
+  server reports in `CONNECTED.connectionDetails.siteCode` has to be
+  that same string. `internal/serial.SiteCode` is the one definition
+  both read from.
+
+  The seriesId is the channel's, not the minting process's. A client
+  reads a change of it as the channel having restarted its ordering —
+  serials before it are not comparable with the ones after — so it must
+  hold across a process restart and across a handover to another node,
+  both of which leave the channel's log intact. Persisting it is each
+  backend's job: Postgres keeps it in the `channels` row (inside
+  `channel_serial`, so no separate column), bbolt in the `initials`
+  bucket, and the memory backend has nothing to keep it across because
+  nothing survives the process.
 
   channelSerials are the discrete attach/resume points in a channel's
   stream. On `ATTACHED` the wire field carries the confirmed attach
@@ -1341,7 +1412,7 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 `--addr-file` writes the listener's resolved `host:port` to the given path
 once the bind succeeds, then keeps running. It exists so a parent process
 that started the server on `--listen 127.0.0.1:0` can discover the
-ephemeral port the OS assigned — the sandbox provisioner (§15) relies on
+ephemeral port the OS assigned — the sandbox provisioner (§17) relies on
 it. The write is atomic (a sibling temp file renamed into place), so a
 reader polling the path never sees a partial address.
 
@@ -1374,11 +1445,29 @@ the server boots with is visible in one file, structured like the Ably
 *test-app-setup* `post_apps` shape (the sandbox provisioner translates
 that JSON into this config rather than the server parsing it):
 
-- `[[namespaces]]` — a namespace `id` plus the `persisted`,
-  `mutableMessages`, and `pushEnabled` feature flags. These are **parsed
-  and recorded but behaviourally inert**: no behaviour keys off them yet;
-  they exist so a provisioner can round-trip the full app shape. A
-  namespace with no `id` is a startup error.
+- `[[namespaces]]` — a namespace `id` plus an optional `mode` and the
+  `persisted`, `mutableMessages`, and `pushEnabled` feature flags. A
+  channel takes the flags of the namespace that selects it: a name in a
+  `mutableMessages` namespace may have its messages edited, one outside
+  every namespace gets the defaults. `pushEnabled` is recorded but inert,
+  this server serving no push.
+
+  `mode` decides how `id` selects channels. Omitted, `id` is one channel
+  name segment and selects every channel whose first segment is that id.
+  `mode = "matcher"` makes `id` a match expression in its own right, with
+  the same segment semantics as a capability resource: a non-trailing `*`
+  matches one segment, a trailing `*` one or more. Where several
+  namespaces select one channel the most specific wins, read left to
+  right — `chat:*` beats `*:room`. The mapping is the shared protocol
+  code's, so a channel is told the same thing about itself here as on
+  Ably.
+
+  A namespace with no `id`, or a `mode` other than `matcher`, is a
+  startup error. An unrecognised mode is refused rather than ignored
+  because the protocol code reads any mode it does not know as the
+  default one, so `mode = "matchers"` would otherwise start a server
+  quietly applying the rule to a different set of channels than the one
+  written down.
 - `[[channels]]` — a channel `name` plus nested `[[channels.presence]]`
   member entries (`clientId`, `data`, `encoding`). At startup, before the
   listener opens, each member is entered through the normal
@@ -1395,6 +1484,11 @@ that JSON into this config rather than the server parsing it):
 [[namespaces]]
 id = "persisted"
 persisted = true
+
+[[namespaces]]
+id = "*:edits"
+mode = "matcher"
+mutableMessages = true
 
 [[channels]]
 name = "persisted:presence_fixtures"
@@ -1486,8 +1580,8 @@ A presence operation is a publish like any other: it lands on the
 channel as one ChannelMessage and flows through the unified
 `storage → Appender.Append` path (§7). The only difference is the
 payload — a ChannelMessage carries exactly one of `Messages` (a data
-publish), `Presence` (a presence publish), or `Annotations` (an
-annotation publish, §14):
+publish), `Presence` (a presence publish), `Annotations` (an annotation
+publish, §14), or `State` (a LiveObjects publish, §15):
 
 ```go
 type PresenceMessage struct {
@@ -1847,10 +1941,11 @@ set:
   wins. Paginated with the same `Link` convention as message history
   (§2.2). It is also what an update / delete consults
   to validate and merge against its target. Appends are the exception to
-  "every version": the log keeps each append cm for live and resume
-  fan-out, but the versions read-path collapses a run of appends to its
-  aggregate, so a streamed append shows as one evolving version rather
-  than one entry per delta (§13.3).
+  "every version": an append is not a version of the message (§13.3), so
+  it never joins the chain. The log keeps each append cm for live and
+  resume fan-out, and what the message currently says carries the
+  aggregate — so a streamed append leaves the chain as it was rather than
+  adding an entry per increment.
 
 Live and resume delivery are **not** collapsed: a fresh subscriber, and a
 resuming one replaying the gap (§4.3), receive the raw version cms in
@@ -2015,7 +2110,384 @@ annotation, WS or REST) and `annotation-subscribe` (receive raw
 `ANNOTATION` frames). Summaries require only `subscribe` — they are
 message deliveries. Reading annotations via REST requires `history`.
 
-## 15. Sandbox provisioner
+## 15. LiveObjects
+
+LiveObjects gives a channel a set of shared, mutable **objects** — maps
+and counters — that every attached client converges on. A client changes
+one by publishing an **operation**; the server orders it, applies it, and
+fans it out. It is modelled the way presence is: a fourth kind of message
+riding the channel's existing stream, plus a derived set the server
+materialises so a late-arriving client can be brought up to date without
+replaying the whole stream.
+
+What the objects mean — how an operation changes one, how two concurrent
+changes to the same key are resolved — is not this server's to decide. It
+is the protocol's, and it is implemented in the shared module
+(`state/liveobject`, `state/liveslice`). This server's part
+is the two things that module asks a server for: take the publish, and
+serve the set.
+
+### 15.1 Model
+
+An object is identified by an **object id** of the form
+`<type>:<hash>@<msTimestamp>`, where the hash covers the operation's
+initial value and a client-supplied nonce. The client derives the id and
+the server checks it, so the object that a create names is the object that
+create makes; the timestamp must fall inside a recency window, which is
+what stops a client replaying an old create against an id that has since
+been reused. Every channel additionally has a **root** map, `root`, which
+is the only object reachable by name — everything else is reached by being
+referenced from it, directly or through another map.
+
+A publish carries one or more StateMessages, each holding one operation:
+
+```go
+type StateMessage struct {
+    ID           string           // "<channelMessageId>:<idx>" or client-supplied (§8)
+    Serial       *Timeserial      // server-assigned, "<channelSerial>:<idx>"
+    SiteCode     string           // the site the operation originated at
+    ClientID     string
+    ConnectionID string
+    Operation    *StateOperation  // what to do: MAP_CREATE, MAP_SET, COUNTER_INC, …
+    Object       *StateObject     // server→client only: an object, on a sync
+}
+```
+
+`Serial` is the whole of how operations are ordered, and it is the
+server's to assign. Each object records the latest serial it has seen
+from each site, and applies an operation only if its serial is strictly
+after that — so an operation that arrives twice, or out of order behind
+one that superseded it, changes nothing. A client may not set it: an
+operation whose order was the publisher's to choose would let one client
+overwrite another's later change.
+
+`SiteCode` is what that per-site record is keyed by, and it has to agree
+in three places or the scheme silently breaks:
+
+- on a state message, where the server stamps it from the serial;
+- in an object's `siteTimeserials`, which a sync sends to the client;
+- in `CONNECTED.connectionDetails.siteCode`.
+
+The third is the one that is easy to miss. A client may apply its own
+operation optimistically when the `ACK` arrives, and an `ACK` carries a
+serial but no site code — so the client keys that apply by the site code
+it was given when it connected. If that disagrees with the one on the
+echo that follows, the echo lands in a different site's bucket, passes
+the newness check, and the client applies its own operation a second
+time. A counter incremented by one goes up by two.
+
+This server therefore derives all three from one constant
+(`internal/serial.SiteCode`, §8), which every seriesId begins with.
+
+A message carries exactly one of `Operation` or `Object`. Clients only
+ever send operations; objects only ever travel server→client, on a sync
+(§15.3).
+
+Objects share **one ordered stream and one channelSerial namespace** with
+messages, presence and annotations (§12.1), as a fourth cm kind (`kind =
+state`). A message-history scan skips state cms exactly as it skips
+presence, and vice versa — so a client reading a channel's history gets
+what was published to the channel, not the operations on its objects.
+
+### 15.2 Publishing operations
+
+An inbound `STATE` frame carries `state[]` of StateMessages plus a
+`msgSerial` for flow control. Before it reaches this server, the shared
+module has validated each operation, checked the object id against the
+operation it claims to derive from, cleared the initial value the id was
+derived from, and normalised the operation to the encoding the connection
+speaks. The connection then:
+
+1. Authorises — the attachment must hold the `OBJECT_PUBLISH` mode flag,
+   which required the `object-publish` capability at attach time (§3.1);
+   otherwise `NACK`.
+2. Stamps `connectionId`, and each op's `id` (`<channelMessageId>:<idx>`)
+   where the client sent none — the id is both what the `ACK` names the
+   operation by and what the per-channel idempotency index keys off, so an
+   unstamped operation would dedupe against nothing.
+3. Calls `channel.StoreState(ctx, state, apply)`, which mints the
+   channelSerial, stamps each `StateMessage.serial`, persists the state cm
+   onto the stream, applies the operations to the channel's **object set**
+   (§15.3), and — via the Appender — links it onto the live list.
+4. Replies `ACK` / `NACK` on the `msgSerial`, exactly as for a data
+   publish (§5.2). The `ACK` carries the serial each operation was given,
+   which is what an SDK waits for before treating its own change as
+   applied.
+
+`apply` is the seam the module's semantics plug into, the same arrangement
+as the merge for a mutation (§13.2) and the fold for an annotation
+(§14.2): storage runs it, with the objects loaded and the write not yet
+made, but what an operation *does* is not storage's business. It is given
+the objects the publish names and the stamped messages, and returns the
+objects that came out changed, which the backend writes back in the same
+atomic step as the log insert. An operation only ever changes the object
+it names, so those are the only objects a backend loads.
+
+Subscribers with `OBJECT_SUBSCRIBE` observe the operation as an outbound
+`STATE` frame delivered by their attachment cursor, identically to how
+`MESSAGE` frames are delivered (§4.4).
+
+### 15.3 The object set & sync
+
+The **object set** is the fold of the state stream: the objects as the
+operations have left them. The server materialises it (rather than
+re-deriving it from history on every read) so that a client attaching can
+be sent the current objects directly.
+
+It is the objects analogue of the presence membership set (§12.5), and is
+owned by the backend the same way — a map in memory, an `objects` bucket
+in bbolt, a `state_objects` table in Postgres. It differs from presence in
+two ways:
+
+- It **is** persisted by the disk backend. A presence member belongs to a
+  connection, and no connection survives a restart, so an empty set on
+  open is the correct answer; an object belongs to the channel and
+  outlives every connection that touched it, so dropping it would lose
+  state no client can re-establish.
+- It has no liveness lease and no reaper. There is nothing to collect: an
+  object stops existing only when an operation says so — a tombstone,
+  which is a value in the set, not the absence of one.
+
+`Objects(ctx, query)` returns one page of the set ordered by object id,
+plus the channelSerial it is current as-of. Object-id order is the order
+the protocol's own paging walks the set in, and the sync cursor a client
+resumes from is an object id, so the page needs no ordering of its own.
+
+On attach, an attachment holding `OBJECT_SUBSCRIBE` is sent a state sync:
+the shared module's state cache pages the set through this read, converts
+it to `STATE_SYNC` frames, and keeps itself current from the live stream
+thereafter. A sync must include everything up to the attach point it is
+consistent with. On this server it cannot fail to: the set is updated in
+the same write as the operation that changed it, and any serial a caller
+can be holding is one that write has already committed — in
+single-process modes because the cm reaches the live list only after the
+store returns, and in cluster mode because the `NOTIFY` that carries it is
+sent inside the same transaction. So the set is never behind the serial a
+sync is asked to be consistent with.
+
+Because the sync is unconditional on attach, a resume does not need to
+replay state cms: a reattaching client is sent the whole set regardless of
+whether its gap was filled. This is why the resume gap replay (§4.3), a
+`kind = message` history scan, skips state cms exactly as it skips
+presence.
+
+> **Not implemented.** There is no **REST** LiveObjects surface: objects are
+> published and read over the realtime connection only. The shared module
+> declares no REST route for them (unlike messages, presence and
+> annotations), so this would be a surface written here rather than one
+> wired up — see the backlog.
+
+> **Not implemented.** Object **garbage collection** — the sweep that
+> tombstones objects no longer reachable from the root, and the
+> `OBJECT_DELETE` / `MAP_CLEAR` operations that only the server issues —
+> is not implemented. An object detached from the root stays in the set.
+> Nothing a client can do is refused because of it; what it costs is that
+> a channel's set grows monotonically, so it is a retention question of
+> the same shape as the one §6 leaves open, and is deferred to the same
+> place.
+
+### 15.4 Capabilities
+
+Two ops extend §3.1, matching Ably: `object-publish` (publish an
+operation) and `object-subscribe` (receive `STATE` frames and the
+post-attach sync).
+
+`object-publish` is not covered by `publish` — an object operation is a
+change to shared state rather than a message, so the right to make one is
+granted separately. `object-subscribe` *is* covered by `subscribe`, which
+grants every kind of receiving (§3.1); it exists so objects can be granted
+on their own, to a client that may not read the channel's messages or
+presence.
+
+## 16. Occupancy
+
+Occupancy is how many clients are attached to a channel and in what
+capacity: how many are subscribed, how many may publish, how many are
+present. It is the one piece of channel state that is not derived from
+anything on the channel's stream — nothing is published to make a
+channel occupied — so it is built from what each node observes of its
+own attachments and summed across the server.
+
+Clients read it two ways: an attachment may watch it live (the
+`occupancy` channel param, §16.4), and the server itself consults it
+when pricing what an app-wide limit refused.
+
+### 16.1 Model
+
+The shared module reports each attachment's contribution as it comes and
+goes — one add on attach, one remove on detach, one update when a mode
+change alters what the attachment may do — and leaves the rest to the
+server. What it hands over is `channel.OccupancyCounts`, which is not
+merely a counter: it reports which **modes** went from unoccupied to
+occupied, or the reverse. That distinction drives the whole reporting
+policy (§16.3).
+
+A channel's occupancy is a `ChannelOccupancy`:
+
+```go
+type ChannelOccupancy struct {
+    ChannelMode         int32 // union of the modes some holder occupies
+    Connections         int32 // holders, whatever their mode
+    Publishers          int32
+    Subscribers         int32
+    PresenceConnections int32
+    PresenceMembers     int32 // the membership set's size, not a holder count
+    PresenceSubscribers int32
+    ObjectSubscribers   int32
+    ObjectPublishers    int32
+}
+```
+
+Every field but `PresenceMembers` counts *holders*: attachments this
+server is serving. `PresenceMembers` counts the channel's presence set
+(§12.5) — members, not attachments — and is the one metric that is
+already global before any summing.
+
+`GloballyInSync` is left false. It reports cross-region convergence,
+which a single-region server has no claim to make either way.
+
+### 16.2 Per-node contributions & the aggregate
+
+A channel's occupancy is a single, node-independent thing: nine
+subscribers is nine subscribers, whichever nodes they are connected to.
+Storage nonetheless holds one **contribution** per (channel, node), and
+the channel's occupancy is their sum. Two reasons, and the second is the
+load-bearing one:
+
+- No node can observe the whole of it. A node knows its own attachments
+  and nothing else, so a global number has to be assembled from parts.
+- A count has no identity, so a bare global counter could not survive a
+  node dying. If storage held one `subscribers` total that nodes
+  incremented and decremented, a node that died holding three of them
+  would leave the total three too high for good — there is no way to
+  subtract a share that was never recorded as anyone's. Attributing each
+  share to its owner is what lets the reaper (below) remove exactly what
+  the dead node contributed.
+
+This is where occupancy differs from presence, which needs no such
+attribution: a presence member is globally *identified*
+(`connectionId:clientId`), so the set is a union rather than a sum and a
+dead node's members can be picked out and removed one by one.
+
+- `StoreOccupancy(ctx, counts)` — records what this node currently
+  serves. `counts` is the whole contribution, not a delta, so a store
+  that is lost costs nothing the next one does not repair. That is what
+  lets several changes be rolled into one write (§16.3). A contribution
+  of nothing removes the node rather than storing zeros, so a channel
+  nobody is attached to on any node has no rows at all.
+- `Occupancy(ctx)` — the contributions summed, with `channelMode` the
+  union of theirs (a mode is occupied if any node has a holder of it),
+  plus `presenceMembers` read off the presence set.
+
+The set of contributions is owned by the backend: a value in memory for
+the memory and bbolt backends, a `channel_occupancy` table in Postgres
+where the sum happens in SQL. Like the presence set and unlike the
+LiveObjects set (§15.3), it is **not** persisted by the disk backend:
+occupancy is who is attached right now, and nothing is attached to a
+process that has just started.
+
+In cluster mode a contribution carries the same liveness lease presence
+does (§12.5), for a sharper reason. A node that dies without tearing
+down cannot zero its own contribution, and nothing else on the channel
+would ever correct it — unlike a stale presence member, whose channel at
+least keeps moving. The owning node bumps the lease on the same tick it
+bumps its presence rows, the reaper deletes lapsed contributions, and
+the aggregate excludes them meanwhile, so an overcount is bounded by one
+lease window even before the sweep.
+
+### 16.3 Reporting: immediate on a mode change, otherwise rolled up
+
+A busy channel's occupancy changes with every attach and detach. A
+client watching it wants to know roughly how many are there — not to be
+woken by each arrival — so reports are **rolled up to at most one every
+5 seconds**, with one exception: a change to the channel's aggregate
+**mode** is reported at once.
+
+The exception is what makes the roll-up tolerable. Going from no
+subscribers to one, or from one to none, changes what the channel *is*;
+going from seventeen subscribers to eighteen changes only a number. So a
+client watching a channel come alive or fall empty sees it happen, and a
+client watching a busy channel gets a number that is at most five
+seconds stale.
+
+The distinction is not the server's to guess: `OccupancyCounts` reports
+which modes crossed zero as it counts, so a change is classified by the
+same code that applies it.
+
+The cadence is applied where the **write** happens, and everything
+downstream inherits it. A change that alters the aggregate mode stores
+at once; anything else waits for the next tick. Storing then signals
+every node holding the channel, which re-reads the aggregate and reports
+it to whoever is watching. So one decision governs the write rate, the
+notify rate and the rate at which clients are woken, rather than three
+throttles that could disagree.
+
+The bound this gives is **per node, not per channel**. Each node reports
+its own contribution at most once per interval, so a channel held by N
+nodes can wake a watcher up to N times per interval — and a mode change
+on any node is immediate on top of that. The staleness bound does not
+degrade (a change is still visible within one interval however many
+nodes there are), but the rate scales with the number of nodes writing.
+
+Two things keep that from being worse than it sounds. An aggregate that
+has not changed is read and discarded rather than reported (§16.4), so
+only nodes whose contribution actually moved cost a wake-up. And nodes
+tick independently, so N nodes idling cost nothing at all — the rate
+scales with how many nodes are *changing*, not with how many are
+holding. A global roll-up would need the reports coordinated across
+nodes, which is a distributed agreement this server has no reason to
+take on for a metric that is advisory by nature.
+
+Nothing is stored inline on the attaching client's path. A store is a
+write to storage — across the network in cluster mode — and the caller
+is an attachment attaching, detaching or being re-authorised; a client
+does not wait on the bookkeeping about it.
+
+### 16.4 Broadcast
+
+A node learns that a channel's occupancy moved the same way it learns
+that a message was published: from storage, through the Appender (§7).
+`Appender.OccupancyChanged` is the second thing that bridge carries.
+Occupancy is not a cm — it is not logged, ordered or replayed — but it
+is in-process channel state that storage is the first to learn about, on
+this node or another.
+
+The signal says only that the aggregate is worth re-reading, never what
+it now is. A node that learned of the change from a notification does
+not have the aggregate to hand, and by the time the notification lands
+several other nodes may have moved too.
+
+- **Single-process modes.** The store calls the Appender directly. One
+  process means the contribution is also the aggregate.
+- **Cluster mode.** The store emits
+  `pg_notify('ably_channel', '{"channel":"...","occupancy":true}')`
+  inside its transaction, so listeners only see it if the write
+  committed. Every node holding the channel — including the writer,
+  which hears its own store back rather than short-cutting to its own
+  numbers — re-reads the aggregate. That is the same single delivery
+  path a publish takes (§7.2), and it is what makes the cluster case
+  work without a second mechanism: a node learns about another node's
+  attachments exactly the way it learns about its own. Occupancy shares
+  the publish LISTEN channel because it shares its fan-out; a separate
+  one would mean a second dedicated connection and a second reconnect
+  path for a strictly rarer event.
+
+Because storage signals on every write without diffing, an aggregate
+that has not actually changed is read and discarded rather than
+reported — otherwise a lease bump or a node re-storing what it already
+stored would wake every attachment watching occupancy to tell it
+nothing.
+
+An attachment watching occupancy is served from a live value per
+**category** (the `occupancy` channel param: `metrics`,
+`metrics.connections`, `metrics.subscribers`, …), each rendering the
+aggregate as the `[meta]occupancy` message that category asks for. They
+are made on demand — there are nine and an attachment watches one — and
+a fresh one is seeded with the aggregate as it stands, so an attachment
+subscribing to a quiet channel is told its occupancy immediately rather
+than waiting for a change that may never come.
+
+## 17. Sandbox provisioner
 
 The `ably-server` binary is strictly single-app: one app's keys, one
 channel namespace. Ably's SDK test suites, however, provision a fresh app
@@ -2077,7 +2549,7 @@ that, it falls back to `go run ./cmd/ably-server` (which assumes the
 working directory is the module root, the case when the provisioner itself
 runs under `go run`).
 
-## 16. Testing strategy
+## 18. Testing strategy
 
 - **Unit**: per-package; mock-free where practical (the storage interface
   has an in-memory implementation, exercised by the same test suite as the
@@ -2092,7 +2564,7 @@ There is no existing Ably protocol conformance suite to target; the
 ably-go integration tests are the de-facto external check on SDK
 compatibility.
 
-## 17. Project layout & licensing
+## 19. Project layout & licensing
 
 - License: **Apache 2.0** (matches ably-go).
 - Module: `github.com/ably/ably-server`.

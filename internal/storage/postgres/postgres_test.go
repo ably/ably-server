@@ -4,18 +4,24 @@ package postgres_test
 
 import (
 	"context"
+	"os"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/ably-server/internal/serial"
 	"github.com/ably/ably-server/internal/storage"
 	"github.com/ably/ably-server/internal/storage/postgres"
 	"github.com/ably/ably-server/internal/storage/postgres/pgtest"
 	"github.com/ably/ably-server/internal/storage/storagetest"
+	"github.com/ably/server-protocol/go/logging"
+	"github.com/ably/server-protocol/go/wire"
 )
 
 func TestPostgresChannelStoreContract(t *testing.T) {
@@ -109,7 +115,7 @@ func TestPostgresMigrateIsConcurrentSafe(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate: %v", err)
 	}
-	want := []string{"0001_initial"}
+	want := shippedMigrations(t)
 	if !slices.Equal(versions, want) {
 		t.Errorf("schema_migrations rows = %v, want %v", versions, want)
 	}
@@ -124,6 +130,26 @@ func TestPostgresMigrateIsConcurrentSafe(t *testing.T) {
 	if _, err := conn.Exec(ctx, `SELECT 1 FROM channels LIMIT 0`); err != nil {
 		t.Errorf("channels table not present: %v", err)
 	}
+}
+
+// shippedMigrations returns the versions of the migrations in the
+// package's migrations/ directory, in the order Open applies them. Read
+// from disk rather than listed here, so shipping a migration does not
+// mean remembering to name it in a test.
+func shippedMigrations(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir("migrations")
+	if err != nil {
+		t.Fatalf("read migrations dir: %v", err)
+	}
+	var versions []string
+	for _, e := range entries {
+		if name := e.Name(); strings.HasSuffix(name, ".sql") {
+			versions = append(versions, strings.TrimSuffix(name, ".sql"))
+		}
+	}
+	slices.Sort(versions)
+	return versions
 }
 
 // TestPostgresClusterBrokerDeliversCrossNode brings up two
@@ -162,7 +188,7 @@ func TestPostgresClusterBrokerDeliversCrossNode(t *testing.T) {
 	}
 
 	// Publish via node1 only. Both nodes' appenders should observe.
-	cm, idempotent, err := ch1.Store(ctx, []*protocol.Message{{ID: "m1", Data: "hi"}})
+	cm, idempotent, err := ch1.Store(ctx, []*wire.Message{{Id: new("m1"), Data: wire.MessageStrData("hi")}})
 	if err != nil {
 		t.Fatalf("Store: %v", err)
 	}
@@ -178,10 +204,10 @@ func TestPostgresClusterBrokerDeliversCrossNode(t *testing.T) {
 	if got2.ChannelSerial != cm.ChannelSerial {
 		t.Errorf("node2 appender saw %q, want %q", got2.ChannelSerial, cm.ChannelSerial)
 	}
-	if len(got1.Messages) != 1 || got1.Messages[0].ID != "m1" {
+	if len(got1.Messages) != 1 || got1.Messages[0].GetId() != "m1" {
 		t.Errorf("node1 appender payload = %+v, want one Message with ID m1", got1.Messages)
 	}
-	if len(got2.Messages) != 1 || got2.Messages[0].ID != "m1" {
+	if len(got2.Messages) != 1 || got2.Messages[0].GetId() != "m1" {
 		t.Errorf("node2 appender payload = %+v, want one Message with ID m1", got2.Messages)
 	}
 
@@ -236,7 +262,7 @@ func TestPostgresClusterSerialsAreStrictlyMonotonic(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for range perNode {
-			cm, _, err := ch1.Store(ctx, []*protocol.Message{{Name: "x"}})
+			cm, _, err := ch1.Store(ctx, []*wire.Message{{Name: new("x")}})
 			if err != nil {
 				t.Errorf("ch1 Store: %v", err)
 				return
@@ -247,7 +273,7 @@ func TestPostgresClusterSerialsAreStrictlyMonotonic(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for range perNode {
-			cm, _, err := ch2.Store(ctx, []*protocol.Message{{Name: "y"}})
+			cm, _, err := ch2.Store(ctx, []*wire.Message{{Name: new("y")}})
 			if err != nil {
 				t.Errorf("ch2 Store: %v", err)
 				return
@@ -289,13 +315,78 @@ func TestPostgresClusterSerialsAreStrictlyMonotonic(t *testing.T) {
 	}
 }
 
-// TestPostgresClusterSummarySnapshotIsCrossNodeDeterministic verifies that
-// the annotation summary snapshot travels with the annotation cm across the
-// NOTIFY path (DESIGN.md §14.2): node2, which never computed
-// the fold, reconstructs the identical summary from the cm on its LISTEN
-// load. It also asserts the summary rides the messages projection so a read
-// on node2 returns the current summary.
-func TestPostgresClusterSummarySnapshotIsCrossNodeDeterministic(t *testing.T) {
+// TestPostgresChannelSeriesIsTheChannelsNotTheNodes publishes to one
+// channel from two nodes and asserts every serial carries the same
+// series (DESIGN.md §8).
+//
+// The series is how a server tells a client that the serials before it
+// are not ordered against the ones after it. Minting with the
+// publishing node's own series made a channel appear to restart its
+// ordering every time the node behind a publish changed — on a channel
+// nothing had happened to.
+func TestPostgresChannelSeriesIsTheChannelsNotTheNodes(t *testing.T) {
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+	ctx := context.Background()
+
+	s1, err := postgres.Open(ctx, postgres.Options{DSN: dsn})
+	if err != nil {
+		t.Fatalf("Open node1: %v", err)
+	}
+	t.Cleanup(func() { _ = s1.Close() })
+	s2, err := postgres.Open(ctx, postgres.Options{DSN: dsn})
+	if err != nil {
+		t.Fatalf("Open node2: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+
+	ch1, err := s1.Channel(ctx, "room", nil)
+	if err != nil {
+		t.Fatalf("Channel node1: %v", err)
+	}
+	ch2, err := s2.Channel(ctx, "room", nil)
+	if err != nil {
+		t.Fatalf("Channel node2: %v", err)
+	}
+
+	// Alternate the publishing node, which is what a handover looks
+	// like to the channel.
+	var serials []string
+	for i := range 6 {
+		ch := ch1
+		if i%2 == 1 {
+			ch = ch2
+		}
+		cm, _, err := ch.Store(ctx, []*wire.Message{{Name: new("x")}})
+		if err != nil {
+			t.Fatalf("publish %d: %v", i, err)
+		}
+		serials = append(serials, cm.ChannelSerial)
+	}
+
+	_, _, want, err := serial.SplitChannelSerial(serials[0])
+	if err != nil {
+		t.Fatalf("split %q: %v", serials[0], err)
+	}
+	for i, s := range serials {
+		_, _, got, err := serial.SplitChannelSerial(s)
+		if err != nil {
+			t.Fatalf("split %q: %v", s, err)
+		}
+		if got != want {
+			t.Errorf("serial %d (%q) is in series %q, want %q — the channel changed series on a node handover",
+				i, s, got, want)
+		}
+	}
+}
+
+// TestPostgresClusterSummaryIsCrossNodeDeterministic verifies that a node
+// which never computed a fold still reads the summary it produced (DESIGN.md
+// §14.2). The fold lands on the messages projection inside the same
+// transaction as the annotation write, so the summary is a fact about the
+// message in the database rather than something a node has to have witnessed
+// the history to know — node2 reads it having only ever seen the NOTIFY.
+func TestPostgresClusterSummaryIsCrossNodeDeterministic(t *testing.T) {
 	c := pgtest.Start(t)
 	dsn := c.FreshSchemaDSN(t)
 	ctx := context.Background()
@@ -324,7 +415,7 @@ func TestPostgresClusterSummarySnapshotIsCrossNodeDeterministic(t *testing.T) {
 
 	// Publish a target message via node1 and let both nodes observe it, so
 	// node2's projection has the target before the annotation lands.
-	target, _, err := ch1.Store(ctx, []*protocol.Message{{ID: "m1", Data: "post"}})
+	target, _, err := ch1.Store(ctx, []*wire.Message{{Id: new("m1"), Data: wire.MessageStrData("post")}})
 	if err != nil {
 		t.Fatalf("Store: %v", err)
 	}
@@ -333,47 +424,40 @@ func TestPostgresClusterSummarySnapshotIsCrossNodeDeterministic(t *testing.T) {
 	targetSerial := target.Messages[0].Serial
 
 	// Two annotations from distinct clients on node1: only node1 computes the
-	// fold; node2 must emit the identical snapshots off the cm.
+	// fold.
 	for _, client := range []string{"alice", "bob"} {
-		if _, _, err := ch1.StoreAnnotation(ctx, []*protocol.Annotation{{
-			Action: protocol.AnnotationCreate, ClientID: client,
+		if _, _, err := ch1.StoreAnnotation(ctx, []*wire.Annotation{{
+			Action: wire.Annotation_ANNOTATION_CREATE, ClientId: new(client),
 			Type: "reaction:distinct.v1", Name: "👍", MessageSerial: targetSerial,
-		}}); err != nil {
+		}}, core.FoldSummary(logging.Nop)); err != nil {
 			t.Fatalf("StoreAnnotation %s: %v", client, err)
 		}
 	}
 
-	// node2 receives both annotation cms; the second carries the full fold.
-	var n1last, n2last *protocol.Annotation
+	// Both nodes see both annotation cms.
 	for range 2 {
-		n1last = waitForAnnotation(t, a1, 3*time.Second)
-		n2last = waitForAnnotation(t, a2, 3*time.Second)
-	}
-	if n1last.Summary == nil || n2last.Summary == nil {
-		t.Fatalf("missing snapshot: node1=%#v node2=%#v", n1last.Summary, n2last.Summary)
-	}
-	agg := n2last.Summary["reaction:distinct.v1"]
-	if agg == nil || agg.Values["👍"] == nil || !slices.Equal(agg.Values["👍"].ClientIDs, []string{"alice", "bob"}) {
-		t.Errorf("node2 snapshot = %#v, want 👍:[alice,bob]", n2last.Summary)
-	}
-	if !slices.Equal(agg.Values["👍"].ClientIDs, n1last.Summary["reaction:distinct.v1"].Values["👍"].ClientIDs) {
-		t.Errorf("cross-node snapshot mismatch: node1=%#v node2=%#v", n1last.Summary, n2last.Summary)
+		waitForAnnotation(t, a1, 3*time.Second)
+		waitForAnnotation(t, a2, 3*time.Second)
 	}
 
-	// The projection carries the current summary for a read on node2.
-	m, err := ch2.LatestVersion(ctx, targetSerial)
-	if err != nil {
-		t.Fatalf("node2 LatestVersion: %v", err)
-	}
-	got := m.Summary["reaction:distinct.v1"]
-	if got == nil || got.Values["👍"] == nil || !slices.Equal(got.Values["👍"].ClientIDs, []string{"alice", "bob"}) {
-		t.Errorf("node2 projection summary = %#v, want 👍:[alice,bob]", m.Summary)
+	// Each node reads the same summary off the message, including the one that
+	// only ever received the NOTIFY.
+	for node, ch := range map[string]storage.ChannelStore{"node1": ch1, "node2": ch2} {
+		m, err := ch.LatestVersion(ctx, targetSerial)
+		if err != nil {
+			t.Fatalf("%s LatestVersion: %v", node, err)
+		}
+		agg := m.GetAnnotations().GetSummary()["reaction:distinct.v1"]
+		list := agg.GetDistinctV1().GetValues()["👍"]
+		if list == nil || !slices.Equal(list.ClientIds, []string{"alice", "bob"}) {
+			t.Errorf("%s summary = %#v, want 👍:[alice,bob]", node, m.GetAnnotations().GetSummary())
+		}
 	}
 }
 
 // waitForAnnotation drains the appender until an annotation cm arrives and
 // returns its first annotation.
-func waitForAnnotation(t *testing.T, a *recordingAppender, timeout time.Duration) *protocol.Annotation {
+func waitForAnnotation(t *testing.T, a *recordingAppender, timeout time.Duration) *wire.Annotation { //nolint:unparam
 	t.Helper()
 	deadline := time.After(timeout)
 	for {
@@ -399,9 +483,10 @@ func (a *recordingAppender) waitAnnotationOrMessage(t *testing.T, timeout time.D
 // recordingAppender captures every cm passed to Append, exposing
 // wait() for tests that need to synchronise on delivery.
 type recordingAppender struct {
-	mu  sync.Mutex
-	cms []*protocol.ChannelMessage
-	got chan *protocol.ChannelMessage
+	mu               sync.Mutex
+	cms              []*protocol.ChannelMessage
+	occupancyChanges int
+	got              chan *protocol.ChannelMessage
 }
 
 func newRecordingAppender() *recordingAppender {
@@ -411,6 +496,20 @@ func newRecordingAppender() *recordingAppender {
 func (a *recordingAppender) Initialize(current, initial string) {
 	// noop for this test: we only assert on Append delivery.
 	_, _ = current, initial
+}
+
+// OccupancyChanged counts the occupancy signals this node received, which is
+// how a cross-node test tells that another node's contribution reached it.
+func (a *recordingAppender) OccupancyChanged() {
+	a.mu.Lock()
+	a.occupancyChanges++
+	a.mu.Unlock()
+}
+
+func (a *recordingAppender) occupancyChangeCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.occupancyChanges
 }
 
 func (a *recordingAppender) Append(cm *protocol.ChannelMessage) {
@@ -435,4 +534,94 @@ func (a *recordingAppender) count() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return len(a.cms)
+}
+
+// TestPostgresClusterOccupancyAggregatesAcrossNodes is the cluster case
+// occupancy exists for: two nodes each serving part of a channel's
+// attachments, and either node able to answer what the whole channel holds.
+//
+// It checks both halves of that. The aggregate one node reads includes the
+// other's contribution — so the sum is genuinely across nodes and not just a
+// read of local counts — and the node that did not write is told the aggregate
+// moved, without which nothing would ever prompt it to re-read.
+func TestPostgresClusterOccupancyAggregatesAcrossNodes(t *testing.T) {
+	ctx := context.Background()
+	c := pgtest.Start(t)
+	dsn := c.FreshSchemaDSN(t)
+
+	s1, err := postgres.Open(ctx, postgres.Options{DSN: dsn})
+	if err != nil {
+		t.Fatalf("Open node1: %v", err)
+	}
+	t.Cleanup(func() { _ = s1.Close() })
+	s2, err := postgres.Open(ctx, postgres.Options{DSN: dsn})
+	if err != nil {
+		t.Fatalf("Open node2: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+
+	a1, a2 := newRecordingAppender(), newRecordingAppender()
+	ch1, err := s1.Channel(ctx, "room", a1)
+	if err != nil {
+		t.Fatalf("Channel node1: %v", err)
+	}
+	ch2, err := s2.Channel(ctx, "room", a2)
+	if err != nil {
+		t.Fatalf("Channel node2: %v", err)
+	}
+
+	// node1 serves two subscribers, node2 one publisher.
+	if err := ch1.StoreOccupancy(ctx, &wire.ChannelOccupancy{
+		ChannelMode: 1 << 18, Connections: 2, Subscribers: 2,
+	}); err != nil {
+		t.Fatalf("node1 StoreOccupancy: %v", err)
+	}
+	if err := ch2.StoreOccupancy(ctx, &wire.ChannelOccupancy{
+		ChannelMode: 1 << 17, Connections: 1, Publishers: 1,
+	}); err != nil {
+		t.Fatalf("node2 StoreOccupancy: %v", err)
+	}
+
+	// Both nodes read the same whole-channel occupancy: the counts summed and
+	// the modes unioned.
+	for node, ch := range map[string]storage.ChannelStore{"node1": ch1, "node2": ch2} {
+		occ, err := ch.Occupancy(ctx)
+		if err != nil {
+			t.Fatalf("%s Occupancy: %v", node, err)
+		}
+		if occ.GetConnections() != 3 {
+			t.Errorf("%s connections = %d, want 3 (2 on node1 + 1 on node2)", node, occ.GetConnections())
+		}
+		if occ.GetSubscribers() != 2 || occ.GetPublishers() != 1 {
+			t.Errorf("%s occupancy = %+v, want 2 subscribers and 1 publisher", node, occ)
+		}
+		if want := int32(1<<18 | 1<<17); occ.GetChannelMode() != want {
+			t.Errorf("%s channelMode = %d, want the union %d", node, occ.GetChannelMode(), want)
+		}
+	}
+
+	// And each node was told the aggregate moved — node2 by node1's write as
+	// much as by its own, since it hears every write on the channel.
+	deadline := time.Now().Add(10 * time.Second)
+	for (a1.occupancyChangeCount() < 2 || a2.occupancyChangeCount() < 2) && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := a1.occupancyChangeCount(); got < 2 {
+		t.Errorf("node1 was signalled %d times, want both writes", got)
+	}
+	if got := a2.occupancyChangeCount(); got < 2 {
+		t.Errorf("node2 was signalled %d times, want both writes", got)
+	}
+
+	// A node withdrawing takes only its own share out.
+	if err := ch1.StoreOccupancy(ctx, nil); err != nil {
+		t.Fatalf("node1 withdraw: %v", err)
+	}
+	occ, err := ch2.Occupancy(ctx)
+	if err != nil {
+		t.Fatalf("node2 Occupancy after node1 withdrew: %v", err)
+	}
+	if occ.GetConnections() != 1 || occ.GetPublishers() != 1 || occ.GetSubscribers() != 0 {
+		t.Errorf("occupancy = %+v after node1 withdrew, want node2's publisher alone", occ)
+	}
 }

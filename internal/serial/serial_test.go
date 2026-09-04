@@ -22,8 +22,24 @@ func stepClock(start int64) func() int64 {
 
 func TestNewSeriesIDLength(t *testing.T) {
 	id := NewSeriesID()
-	if len(id) != seriesIDBytes*2 {
-		t.Errorf("len = %d, want %d", len(id), seriesIDBytes*2)
+	if want := len(SiteCode) + seriesIDBytes*2; len(id) != want {
+		t.Errorf("len = %d, want %d", len(id), want)
+	}
+}
+
+// Every seriesId begins with the site code, which is what makes the site
+// readable back off any serial the series mints — and what a LiveObjects
+// client keys its per-site view of an object by.
+func TestNewSeriesIDCarriesTheSiteCode(t *testing.T) {
+	id := NewSeriesID()
+	if !strings.HasPrefix(id, SiteCode) {
+		t.Errorf("seriesId %q does not begin with the site code %q", id, SiteCode)
+	}
+	// The protocol reads the site code as the first three characters of the
+	// series (wire.Timeserial.SiteCode), so a longer one would not survive
+	// the round trip.
+	if len(SiteCode) != 3 {
+		t.Errorf("SiteCode = %q (%d chars), want 3 — the protocol reads exactly three", SiteCode, len(SiteCode))
 	}
 }
 

@@ -16,18 +16,18 @@
 -- chain).
 --
 -- is_append marks rows persisted via a streamed append (DESIGN.md
--- §13.3): an append is stored as a full action=update version
--- carrying the rolled-up aggregate, so the log stays append-only and
--- live/resume fan-out sees every append, while the version-history
--- read-path collapses a run of appends to its aggregate rather than
--- enumerate each delta.
+-- §13.3): an append is stored as a full action=update carrying the
+-- rolled-up aggregate, so the log stays append-only and live/resume
+-- fan-out sees every append — but an append is not a version of the
+-- message, so the version-history read leaves these rows out. This
+-- backend derives versions from the log, which is why the log has to
+-- say which of its rows are versions.
 --
--- summary holds the msgpack-encoded post-fold annotation-summary
--- SNAPSHOT (DESIGN.md §14.2) for a kind = 'annotation' row: the fold
--- of the target message's annotations as of that annotation. It lets
--- every node — including ones that never witnessed earlier
--- annotations — deliver the identical summary from the cm itself
--- rather than recomputing. The current summary for message reads
+-- summary is no longer written. It held a post-fold annotation-summary
+-- snapshot per kind = 'annotation' row; the summary now lives only on
+-- the messages projection, which is updated in the same transaction, so
+-- a node that never witnessed an annotation still reads the right
+-- summary. The column is dropped by a later migration. The summary for message reads
 -- lives on the messages projection payload instead; this column is
 -- purely the cross-node delivery carrier.
 
@@ -202,7 +202,7 @@ CREATE TABLE presence (
   connection_id  TEXT        NOT NULL,
   client_id      TEXT        NOT NULL,
   channel_serial TEXT        NOT NULL,  -- serial of the latest ENTER/UPDATE
-  payload        BYTEA       NOT NULL,  -- msgpack-encoded protocol.PresenceMessage
+  payload        BYTEA       NOT NULL,  -- protobuf-encoded wire.PresenceMessage
   node_id        TEXT        NOT NULL DEFAULT '',
   expires_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (channel, connection_id, client_id)
@@ -218,7 +218,7 @@ CREATE TABLE presence (
 CREATE TABLE messages (
   channel        TEXT    NOT NULL,
   message_serial TEXT    NOT NULL,  -- stable identity (== the create's Message.serial)
-  payload        BYTEA   NOT NULL,  -- msgpack-encoded latest merged protocol.Message
+  payload        BYTEA   NOT NULL,  -- protobuf-encoded latest merged wire.Message
   deleted        BOOLEAN NOT NULL DEFAULT FALSE,
   PRIMARY KEY (channel, message_serial)
 );

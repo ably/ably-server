@@ -15,12 +15,17 @@ import (
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/serial"
 	"github.com/ably/ably-server/internal/storage"
+	"github.com/ably/server-protocol/go/wire"
 )
 
 // Options configures a Storage. Zero values pick sensible defaults.
 type Options struct {
-	// SeriesID is the per-process series identifier embedded in every
-	// minted channelSerial. Empty means generate one at New time.
+	// SeriesID is the series identifier embedded in every minted
+	// channelSerial. Empty means generate one at New time.
+	//
+	// One series for the whole process is enough here: a series must
+	// stay fixed for as long as a channel's log lives (DESIGN.md §8),
+	// and nothing in this backend outlives the process that holds it.
 	SeriesID string
 
 	// Now is the clock used by every channel's serial generator.
@@ -94,16 +99,16 @@ type channelStore struct {
 	mu      sync.Mutex
 	order   []string // append-only, sorted (serials are monotonic): both kinds
 	byCS    map[string]*protocol.ChannelMessage
-	byID    map[string]string                    // Message.id / PresenceMessage.id -> channelSerial
-	members map[string]*protocol.PresenceMessage // "<connId>:<clientId>" -> latest member (DESIGN.md §12.5)
+	byID    map[string]string                // Message.id / PresenceMessage.id -> channelSerial
+	members map[string]*wire.PresenceMessage // "<connId>:<clientId>" -> latest member (DESIGN.md §12.5)
 
 	// Mutable-message derived structures (DESIGN.md §13.4), maintained
 	// under mu alongside the log. latest is the materialised projection:
 	// message identity serial -> latest merged version. versions is the
 	// serial→versions index: identity serial -> every version in version
 	// (publish) order.
-	latest   map[string]*protocol.Message
-	versions map[string][]*protocol.Message
+	latest   map[string]*wire.Message
+	versions map[string][]*wire.Message
 
 	// annotations indexes a target message identity serial to its
 	// annotations in stream (publish) order — the annotations-for-message
@@ -111,7 +116,22 @@ type channelStore struct {
 	// channel_messages serial index. The annotation cms also live on the
 	// shared log (order/byCS) so they flow to the appender and are
 	// kind-skipped by message/presence history.
-	annotations map[string][]*protocol.Annotation
+	annotations map[string][]*wire.Annotation
+
+	// objects is the materialised LiveObjects set (DESIGN.md §15.3): object
+	// id -> the object as the channel's state stream has left it. It is the
+	// objects analogue of members, maintained under mu alongside the log so a
+	// concurrent Objects observes a set consistent with it.
+	objects map[string]*wire.StateObject
+
+	// occupancy is this process's contribution to the channel's occupancy
+	// (DESIGN.md §16.2), nil when it serves no holders of the channel. This
+	// backend is one process, so the contribution is also the aggregate.
+	//
+	// It is held in memory and not persisted for the same reason the
+	// membership set is not: occupancy is what is attached right now, and
+	// nothing is attached to a process that has just started.
+	occupancy *wire.ChannelOccupancy
 }
 
 func newChannelStore(gen *serial.Generator, appender storage.Appender) *channelStore {
@@ -120,10 +140,11 @@ func newChannelStore(gen *serial.Generator, appender storage.Appender) *channelS
 		appender:    appender,
 		byCS:        make(map[string]*protocol.ChannelMessage),
 		byID:        make(map[string]string),
-		members:     make(map[string]*protocol.PresenceMessage),
-		latest:      make(map[string]*protocol.Message),
-		versions:    make(map[string][]*protocol.Message),
-		annotations: make(map[string][]*protocol.Annotation),
+		members:     make(map[string]*wire.PresenceMessage),
+		latest:      make(map[string]*wire.Message),
+		versions:    make(map[string][]*wire.Message),
+		annotations: make(map[string][]*wire.Annotation),
+		objects:     make(map[string]*wire.StateObject),
 	}
 }
 
@@ -134,7 +155,7 @@ func newChannelStore(gen *serial.Generator, appender storage.Appender) *channelS
 // the original. The appender is fired synchronously after the insert
 // for fresh publishes only; idempotent returns do not re-fire the
 // appender (the original was already delivered).
-func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
+func (cs *channelStore) Store(ctx context.Context, msgs []*wire.Message) (*protocol.ChannelMessage, bool, error) {
 	if len(msgs) == 0 {
 		return nil, false, errors.New("storage/memory: Store with no messages")
 	}
@@ -156,10 +177,10 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	// Idempotency: any contained ID that was already published on
 	// this channel makes the whole publish a duplicate.
 	for _, m := range msgs {
-		if m.ID == "" {
+		if m.GetId() == "" {
 			continue
 		}
-		if existingCS, ok := cs.byID[m.ID]; ok {
+		if existingCS, ok := cs.byID[m.GetId()]; ok {
 			return cs.byCS[existingCS], true, nil
 		}
 	}
@@ -167,7 +188,7 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	channelSerial := cs.gen.Mint()
 	for i, m := range msgs {
 		m.Serial = serial.MessageSerial(channelSerial, i)
-		m.Action = protocol.MessageCreate
+		m.Action = wire.MessageAction_MESSAGE_CREATE
 		storage.StampCreateVersion(m)
 	}
 	cm := &protocol.ChannelMessage{
@@ -179,14 +200,14 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	cs.byCS[channelSerial] = cm
 	cs.order = append(cs.order, channelSerial)
 	for _, m := range msgs {
-		if m.ID != "" {
-			cs.byID[m.ID] = channelSerial
+		if m.GetId() != "" {
+			cs.byID[m.GetId()] = channelSerial
 		}
 		// Register the create as the first version + projection entry,
 		// so mutations can resolve their target and collapsed history /
 		// single-message reads find it (DESIGN.md §13.4).
 		cs.latest[m.Serial] = m
-		cs.versions[m.Serial] = []*protocol.Message{m}
+		cs.versions[m.Serial] = []*wire.Message{m}
 	}
 
 	if cs.appender != nil {
@@ -195,13 +216,37 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	return cm, false, nil
 }
 
+// StoreSummary logs the summaries of freshly-annotated messages so they reach
+// subscribers, without recording them as versions (see storage.ChannelStore).
+func (cs *channelStore) StoreSummary(ctx context.Context, summaries []*wire.Message) (*protocol.ChannelMessage, error) {
+	if len(summaries) == 0 {
+		return nil, errors.New("storage/memory: StoreSummary with no messages")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	channelSerial := cs.gen.Mint()
+	cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Messages: summaries}
+	cs.byCS[channelSerial] = cm
+	cs.order = append(cs.order, channelSerial)
+
+	if cs.appender != nil {
+		cs.appender.Append(cm)
+	}
+	return cm, nil
+}
+
 // Mutate applies an update/delete/append to an existing message under the
 // single channel mutex, mirroring Store's idempotency + appender
 // discipline (DESIGN.md §13.2). It validates the target exists, merges,
 // mints a fresh version cm carrying the complete merged Message, and
 // updates the latest projection + versions index atomically.
-func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*protocol.ChannelMessage, bool, error) {
-	if mut == nil || !mut.Action.IsMutation() {
+func (cs *channelStore) Mutate(ctx context.Context, mut *wire.Message, merge storage.MergeFunc) (*protocol.ChannelMessage, bool, error) {
+	if mut == nil || !mut.IsMutation() {
 		return nil, false, errors.New("storage/memory: Mutate requires a mutation action")
 	}
 	if mut.Serial == "" {
@@ -214,8 +259,8 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	if mut.ID != "" {
-		if existingCS, ok := cs.byID[mut.ID]; ok {
+	if mut.GetId() != "" {
+		if existingCS, ok := cs.byID[mut.GetId()]; ok {
 			return cs.byCS[existingCS], true, nil
 		}
 	}
@@ -226,22 +271,28 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 	}
 
 	channelSerial := cs.gen.Mint()
-	version, err := storage.MergeVersion(current, mut, serial.MessageSerial(channelSerial, 0))
+	version, err := merge(current, mut, serial.MessageSerial(channelSerial, 0))
 	if err != nil {
 		return nil, false, err
 	}
 	cm := &protocol.ChannelMessage{
 		ChannelSerial: channelSerial,
-		Messages:      []*protocol.Message{version},
+		Messages:      []*wire.Message{version},
 	}
 
 	cs.byCS[channelSerial] = cm
 	cs.order = append(cs.order, channelSerial)
-	if mut.ID != "" {
-		cs.byID[mut.ID] = channelSerial
+	if mut.GetId() != "" {
+		cs.byID[mut.GetId()] = channelSerial
 	}
 	cs.latest[mut.Serial] = version
-	cs.versions[mut.Serial] = append(cs.versions[mut.Serial], version)
+	// An append is not a version of the message, so it does not join the
+	// chain (DESIGN.md §13.3): it changes what the message currently says,
+	// which the projection above records, and it stays on the log for live
+	// and resume fan-out.
+	if !version.HasAppend() {
+		cs.versions[mut.Serial] = append(cs.versions[mut.Serial], version)
+	}
 
 	if cs.appender != nil {
 		cs.appender.Append(cm)
@@ -251,7 +302,7 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 
 // LatestVersion returns the projection entry for serial, or
 // ErrTargetNotFound (DESIGN.md §13.4).
-func (cs *channelStore) LatestVersion(ctx context.Context, serial string) (*protocol.Message, error) {
+func (cs *channelStore) LatestVersion(ctx context.Context, serial string) (*wire.Message, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -278,9 +329,7 @@ func (cs *channelStore) Versions(ctx context.Context, serial string, q storage.H
 	if !ok {
 		return storage.HistoryPage{}, storage.ErrTargetNotFound
 	}
-	// Collapse append runs so history reflects the aggregate, not each
-	// delta (DESIGN.md §13.3, §13.4); the log keeps every append cm.
-	return storage.PaginateVersions(storage.CollapseAppendVersions(all), q), nil
+	return storage.PaginateVersions(all, q), nil
 }
 
 // StoreAnnotation persists an annotation publish on the same stream as
@@ -291,7 +340,7 @@ func (cs *channelStore) Versions(ctx context.Context, serial string, q storage.H
 // serial so annotations-for-message reads are O(target). Idempotency
 // shares the byID index with messages/presence. The returned cm is the
 // annotation summary-fold seam.
-func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*protocol.Annotation) (*protocol.ChannelMessage, bool, error) {
+func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*wire.Annotation, fold storage.FoldFunc) (*protocol.ChannelMessage, bool, error) {
 	if len(annotations) == 0 {
 		return nil, false, errors.New("storage/memory: StoreAnnotation with no annotations")
 	}
@@ -303,10 +352,10 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 	defer cs.mu.Unlock()
 
 	for _, a := range annotations {
-		if a.ID == "" {
+		if a.GetId() == "" {
 			continue
 		}
-		if existingCS, ok := cs.byID[a.ID]; ok {
+		if existingCS, ok := cs.byID[a.GetId()]; ok {
 			return cs.byCS[existingCS], true, nil
 		}
 	}
@@ -322,12 +371,12 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 
 	channelSerial := cs.gen.Mint()
 	for i, a := range annotations {
-		a.Serial = serial.MessageSerial(channelSerial, i)
+		a.Serial = storage.AnnotationSerial(channelSerial, i)
 		// Fold the annotation into its target's summary projection and stamp
 		// the post-fold snapshot onto the annotation for delivery (DESIGN.md
 		// §14.2). Both happen under the channel mutex, atomically with the
 		// log write, exactly like the presence membership fold.
-		cs.foldSummary(a)
+		cs.foldSummary(a, fold)
 	}
 	cm := &protocol.ChannelMessage{
 		ChannelSerial: channelSerial,
@@ -337,8 +386,8 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 	cs.byCS[channelSerial] = cm
 	cs.order = append(cs.order, channelSerial)
 	for _, a := range annotations {
-		if a.ID != "" {
-			cs.byID[a.ID] = channelSerial
+		if a.GetId() != "" {
+			cs.byID[a.GetId()] = channelSerial
 		}
 		cs.annotations[a.MessageSerial] = append(cs.annotations[a.MessageSerial], a)
 	}
@@ -350,22 +399,18 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 }
 
 // foldSummary folds one annotation into its target message's summary on the
-// latest-version projection and stamps the post-fold snapshot onto the
-// annotation for delivery (DESIGN.md §14.2). It runs under cs.mu with the
+// latest-version projection (DESIGN.md §14.2). It runs under cs.mu with the
 // target already validated to exist. The projection Message is replaced by a
-// shallow copy carrying the new summary so a reader holding the prior
-// pointer is unaffected, and the annotation's snapshot is a clone so a later
-// fold in the same batch cannot disturb it.
-func (cs *channelStore) foldSummary(a *protocol.Annotation) {
+// clone carrying the new summary, so a reader holding the prior pointer is
+// unaffected.
+func (cs *channelStore) foldSummary(a *wire.Annotation, fold storage.FoldFunc) {
 	cur := cs.latest[a.MessageSerial]
 	if cur == nil {
 		return
 	}
-	folded := cur.Summary.Apply(a)
-	updated := *cur
-	updated.Summary = folded
-	cs.latest[a.MessageSerial] = &updated
-	a.Summary = folded.Clone()
+	updated := cur.Clone()
+	fold(updated, a)
+	cs.latest[a.MessageSerial] = updated
 }
 
 // Annotations returns the annotations attached to messageSerial in stream
@@ -384,7 +429,7 @@ func (cs *channelStore) Annotations(ctx context.Context, messageSerial string, q
 // messages and folds it into the membership set, all under the single
 // channel mutex (DESIGN.md §12.2, §12.5). Idempotency shares the byID
 // index with messages.
-func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.PresenceMessage) (*protocol.ChannelMessage, bool, error) {
+func (cs *channelStore) StorePresence(ctx context.Context, presence []*wire.PresenceMessage) (*protocol.ChannelMessage, bool, error) {
 	if len(presence) == 0 {
 		return nil, false, errors.New("storage/memory: StorePresence with no messages")
 	}
@@ -396,10 +441,10 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 	defer cs.mu.Unlock()
 
 	for _, p := range presence {
-		if p.ID == "" {
+		if p.GetId() == "" {
 			continue
 		}
-		if existingCS, ok := cs.byID[p.ID]; ok {
+		if existingCS, ok := cs.byID[p.GetId()]; ok {
 			return cs.byCS[existingCS], true, nil
 		}
 	}
@@ -416,12 +461,12 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 	cs.byCS[channelSerial] = cm
 	cs.order = append(cs.order, channelSerial)
 	for _, p := range presence {
-		if p.ID != "" {
-			cs.byID[p.ID] = channelSerial
+		if p.GetId() != "" {
+			cs.byID[p.GetId()] = channelSerial
 		}
-		key := storage.MemberKey(p.ConnectionID, p.ClientID)
+		key := storage.MemberKey(p.ConnectionId, p.GetClientId())
 		switch p.Action {
-		case protocol.PresenceLeave, protocol.PresenceAbsent:
+		case wire.PresenceMessage_LEAVE, wire.PresenceMessage_ABSENT:
 			delete(cs.members, key)
 		default: // Enter, Update, Present
 			cs.members[key] = p
@@ -436,24 +481,155 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 
 // Members returns the current membership set (sorted by Serial for a
 // stable order) and the channel's current watermark as the as-of serial.
-func (cs *channelStore) Members(ctx context.Context) ([]*protocol.PresenceMessage, string, error) {
+func (cs *channelStore) Members(ctx context.Context, q storage.MembersQuery) (storage.MembersPage, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, "", err
+		return storage.MembersPage{}, err
 	}
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	out := make([]*protocol.PresenceMessage, 0, len(cs.members))
+	out := make([]*wire.PresenceMessage, 0, len(cs.members))
 	for _, p := range cs.members {
 		out = append(out, p)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Serial < out[j].Serial })
+	sort.Slice(out, func(i, j int) bool {
+		return storage.MemberKey(out[i].ConnectionId, out[i].GetClientId()) <
+			storage.MemberKey(out[j].ConnectionId, out[j].GetClientId())
+	})
 
 	var asOf string
 	if n := len(cs.order); n > 0 {
 		asOf = cs.order[n-1]
 	}
-	return out, asOf, nil
+
+	out, next := storage.PageMembers(out, q)
+	return storage.MembersPage{Members: out, AsOfSerial: asOf, NextCursor: next}, nil
+}
+
+// StoreState persists a LiveObjects publish on the same stream as messages and
+// applies its operations to the materialised object set, all under the single
+// channel mutex (DESIGN.md §15.2, §15.3). Idempotency shares the byID index
+// with messages and presence.
+//
+// The apply runs while the mutex is held, so the objects it is given cannot
+// have moved under it by the time its result is written back — the same
+// atomicity Mutate gets from holding the lock across load-merge-store.
+func (cs *channelStore) StoreState(ctx context.Context, state []*wire.StateMessage, apply storage.ApplyFunc) (*protocol.ChannelMessage, bool, error) {
+	if len(state) == 0 {
+		return nil, false, errors.New("storage/memory: StoreState with no messages")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	for _, sm := range state {
+		if sm.GetId() == "" {
+			continue
+		}
+		if existingCS, ok := cs.byID[sm.GetId()]; ok {
+			return cs.byCS[existingCS], true, nil
+		}
+	}
+
+	channelSerial := cs.gen.Mint()
+	for i, sm := range state {
+		storage.StampStateMessage(sm, channelSerial, i)
+	}
+
+	named := make([]*wire.StateObject, 0, len(state))
+	for _, id := range storage.StateObjectIDs(state) {
+		if obj, ok := cs.objects[id]; ok {
+			named = append(named, obj)
+		}
+	}
+	changed, err := apply(named, state)
+	if err != nil {
+		return nil, false, err
+	}
+
+	cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, State: state}
+	cs.byCS[channelSerial] = cm
+	cs.order = append(cs.order, channelSerial)
+	for _, sm := range state {
+		if sm.GetId() != "" {
+			cs.byID[sm.GetId()] = channelSerial
+		}
+	}
+	for _, obj := range changed {
+		cs.objects[obj.GetObjectId()] = obj
+	}
+
+	if cs.appender != nil {
+		cs.appender.Append(cm)
+	}
+	return cm, false, nil
+}
+
+// Objects returns the materialised object set (sorted by object id, which is
+// the order the protocol's own paging walks it in) and the channel's current
+// watermark as the as-of serial.
+func (cs *channelStore) Objects(ctx context.Context, q storage.ObjectsQuery) (storage.ObjectsPage, error) {
+	if err := ctx.Err(); err != nil {
+		return storage.ObjectsPage{}, err
+	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	out := make([]*wire.StateObject, 0, len(cs.objects))
+	for _, obj := range cs.objects {
+		out = append(out, obj)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].GetObjectId() < out[j].GetObjectId()
+	})
+
+	var asOf string
+	if n := len(cs.order); n > 0 {
+		asOf = cs.order[n-1]
+	}
+
+	out, next := storage.PageObjects(out, q)
+	return storage.ObjectsPage{Objects: out, AsOfSerial: asOf, NextCursor: next}, nil
+}
+
+// StoreOccupancy records this process's contribution and signals the appender,
+// which is the whole of the broadcast here: one process means the contribution
+// is the aggregate, and the only reader is on the other side of that call.
+func (cs *channelStore) StoreOccupancy(ctx context.Context, counts *wire.ChannelOccupancy) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	cs.mu.Lock()
+	if storage.OccupancyIsEmpty(counts) {
+		cs.occupancy = nil
+	} else {
+		cs.occupancy = storage.CopyOccupancy(counts)
+	}
+	cs.mu.Unlock()
+
+	if cs.appender != nil {
+		cs.appender.OccupancyChanged()
+	}
+	return nil
+}
+
+// Occupancy is this process's contribution plus the size of the membership
+// set, which is where presenceMembers comes from.
+func (cs *channelStore) Occupancy(ctx context.Context) (*wire.ChannelOccupancy, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	agg := &wire.ChannelOccupancy{}
+	storage.SumOccupancy(agg, cs.occupancy)
+	agg.PresenceMembers = int32(len(cs.members))
+	return agg, nil
 }
 
 // collapsedHistory returns the latest version of each message positioned
@@ -481,7 +657,7 @@ func (cs *channelStore) collapsedHistory(q storage.HistoryQuery) storage.History
 
 	var page storage.HistoryPage
 	count := 0
-	emit := func(m *protocol.Message) bool {
+	emit := func(m *wire.Message) bool {
 		if limit > 0 && count >= limit {
 			page.HasMore = true
 			return false
@@ -495,6 +671,7 @@ func (cs *channelStore) collapsedHistory(q storage.HistoryQuery) storage.History
 			page.ChannelMessages = append(page.ChannelMessages, current)
 		}
 		current.Messages = append(current.Messages, m)
+		page.LastSerial = m.Serial
 		count++
 		return true
 	}
@@ -597,7 +774,7 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 	// emit appends one item (a Message or a PresenceMessage, via put)
 	// onto the trailing ChannelMessage when its channelSerial matches,
 	// or a fresh entry otherwise. Returns false once Limit is reached.
-	emit := func(channelSerial string, put func(dst *protocol.ChannelMessage)) bool {
+	emit := func(channelSerial, itemSerial string, put func(dst *protocol.ChannelMessage)) bool {
 		if limit > 0 && count >= limit {
 			page.HasMore = true
 			return false
@@ -610,6 +787,7 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 			page.ChannelMessages = append(page.ChannelMessages, current)
 		}
 		put(current)
+		page.LastSerial = itemSerial
 		count++
 		return true
 	}
@@ -621,7 +799,7 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 				if cursor != "" && it.Serial <= cursor {
 					continue
 				}
-				if !emit(cm.ChannelSerial, it.Append) {
+				if !emit(cm.ChannelSerial, it.Serial, it.Append) {
 					return page, nil
 				}
 			}
@@ -636,7 +814,7 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 			if cursor != "" && items[j].Serial >= cursor {
 				continue
 			}
-			if !emit(cm.ChannelSerial, items[j].Append) {
+			if !emit(cm.ChannelSerial, items[j].Serial, items[j].Append) {
 				return page, nil
 			}
 		}

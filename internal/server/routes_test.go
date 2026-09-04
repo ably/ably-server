@@ -5,12 +5,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/ably/ably-server/internal/auth"
+	"github.com/ably/ably-server/internal/config"
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/logging"
-	"github.com/ably/ably-server/internal/realtime"
 	"github.com/ably/ably-server/internal/rest"
 	"github.com/ably/ably-server/internal/storage/memory"
 )
@@ -24,9 +23,13 @@ func TestMuxWebSocketOnlyAtRoot(t *testing.T) {
 	}
 	mgr := core.NewManager(memory.New(memory.Options{}))
 	logger := logging.New(slog.DiscardHandler)
-	rt := realtime.NewServer([]auth.APIKey{key}, mgr, time.Hour, logger, nil, nil)
-	rs := rest.NewServer([]auth.APIKey{key}, mgr, logger, nil, nil, nil, rt)
-	srv := httptest.NewServer(newMux(rt, rs, nil, false))
+	shared, err := newSharedProtocol(t.Context(), []auth.APIKey{key}, config.File{}, mgr, nil, logger, sharedOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(shared.Close)
+	rs := rest.NewServer([]auth.APIKey{key}, logger, nil)
+	srv := httptest.NewServer(newMux(shared, rs, nil, false))
 	t.Cleanup(srv.Close)
 
 	get := func(path string) *http.Response {
@@ -75,16 +78,13 @@ func TestMuxWebSocketOnlyAtRoot(t *testing.T) {
 		resp.Body.Close()
 	}
 
-	// The root still routes to the WS upgrader: a non-upgrade GET there is
-	// rejected by the upgrader with 400 and carries WS handshake headers,
-	// which distinguishes "reached the upgrader" from a plain 404.
+	// The root routes to the websocket transport, which answers a request
+	// that is not an upgrade with an Ably-shaped 404 naming the path. This
+	// server's own upgrader used to answer 400 with handshake headers.
 	resp := get("/")
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("GET / (no upgrade) = %d, want 400 from the upgrader", resp.StatusCode)
-	}
-	if resp.Header.Get("Sec-Websocket-Version") == "" {
-		t.Error("GET / should reach the WS upgrader (missing Sec-Websocket-Version header)")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("GET / (no upgrade) = %d, want 404", resp.StatusCode)
 	}
 }
 
@@ -100,9 +100,13 @@ func TestStatsStubGating(t *testing.T) {
 	newServer := func(enableStatsStub bool) *httptest.Server {
 		mgr := core.NewManager(memory.New(memory.Options{}))
 		logger := logging.New(slog.DiscardHandler)
-		rt := realtime.NewServer([]auth.APIKey{key}, mgr, time.Hour, logger, nil, nil)
-		rs := rest.NewServer([]auth.APIKey{key}, mgr, logger, nil, nil, nil, rt)
-		return httptest.NewServer(newMux(rt, rs, nil, enableStatsStub))
+		shared, err := newSharedProtocol(t.Context(), []auth.APIKey{key}, config.File{}, mgr, nil, logger, sharedOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(shared.Close)
+		rs := rest.NewServer([]auth.APIKey{key}, logger, nil)
+		return httptest.NewServer(newMux(shared, rs, nil, enableStatsStub))
 	}
 
 	get := func(srv *httptest.Server, path string) *http.Response {

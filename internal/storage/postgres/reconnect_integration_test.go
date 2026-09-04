@@ -15,6 +15,7 @@ import (
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/storage"
 	"github.com/ably/ably-server/internal/storage/postgres/pgtest"
+	"github.com/ably/server-protocol/go/wire"
 )
 
 // TestListenReconnectReconcilesGap forces the LISTEN connection to drop
@@ -81,7 +82,7 @@ func TestListenReconnectReconcilesGap(t *testing.T) {
 
 func publish(t *testing.T, ctx context.Context, ch storage.ChannelStore, data string) string {
 	t.Helper()
-	cm, _, err := ch.Store(ctx, []*protocol.Message{{Data: data}})
+	cm, _, err := ch.Store(ctx, []*wire.Message{{Data: wire.MessageStrData(data)}})
 	if err != nil {
 		t.Fatalf("Store %q: %v", data, err)
 	}
@@ -155,6 +156,9 @@ type recorder struct {
 }
 
 func (r *recorder) Initialize(current, initial string) {}
+
+// OccupancyChanged is not what this recorder is watching for.
+func (r *recorder) OccupancyChanged() {}
 
 func (r *recorder) Append(cm *protocol.ChannelMessage) {
 	r.mu.Lock()

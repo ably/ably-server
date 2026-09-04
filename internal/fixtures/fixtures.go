@@ -15,8 +15,8 @@ import (
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/id"
 	"github.com/ably/ably-server/internal/logging"
-	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/storage"
+	"github.com/ably/server-protocol/go/wire"
 )
 
 // Spec is the set of channels to seed.
@@ -58,15 +58,19 @@ func Seed(ctx context.Context, m *core.Manager, spec *Spec, logger *logging.Logg
 		if err != nil {
 			return fmt.Errorf("fixtures: get channel %q: %w", ch.Name, err)
 		}
-		members := make([]*protocol.PresenceMessage, 0, len(ch.Presence))
+		members := make([]*wire.PresenceMessage, 0, len(ch.Presence))
 		for _, mem := range ch.Presence {
-			members = append(members, &protocol.PresenceMessage{
-				Action:       protocol.PresenceEnter,
-				ClientID:     mem.ClientID,
-				ConnectionID: id.NewConnectionID(),
-				Data:         mem.Data,
-				Encoding:     mem.Encoding,
-				Timestamp:    now,
+			data, encoding, err := wire.DataFromExternal(mem.Data, mem.Encoding)
+			if err != nil {
+				return fmt.Errorf("fixtures: channel %q member %q data: %w", ch.Name, mem.ClientID, err)
+			}
+			members = append(members, &wire.PresenceMessage{
+				Action:       wire.PresenceMessage_ENTER,
+				ClientId:     &mem.ClientID,
+				ConnectionId: id.NewConnectionID(),
+				Data:         data,
+				Encoding:     encoding,
+				Timestamp:    uint64(now),
 			})
 		}
 		if _, _, err := channel.PublishPresence(seedCtx, members); err != nil {

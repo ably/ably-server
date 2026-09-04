@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ably/ably-server/internal/protocol"
+	"github.com/ably/server-protocol/go/wire"
 )
 
 // newCM builds a deterministic ChannelMessage for tests. The serial
@@ -16,10 +17,10 @@ import (
 // "<serial>:<idx>". Channel doesn't mint or stamp anything itself —
 // storage does that upstream — so tests construct cms directly.
 func newCM(serial string, ids ...string) *protocol.ChannelMessage {
-	msgs := make([]*protocol.Message, len(ids))
+	msgs := make([]*wire.Message, len(ids))
 	for i, id := range ids {
-		msgs[i] = &protocol.Message{
-			ID:     id,
+		msgs[i] = &wire.Message{
+			Id:     new(id),
 			Serial: fmt.Sprintf("%s:%03d", serial, i),
 		}
 	}
@@ -76,8 +77,8 @@ func TestChannelAppendBuildsList(t *testing.T) {
 		if e.cm.ChannelSerial != want.ChannelSerial {
 			t.Fatalf("entry %d: ChannelSerial = %q, want %q", i, e.cm.ChannelSerial, want.ChannelSerial)
 		}
-		if e.cm.Messages[0].ID != want.Messages[0].ID {
-			t.Fatalf("entry %d: msg.ID = %q, want %q", i, e.cm.Messages[0].ID, want.Messages[0].ID)
+		if e.cm.Messages[0].GetId() != want.Messages[0].GetId() {
+			t.Fatalf("entry %d: msg.GetId() = %q, want %q", i, e.cm.Messages[0].GetId(), want.Messages[0].GetId())
 		}
 	}
 
@@ -121,8 +122,8 @@ func TestChannelNotifyWakesWaiter(t *testing.T) {
 		if e == nil {
 			t.Fatal("waiter woke with nil next")
 		}
-		if e.cm.Messages[0].ID != "m1" {
-			t.Fatalf("waiter saw msg.ID = %q, want %q", e.cm.Messages[0].ID, "m1")
+		if e.cm.Messages[0].GetId() != "m1" {
+			t.Fatalf("waiter saw msg.GetId() = %q, want %q", e.cm.Messages[0].GetId(), "m1")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("waiter did not wake within 1s")
@@ -216,8 +217,8 @@ func TestStreamAttachOnEmptyChannelExposesWatermark(t *testing.T) {
 		if len(cm.Messages) != 1 {
 			t.Fatalf("delivered Messages length = %d, want 1", len(cm.Messages))
 		}
-		if cm.Messages[0].ID != "m1" {
-			t.Errorf("Next msg.ID = %q, want %q", cm.Messages[0].ID, "m1")
+		if cm.Messages[0].GetId() != "m1" {
+			t.Errorf("Next msg.GetId() = %q, want %q", cm.Messages[0].GetId(), "m1")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Next did not return within 1s")
@@ -257,8 +258,8 @@ func TestStreamAttachAfterAppendsParksAtTail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Next: %v", err)
 	}
-	if cm.Messages[0].ID != "m3" {
-		t.Errorf("msg.ID = %q, want %q", cm.Messages[0].ID, "m3")
+	if cm.Messages[0].GetId() != "m3" {
+		t.Errorf("msg.GetId() = %q, want %q", cm.Messages[0].GetId(), "m3")
 	}
 	if got := s.ChannelSerial(); got != "003" {
 		t.Errorf("ChannelSerial after Next = %q, want %q", got, "003")
@@ -301,8 +302,8 @@ func TestStreamNextReturnsAtomicBatchAsOneChannelMessage(t *testing.T) {
 		t.Fatalf("Messages length = %d, want 3", len(cm.Messages))
 	}
 	for i, want := range []string{"a", "b", "c"} {
-		if cm.Messages[i].ID != want {
-			t.Errorf("msg %d ID = %q, want %q", i, cm.Messages[i].ID, want)
+		if cm.Messages[i].GetId() != want {
+			t.Errorf("msg %d ID = %q, want %q", i, cm.Messages[i].GetId(), want)
 		}
 	}
 

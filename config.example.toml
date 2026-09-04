@@ -62,8 +62,10 @@
 # capability = '{"chat:*":["subscribe"]}'
 
 # [[namespaces]] entries mirror the Ably test-app-setup post_apps shape:
-# a namespace `id` plus feature flags. These are parsed and recorded but
-# behaviourally inert today — no behaviour keys off them yet.
+# a namespace `id` plus feature flags. A channel takes the settings of the
+# namespace its name falls in: whether its messages can be edited, and
+# whether it is persisted. The namespace of a channel called "foo:bar" is
+# "foo"; the namespace of an unprefixed channel called "foo" is "foo".
 #
 # [[namespaces]]
 # id = "persisted"

@@ -5,7 +5,7 @@
 // Two forms (see DESIGN.md §8):
 //
 //		channelSerial:  <timestamp>-<counter>@<seriesId>
-//		                |14 digits | 3 digit |10 chars
+//		                |14 digits | 3 digit |3-char site + 10 chars
 //
 //		Message.serial: <channelSerial>:<idx>
 //		                                |3 digit
@@ -13,8 +13,13 @@
 //	  - timestamp — wall-clock ms since epoch, zero-padded to 14 digits.
 //	  - counter   — increments when multiple serials are minted in the
 //	    same millisecond; resets to 000 when the timestamp advances.
-//	  - seriesId  — random per-process identifier; disambiguates serials
-//	    minted in the same millisecond on different nodes.
+//	  - seriesId  — identifier for the channel's series, minted once when
+//	    the channel is first materialised and carried by every serial
+//	    thereafter. It begins with the three-character SiteCode, which the
+//	    protocol reads back off any serial, followed by random hex. A change of seriesId is what tells a client
+//	    the channel's ordering restarted, so it must not change while
+//	    the channel's log is intact — including across a process
+//	    restart or a handover to another node.
 //	  - idx       — index of a Message within its containing
 //	    ChannelMessage (atomic publish).
 //
@@ -46,19 +51,38 @@ const (
 	maxCounter     = 999
 )
 
-// NewSeriesID returns a fresh random per-process identifier. Panics if
+// SiteCode identifies the deployment a serial was minted in. It is the first
+// three characters of every seriesId, which is what makes it readable back off
+// any serial (wire.Timeserial.SiteCode).
+//
+// Three characters is not this server's choice: the protocol reads the site
+// code as the first three characters of a serial's series, and clients key
+// their per-site view of an object's history by it. It lives here, with the
+// serials that carry it, because that is the constraint it has to satisfy —
+// a site code that did not prefix every seriesId would be unreadable from the
+// serials it is supposed to identify.
+//
+// It must also be what the server reports in a CONNECTED frame's
+// connectionDetails, because a client applying its own LiveObjects operation
+// on the ACK has only that to key it by, and the echo that follows carries the
+// one derived from the serial. If the two disagree the client counts its own
+// operation twice (DESIGN.md §15.1).
+const SiteCode = "loc"
+
+// NewSeriesID returns a fresh per-channel identifier, prefixed with the site
+// code so the site can be read back off any serial the series mints. Panics if
 // the system RNG is unavailable; we can't usefully operate without it.
 func NewSeriesID() string {
 	var buf [seriesIDBytes]byte
 	if _, err := rand.Read(buf[:]); err != nil {
 		panic("serial: crypto/rand failed: " + err.Error())
 	}
-	return hex.EncodeToString(buf[:])
+	return SiteCode + hex.EncodeToString(buf[:])
 }
 
 // Generator mints monotonic timeserials. One Generator instance is
-// expected per channel: state (lastTs, lastCounter) is per-channel,
-// while the seriesId is shared across all generators in a process.
+// expected per channel: both the monotonic state (lastTs, lastCounter)
+// and the seriesId belong to the channel whose serials it mints.
 //
 // Generator is safe for concurrent use.
 type Generator struct {
@@ -158,6 +182,37 @@ func Timestamp(s string) (int64, error) {
 		return 0, fmt.Errorf("serial: %q has non-numeric timestamp prefix: %w", s, err)
 	}
 	return v, nil
+}
+
+// SplitChannelSerial breaks a channelSerial back into the three parts
+// Mint assembled it from. Used by persistent backends on startup to
+// carry a channel's existing series and monotonic state forward
+// (DESIGN.md §8) — the series belongs to the channel, so a restart or
+// a handover to another node must continue it rather than start a new
+// one.
+//
+// A Message.serial (`<channelSerial>:<idx>`) is accepted too; the idx
+// suffix is ignored.
+func SplitChannelSerial(s string) (ts int64, counter int, seriesID string, err error) {
+	if i := strings.LastIndexByte(s, ':'); i >= 0 {
+		s = s[:i]
+	}
+	at := strings.IndexByte(s, '@')
+	if at < 0 {
+		return 0, 0, "", fmt.Errorf("serial: %q is not a channelSerial (no '@')", s)
+	}
+	if at != timestampWidth+1+counterWidth {
+		return 0, 0, "", fmt.Errorf("serial: %q has a malformed timestamp-counter prefix", s)
+	}
+	ts, err = Timestamp(s)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	counter, err = strconv.Atoi(s[timestampWidth+1 : at])
+	if err != nil {
+		return 0, 0, "", fmt.Errorf("serial: %q has a non-integer counter: %w", s, err)
+	}
+	return ts, counter, s[at+1:], nil
 }
 
 // TimestampBounds maps an inclusive ms-since-epoch range to a

@@ -282,7 +282,10 @@ func TestFixtureSpec(t *testing.T) {
 	// Malformed sections are errors.
 	malformed := map[string]config.File{
 		"namespace no id": {Namespaces: []config.Namespace{{Persisted: true}}},
-		"channel no name": {Channels: []config.Channel{{Presence: nil}}},
+		// A mode the protocol code does not recognise reads as the default
+		// one, so a typo would quietly apply the rule to other channels.
+		"namespace unknown mode": {Namespaces: []config.Namespace{{ID: "ns", Mode: "matchers"}}},
+		"channel no name":        {Channels: []config.Channel{{Presence: nil}}},
 		"member no clientId": {Channels: []config.Channel{{
 			Name:     "c1",
 			Presence: []config.PresenceMember{{Data: "x"}},

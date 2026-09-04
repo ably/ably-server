@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/ably/server-protocol/go/resource"
+	"github.com/ably/server-protocol/go/scope"
 )
 
 // Op is a capability operation (DESIGN.md §3.1). The wildcard op "*"
@@ -83,49 +86,26 @@ func ParseCapability(s string) (Capability, error) {
 // capability, including ops this server does not itself enforce (push,
 // object, metadata) — they are still valid names, so a token request
 // carrying one is well-formed. The wildcard "*" is handled separately.
-var validCapabilityOps = map[string]bool{
-	"publish": true, "subscribe": true, "presence": true, "history": true,
-	"stats": true, "message-subscribe": true, "presence-subscribe": true,
-	"message-update-own": true, "message-update-any": true,
-	"message-delete-own": true, "message-delete-any": true,
-	"annotation-publish": true, "annotation-subscribe": true,
-	"push-subscribe": true, "push-admin": true,
-	"channel-metadata": true, "channel-metadata:publishers": true,
-	"object-subscribe": true, "object-publish": true,
-	"list-channels": true, "privileged-headers": true, "connection-metadata": true,
-}
-
-// ValidateCapability checks that a requested `x-ably-capability` JSON
-// object is well-formed (DESIGN.md §3.3): parseable, every op list
-// non-empty, "*" never mixed with another op, and every op a recognised
-// Ably operation name. It returns ErrInvalidCapability on any violation —
-// a client error the token-request path surfaces as a 400. It is applied
-// only to a client-supplied requested capability, never to a configured
-// key's capability (which is trusted and may carry ops this server does
-// not implement).
+// ValidateCapability checks that a requested `x-ably-capability` JSON object
+// is well-formed (DESIGN.md §3.3), returning ErrInvalidCapability on any
+// violation — a client error the token-request path surfaces as a 400.
+//
+// What counts as well-formed is the protocol's, so the shared parser decides,
+// and the registry of operation names it checks against is the shared one
+// rather than a copy kept here. It is applied only to a client-supplied
+// requested capability, never to a configured key's (which is trusted and may
+// carry ops this server does not implement).
 func ValidateCapability(s string) error {
-	raw := map[string][]string{}
-	if err := json.Unmarshal([]byte(s), &raw); err != nil {
+	if _, err := resource.ParseCapabilities(s, capabilityScope); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidCapability, err)
-	}
-	for res, ops := range raw {
-		if len(ops) == 0 {
-			return fmt.Errorf("%w: resource %q has no operations", ErrInvalidCapability, res)
-		}
-		for _, o := range ops {
-			if o == string(OpWildcard) {
-				if len(ops) != 1 {
-					return fmt.Errorf("%w: resource %q mixes %q with other operations", ErrInvalidCapability, res, OpWildcard)
-				}
-				continue
-			}
-			if !validCapabilityOps[o] {
-				return fmt.Errorf("%w: resource %q has invalid operation %q", ErrInvalidCapability, res, o)
-			}
-		}
 	}
 	return nil
 }
+
+// capabilityScope is the scope a requested capability is read under. Only its
+// shape is being checked here, and this server serves one app, so which app
+// does not come into it.
+var capabilityScope = scope.New(scope.App, "ably-server")
 
 // Permits reports whether the capability grants op on channel: the union
 // of ops across every resource pattern matching channel must contain op

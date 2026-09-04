@@ -164,7 +164,7 @@ searches for the highest sustained rate that still meets it. Run
 ## Sandbox provisioner
 
 `cmd/ably-local-sandbox` is a test-app provisioner for the Ably SDK test suites
-(see [DESIGN.md §15](DESIGN.md#15-sandbox-provisioner)). `ably-server`
+(see [DESIGN.md §17](DESIGN.md#17-sandbox-provisioner)). `ably-server`
 itself is strictly single-app, but SDK test suites expect a sandbox host
 that hands out a fresh app per run; `ably-local-sandbox` bridges the gap by
 spawning one isolated, in-memory `ably-server` child per provisioned app:

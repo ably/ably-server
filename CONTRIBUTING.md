@@ -51,7 +51,7 @@ go test -tags=integration -race ./...
 The storage interface has an in-memory implementation exercised by the same
 table-driven contract tests as the bbolt and Postgres backends, so most
 storage behaviour is covered without external dependencies. See
-[`DESIGN.md` §16](./DESIGN.md#16-testing-strategy) for the overall testing
+[`DESIGN.md` §18](./DESIGN.md#18-testing-strategy) for the overall testing
 strategy.
 
 ### SDK compatibility harnesses

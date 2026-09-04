@@ -58,7 +58,12 @@ SERVER_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 ABLY_GO_DIR="${ABLY_GO_DIR:-$SERVER_ROOT/../ably-go}"
 LOCAL_SANDBOX_URL="${ABLY_LOCAL_SANDBOX_URL:-http://localhost:9010}"
 RUN_REGEX=""
-PER_TEST_TIMEOUT="25s"
+# A cap is here to catch a hang, not to race a slow test. 25s used to be it,
+# which sat inside the spread of the slowest legitimate test:
+# TestPresenceHistory_RSP4_RSP4b3 takes 23-28s depending on load, so it timed
+# out on some runs and passed on others, and the gate reported a server gap
+# where there was none.
+PER_TEST_TIMEOUT="60s"
 JOBS=8
 RETRIES=1
 JSON_OUT="$SERVER_ROOT/compat-results-ably-go.json"

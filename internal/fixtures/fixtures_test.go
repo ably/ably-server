@@ -2,13 +2,15 @@ package fixtures_test
 
 import (
 	"context"
+	"encoding/base64"
+	"reflect"
 	"testing"
 
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/fixtures"
-	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/storage"
 	"github.com/ably/ably-server/internal/storage/memory"
+	"github.com/ably/server-protocol/go/wire"
 )
 
 // presenceFixturesSpec mirrors the persisted:presence_fixtures channel the
@@ -45,23 +47,27 @@ func TestSeed_MembersHistoryAndEncodings(t *testing.T) {
 		t.Fatalf("GetChannel: %v", err)
 	}
 
-	// Expected verbatim data/encoding per member (encoding opaque, data
-	// stored exactly as the spec gave it).
+	// Expected data/encoding per member. A payload is stored as the spec gave
+	// it, except that an outer base64 is decoded on the way in: base64 is how
+	// a JSON transport carries bytes, not part of what the payload is, so it
+	// comes off with the rest of the transport and the suffix comes off the
+	// encoding with it (matching the reference).
 	wantData := map[string]any{
 		"client_bool":    "true",
 		"client_int":     "24",
 		"client_string":  "This is a string clientData payload",
 		"client_json":    `{ "test": "This is a JSONObject clientData payload"}`,
 		"client_decoded": `{"example":{"json":"Object"}}`,
-		"client_encoded": "HO4cYSP8LybPYBPZPHQOtuD53yrD3YV3NBoTEYBh4U0N1QXHbtkfsDfTspKeLQFt",
+		"client_encoded": mustBase64(t, "HO4cYSP8LybPYBPZPHQOtuD53yrD3YV3NBoTEYBh4U0N1QXHbtkfsDfTspKeLQFt"),
 	}
 	wantEncoding := map[string]string{
 		"client_decoded": "json",
-		"client_encoded": "json/utf-8/cipher+aes-128-cbc/base64",
+		"client_encoded": "json/utf-8/cipher+aes-128-cbc",
 	}
 
 	// Membership set.
-	members, _, err := ch.Members(ctx)
+	chPage, err := ch.Members(ctx, storage.MembersQuery{})
+	members, _ := chPage.Members, chPage.AsOfSerial
 	if err != nil {
 		t.Fatalf("Members: %v", err)
 	}
@@ -70,30 +76,30 @@ func TestSeed_MembersHistoryAndEncodings(t *testing.T) {
 	}
 	seenConn := map[string]bool{}
 	for _, m := range members {
-		wd, ok := wantData[m.ClientID]
+		wd, ok := wantData[m.GetClientId()]
 		if !ok {
-			t.Errorf("unexpected member clientId %q", m.ClientID)
+			t.Errorf("unexpected member clientId %q", m.GetClientId())
 			continue
 		}
-		if m.Data != wd {
-			t.Errorf("%s: data = %#v, want %#v", m.ClientID, m.Data, wd)
+		if !reflect.DeepEqual(m.Data.AsAny(), wd) {
+			t.Errorf("%s: data = %#v, want %#v", m.GetClientId(), m.Data.AsAny(), wd)
 		}
-		if m.Encoding != wantEncoding[m.ClientID] {
-			t.Errorf("%s: encoding = %q, want %q", m.ClientID, m.Encoding, wantEncoding[m.ClientID])
+		if m.Encoding != wantEncoding[m.GetClientId()] {
+			t.Errorf("%s: encoding = %q, want %q", m.GetClientId(), m.Encoding, wantEncoding[m.GetClientId()])
 		}
-		if m.ConnectionID == "" {
-			t.Errorf("%s: empty connectionId, want a synthesized one", m.ClientID)
+		if m.ConnectionId == "" {
+			t.Errorf("%s: empty connectionId, want a synthesized one", m.GetClientId())
 		}
 		// Fixture members are genuinely synthesized: no real connection or
 		// msgSerial, so they stay id-less and SDKs order them by timestamp
 		// (RTP2b1), never taking the id path.
-		if m.ID != "" {
-			t.Errorf("%s: fixture member carries id %q, want id-less", m.ClientID, m.ID)
+		if m.GetId() != "" {
+			t.Errorf("%s: fixture member carries id %q, want id-less", m.GetClientId(), m.GetId())
 		}
-		if seenConn[m.ConnectionID] {
-			t.Errorf("%s: connectionId %q reused across members", m.ClientID, m.ConnectionID)
+		if seenConn[m.ConnectionId] {
+			t.Errorf("%s: connectionId %q reused across members", m.GetClientId(), m.ConnectionId)
 		}
-		seenConn[m.ConnectionID] = true
+		seenConn[m.ConnectionId] = true
 	}
 
 	// Presence history (forwards) — every member appears as a stored ENTER.
@@ -104,7 +110,7 @@ func TestSeed_MembersHistoryAndEncodings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("History: %v", err)
 	}
-	var hist []*protocol.PresenceMessage
+	var hist []*wire.PresenceMessage
 	for _, cm := range page.ChannelMessages {
 		hist = append(hist, cm.Presence...)
 	}
@@ -112,11 +118,22 @@ func TestSeed_MembersHistoryAndEncodings(t *testing.T) {
 		t.Fatalf("presence history len = %d, want %d", len(hist), len(wantData))
 	}
 	for _, p := range hist {
-		if p.Action != protocol.PresenceEnter {
-			t.Errorf("%s: history action = %v, want ENTER", p.ClientID, p.Action)
+		if p.Action != wire.PresenceMessage_ENTER {
+			t.Errorf("%s: history action = %v, want ENTER", p.GetClientId(), p.Action)
 		}
-		if wd := wantData[p.ClientID]; p.Data != wd {
-			t.Errorf("%s: history data = %#v, want %#v", p.ClientID, p.Data, wd)
+		if wd := wantData[p.GetClientId()]; !reflect.DeepEqual(p.Data.AsAny(), wd) {
+			t.Errorf("%s: history data = %#v, want %#v", p.GetClientId(), p.Data.AsAny(), wd)
 		}
 	}
+}
+
+// mustBase64 decodes a base64 payload, which is how the fixture spec carries
+// bytes and how they come back off it.
+func mustBase64(t *testing.T, s string) []byte {
+	t.Helper()
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		t.Fatalf("decode %q: %v", s, err)
+	}
+	return b
 }

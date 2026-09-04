@@ -1,11 +1,13 @@
 package protocol
 
 import (
+	"bytes"
 	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/ably/server-protocol/go/wire"
 	"github.com/vmihailenco/msgpack/v5"
 )
 
@@ -167,44 +169,6 @@ func TestFormatFromQuery(t *testing.T) {
 	}
 }
 
-func TestMessageRoundTrip(t *testing.T) {
-	original := &Message{
-		ID:           "conn:1:0",
-		ClientID:     "alice",
-		ConnectionID: "conn",
-		Name:         "greeting",
-		Data:         "hello world",
-		Encoding:     "utf-8",
-		Timestamp:    1700000000000,
-	}
-
-	for _, f := range []Format{FormatJSON, FormatMsgpack} {
-		t.Run(f.String(), func(t *testing.T) {
-			// Wrap in a ProtocolMessage so we exercise the full publish
-			// shape that lands on the wire.
-			out := &ProtocolMessage{
-				Action:   ActionMessage,
-				Channel:  new("foo"),
-				Messages: []*Message{original},
-			}
-			data, err := Marshal(out, f)
-			if err != nil {
-				t.Fatalf("Marshal: %v", err)
-			}
-			var decoded ProtocolMessage
-			if err := Unmarshal(data, f, &decoded); err != nil {
-				t.Fatalf("Unmarshal: %v", err)
-			}
-			if len(decoded.Messages) != 1 {
-				t.Fatalf("decoded Messages length = %d, want 1", len(decoded.Messages))
-			}
-			if !reflect.DeepEqual(decoded.Messages[0], original) {
-				t.Fatalf("Message round-trip mismatch:\n got %+v\nwant %+v", decoded.Messages[0], original)
-			}
-		})
-	}
-}
-
 func i64p(v int64) *int64 { return &v }
 
 // TestAckCarriesMsgSerialZero pins the msgSerial:0 ACK case: an ACK (and NACK) for the
@@ -247,7 +211,7 @@ func TestNonPublishFramesOmitMsgSerial(t *testing.T) {
 	frames := map[string]*ProtocolMessage{
 		"heartbeat": {Action: ActionHeartbeat},
 		"connected": {Action: ActionConnected, ConnectionID: "abc"},
-		"message":   {Action: ActionMessage, Channel: new("c"), Messages: []*Message{{Serial: "s:000", Data: "x"}}},
+		"message":   {Action: ActionMessage, Channel: new("c"), Messages: []*wire.Message{{Serial: "s:000", Data: wire.MessageStrData("x")}}},
 	}
 	for name, f := range frames {
 		t.Run(name, func(t *testing.T) {
@@ -280,4 +244,23 @@ func TestActionString(t *testing.T) {
 	if got := Action(99).String(); !strings.Contains(got, "unknown") {
 		t.Errorf("unknown action string = %q, want contains %q", got, "unknown")
 	}
+}
+
+// unmarshalMsgpackMap decodes a msgpack blob into a plain map, so a test can
+// assert on the keys a frame actually carries.
+func unmarshalMsgpackMap(blob []byte, m *map[string]any) error {
+	dec := msgpack.NewDecoder(bytes.NewReader(blob))
+	return dec.Decode(m)
+}
+
+// toInt64 coerces a msgpack-decoded numeric (any int/uint kind) to int64.
+func toInt64(v any) (int64, bool) {
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return rv.Int(), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return int64(rv.Uint()), true
+	}
+	return 0, false
 }

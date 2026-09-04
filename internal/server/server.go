@@ -23,21 +23,22 @@ import (
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/config"
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/fixtures"
+	"github.com/ably/ably-server/internal/handles"
 	"github.com/ably/ably-server/internal/logging"
 	"github.com/ably/ably-server/internal/metrics"
-	"github.com/ably/ably-server/internal/realtime"
 	"github.com/ably/ably-server/internal/rest"
 	"github.com/ably/ably-server/internal/storage"
 	"github.com/ably/ably-server/internal/storage/bbolt"
 	"github.com/ably/ably-server/internal/storage/memory"
 	"github.com/ably/ably-server/internal/storage/postgres"
 	"github.com/ably/ably-server/internal/tracing"
+
+	protoapp "github.com/ably/server-protocol/go/app"
 )
 
 const (
@@ -124,8 +125,8 @@ func Run(ctx context.Context, opts Opts) int {
 	mode := fs.String("mode", config.Default(opts.Getenv(modeEnv), file.Mode, "memory"), "storage backend: memory, disk, or cluster (env: "+modeEnv+")")
 	dataDir := fs.String("data-dir", config.Default(opts.Getenv(dataDirEnv), file.DataDir, "./data"), "data directory for disk mode (holds the bbolt file) (env: "+dataDirEnv+")")
 	postgresDSN := fs.String("postgres-dsn", config.Default(opts.Getenv(postgresDSNEnv), file.PostgresDSN, ""), "libpq DSN for cluster mode, e.g. postgres://user:pw@host:5432/db?sslmode=disable (env: "+postgresDSNEnv+")")
-	hbInterval := fs.Duration("heartbeat-interval", realtime.DefaultHeartbeatInterval, "server-driven HEARTBEAT cadence")
-	remainPresentFor := fs.Duration("presence-remain-for", realtime.DefaultRemainPresentFor, "how long a presence member survives an abrupt disconnect before its LEAVE is synthesised, so a resume+re-enter avoids a flicker (DESIGN.md §12.5)")
+	hbInterval := fs.Duration("heartbeat-interval", 15*time.Second, "server-driven HEARTBEAT cadence")
+	remainPresentFor := fs.Duration("presence-remain-for", 0, "how long a presence member survives an abrupt disconnect before its LEAVE is synthesised, so a resume+re-enter avoids a flicker (DESIGN.md §12.5)")
 	shutdownGrace := fs.Duration("shutdown-grace", shutdownGraceDefault, "window to disconnect existing connections on SIGTERM (env: "+shutdownGraceEnv+")")
 	logLevel := fs.String("log-level", config.Default(opts.Getenv(logLevelEnv), file.LogLevel, "info"), "log level: "+logging.LevelNames+" (env: "+logLevelEnv+")")
 	logFormat := fs.String("log-format", config.Default(opts.Getenv(logFormatEnv), file.LogFormat, "text"), "log format: text or json (env: "+logFormatEnv+")")
@@ -184,11 +185,11 @@ func Run(ctx context.Context, opts Opts) int {
 			logger.Error("shutdown tracing", "err", err)
 		}
 	}()
-	// Only hand the servers a tracer when export is on, so the disabled
-	// path skips span creation (and its context allocations) entirely.
-	var tracer trace.Tracer
+	// The endpoints this server serves itself take no tracer: what is traced
+	// is the channel surface, which is the shared module's and starts its own
+	// spans on whatever tracer provider this installed. HTTP spans come from
+	// the otelhttp handler below.
 	if tp.Enabled {
-		tracer = tp.Tracer
 		logger.Info("tracing enabled")
 	}
 
@@ -226,23 +227,36 @@ func Run(ctx context.Context, opts Opts) int {
 		}
 	}
 
-	rt := realtime.NewServer(parsedKeys, manager, *hbInterval, logger, m, tracer)
-	rt.SetRemainPresentFor(*remainPresentFor)
+	// The protocol is served from github.com/ably/server-protocol/go, which this
+	// server supplies with its storage, its keys and its logger. What is left
+	// here is what that module does not describe: this server's own token
+	// endpoint, its liveness probes, and the stats stub SDK test flows want.
+	shared, err := newSharedProtocol(ctx, parsedKeys, file, manager, m, logger, sharedOptions{
+		heartbeatInterval: *hbInterval,
+		remainPresentFor:  *remainPresentFor,
+	})
+	if err != nil {
+		logger.Error("wiring the shared protocol code", "err", err)
+		return 1
+	}
+
 	// ready is non-nil only for backends with an external dependency
 	// worth probing (currently postgres.Storage); memory/disk leave it
 	// nil and /readyz reports 200 unconditionally.
 	ready, _ := store.(storage.Pinger)
-	// rt resolves a REST publish's connectionKey to a live connection for
-	// publish-on-behalf (DESIGN.md §13); a single-node, in-process registry.
-	rs := rest.NewServer(parsedKeys, manager, logger, ready, m, tracer, rt)
+	rs := rest.NewServer(parsedKeys, logger, ready)
 
-	mux := newMux(rt, rs, m, *enableStatsStub)
+	mux := newMux(shared, rs, m, *enableStatsStub)
 
 	// When tracing is enabled, otelhttp wraps the whole mux so every HTTP
 	// request (including the REST handlers) gets a server span; the WS
 	// upgrade request's span then spans the connection handler too. When
 	// disabled the mux is served directly with no wrapping overhead.
-	var handler http.Handler = mux
+	// Every request is tracked so it can be cancelled on shutdown; a
+	// websocket handler otherwise runs until its client goes away.
+	conns := newConnTracker()
+
+	var handler http.Handler = conns.Handler(mux)
 	if tp.Enabled {
 		handler = otelhttp.NewHandler(mux, "http.server")
 	}
@@ -259,7 +273,7 @@ func Run(ctx context.Context, opts Opts) int {
 	}
 
 	// Publish the bound address so a parent process (the sandbox
-	// provisioner, DESIGN.md §15) can discover the port a `--listen
+	// provisioner, DESIGN.md §17) can discover the port a `--listen
 	// 127.0.0.1:0` bind resolved to. Written atomically so a reader
 	// polling the path never observes a partial address.
 	if *addrFile != "" {
@@ -330,7 +344,8 @@ func Run(ctx context.Context, opts Opts) int {
 	// the grace window (DESIGN.md §11), unblocking those handlers.
 	srvErr := make(chan error, 1)
 	go func() { srvErr <- srv.Shutdown(shutdownCtx) }()
-	rt.Shutdown(shutdownCtx)
+	conns.CloseAll()
+	shared.Close()
 	if err := <-srvErr; err != nil {
 		logger.Error("shutdown error", "err", err)
 		return 1
@@ -403,15 +418,23 @@ func splitTrim(in []string) []string {
 
 // fixtureSpec validates the config file's [[namespaces]] and [[channels]]
 // sections and builds the presence-fixture spec to seed at startup
-// (DESIGN.md §9, §12.5). Namespaces are validated but otherwise inert
-// (their flags are recorded, not acted on). A namespace with no id, a
+// (DESIGN.md §9, §12.5). A namespace with no id or an unknown mode, a
 // channel with no name, or a presence member with no clientId is a
 // malformed section and returns an error. Returns a nil spec when no
 // channels are declared.
+//
+// An unknown mode is refused rather than ignored because the protocol code
+// reads any mode it does not recognise as the default one: `mode = "matchers"`
+// would otherwise start a server that silently applied the rule to a different
+// set of channels than the one written down.
 func fixtureSpec(file config.File) (*fixtures.Spec, error) {
 	for i, ns := range file.Namespaces {
 		if ns.ID == "" {
 			return nil, fmt.Errorf("namespace #%d has no id", i)
+		}
+		if ns.Mode != "" && ns.Mode != protoapp.NamespaceModeMatcher {
+			return nil, fmt.Errorf("namespace %q has mode %q, want %q or none",
+				ns.ID, ns.Mode, protoapp.NamespaceModeMatcher)
 		}
 	}
 	if len(file.Channels) == 0 {
@@ -468,39 +491,50 @@ func writeAddrFile(path, addr string) error {
 //
 // ctx bounds the cluster-mode dial + ping + migrate; it's ignored by
 // the in-process modes.
-// newMux builds the HTTP routing table. The WebSocket endpoint is bound to
-// the exact root with the `{$}` anchor: a bare `GET /` is a catch-all in
-// Go 1.22's ServeMux and would feed every unmatched GET path to the
-// upgrader (returning a confusing 400 with WebSocket headers). With `{$}`,
-// only `/` upgrades and unknown paths fall through to a clean 404.
-func newMux(rt *realtime.Server, rs *rest.Server, m *metrics.Metrics, enableStatsStub bool) *http.ServeMux {
+// newMux builds the HTTP routing table: the shared module's whole surface at
+// the paths the module names, and this server's own endpoints around it.
+//
+// The module anchors its WebSocket route to the exact root with `{$}`, which
+// is what keeps it from being a catch-all: a bare `GET /` matches every
+// unmatched GET path in Go's ServeMux and would feed each one to the upgrader,
+// returning a confusing 400 with WebSocket headers. With `{$}`, only `/`
+// upgrades and unknown paths fall through to a clean 404.
+func newMux(shared *handles.Protocol, rs *rest.Server, m *metrics.Metrics, enableStatsStub bool) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", rt.HandleWebSocket)
 
 	// REST routes are wrapped so each records ably_http_requests_total by
-	// route pattern / method / status (DESIGN.md §10). The WebSocket route
-	// is excluded — its handler blocks for the connection's whole lifetime,
+	// route pattern / method / status (DESIGN.md §10). The connection routes
+	// are excluded — their handlers block for the connection's whole lifetime,
 	// which the connection metrics already cover. /metrics itself is
 	// unwrapped so scrapes don't inflate the counters.
 	rest := func(pattern string, h http.HandlerFunc) {
 		mux.Handle(pattern, instrumentHTTP(m, pattern, h))
 	}
-	rest("POST /channels/{name}/messages", rs.HandlePublish)
-	rest("GET /channels/{name}/messages", rs.HandleHistory)
+	// The whole protocol surface is the shared module's, its paths included:
+	// the module declares where each of its handlers belongs, so this server
+	// and realtime answer the same request at the same URL rather than each
+	// choosing. That covers the three transports a client can reach a
+	// connection through — WebSocket, SSE and comet — as well as REST, and a
+	// route per path for CORS preflights and for a method the path does not
+	// take, which would otherwise reach the catch-all below and be reported as
+	// a path that does not exist.
+	for _, route := range shared.Routes() {
+		if strings.HasPrefix(route.Name, "connection.") {
+			mux.Handle(route.Pattern, route.Handler)
+			continue
+		}
+		rest(route.Pattern, route.Handler.ServeHTTP)
+	}
 	// Ably SDKs' REST history reads request /history; serve it as
 	// an alias so those reads work.
-	rest("GET /channels/{name}/history", rs.HandleHistory)
-	rest("PATCH /channels/{name}/messages/{serial}", rs.HandleMutate)
-	rest("GET /channels/{name}/messages/{serial}", rs.HandleMessage)
-	rest("GET /channels/{name}/messages/{serial}/versions", rs.HandleMessageVersions)
-	rest("POST /channels/{name}/messages/{serial}/annotations", rs.HandlePublishAnnotation)
-	rest("GET /channels/{name}/messages/{serial}/annotations", rs.HandleListAnnotations)
-	rest("GET /channels/{name}/presence", rs.HandlePresence)
-	rest("GET /channels/{name}/presence/history", rs.HandlePresenceHistory)
+	rest("GET /channels/{channelId}/history", shared.REST().HandleHistory)
+
+	// What the shared module does not describe stays here: minting a token is
+	// this server's own endpoint, and the rest are operational.
 	rest("POST /keys/{keyName}/requestToken", rs.HandleRequestToken)
 	// GET/POST /stats are a compatibility stub (DESIGN.md §1) only needed by
 	// SDK test flows — the sandbox provisioner boots its children with
-	// --enable-stats-stub (§15). Unregistered by default, they fall
+	// --enable-stats-stub (§17). Unregistered by default, they fall
 	// through to the catch-all Ably-shaped 40400 below rather than the
 	// stub always answering an app that never asked for it.
 	if enableStatsStub {
@@ -510,7 +544,6 @@ func newMux(rt *realtime.Server, rs *rest.Server, m *metrics.Metrics, enableStat
 		// reading the error body of a request it never fully sent.
 		rest("POST /stats", rs.HandlePostStats)
 	}
-	rest("GET /time", rs.HandleTime)
 	rest("GET /healthz", rs.HandleHealthz)
 	rest("GET /readyz", rs.HandleReadyz)
 

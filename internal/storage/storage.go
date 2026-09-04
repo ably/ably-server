@@ -18,33 +18,29 @@ package storage
 
 import (
 	"context"
-	"errors"
+	stderrors "errors"
 	"strconv"
 	"strings"
 
 	"github.com/ably/ably-server/internal/id"
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/serial"
+
+	"github.com/ably/server-protocol/go/errors"
+	"github.com/ably/server-protocol/go/wire"
 )
 
 // ErrTargetNotFound is returned by Mutate, LatestVersion and Versions
 // when the target message identity has never been published on the
 // channel, or has aged out of retention (DESIGN.md §13.2). Callers map
 // it to a 4xx (REST) or a NACK/ERROR (WS).
-var ErrTargetNotFound = errors.New("storage: target message not found")
-
-// ErrIncompatibleAppend is returned by Mutate (via MergeVersion) when an
-// append's data cannot be concatenated onto the target's current data
-// because their types are incompatible — appends are defined only for
-// string-onto-string and binary-onto-binary (DESIGN.md §13.3). Callers
-// map it to a 400 (REST) or a NACK (WS).
-var ErrIncompatibleAppend = errors.New("storage: append data type is incompatible with the target's current data")
+var ErrTargetNotFound = stderrors.New("storage: target message not found")
 
 // ErrInvalidMessageID is returned by StampMessageIDs (and therefore by
 // Store) when a client supplies message ids that do not conform to the
 // required "<batchID>:<idx>" batch shape (DESIGN.md §8). Callers map it
 // to a 400 (REST) or a NACK (WS).
-var ErrInvalidMessageID = errors.New("storage: client-supplied message ids do not match the required <batchID>:<idx> format")
+var ErrInvalidMessageID = stderrors.New("storage: client-supplied message ids do not match the required <batchID>:<idx> format")
 
 // Appender is the bridge between the storage backend and the in-process
 // channel state. The backend calls Initialize exactly once, before any
@@ -56,10 +52,16 @@ var ErrInvalidMessageID = errors.New("storage: client-supplied message ids do no
 // memory/bbolt, asynchronously via the Postgres LISTEN goroutine in
 // cluster mode).
 //
+// The bridge carries two things: the channel's cm stream, and the fact
+// that its aggregate occupancy has moved. Occupancy is not a cm — it is
+// not logged, ordered or replayed — but it is in-process channel state
+// that storage is the first to learn about, on this node or another, so
+// it reaches the channel the same way.
+//
 // In core, *Channel implements Appender — Initialize seeds the channel
 // sentinel's serial, records the initial value, and unblocks Attach;
 // Append links the cm onto the live linked list so attached streams
-// observe it.
+// observe it; OccupancyChanged wakes whoever is reporting occupancy.
 type Appender interface {
 	// Initialize is called once by the storage backend with two
 	// channelSerials. current is the channel's current cursor at
@@ -75,6 +77,20 @@ type Appender interface {
 	// strictly greater than every prior Append's serial and strictly
 	// greater than the Initialize current/initial serials.
 	Append(cm *protocol.ChannelMessage)
+
+	// OccupancyChanged reports that the channel's aggregate occupancy may
+	// have moved — because this node stored a contribution, or because
+	// another node's reached storage (DESIGN.md §16.3). It says only that
+	// the aggregate is worth re-reading, not what it now is: a backend that
+	// learned of the change from a notification does not have the aggregate
+	// to hand, and one that does would be handing over a value the caller
+	// must re-read anyway once several nodes contribute.
+	//
+	// It may be called when nothing actually changed. Backends do not
+	// diff contributions, so a node re-storing what it already stored still
+	// signals; a caller that reports on every signal reports the same
+	// numbers twice rather than missing a change.
+	OccupancyChanged()
 }
 
 // Storage is the per-process persistence root. It hands out
@@ -132,7 +148,20 @@ type ChannelStore interface {
 	// On idempotent return, callers should use the returned
 	// ChannelMessage (the original) rather than the messages they
 	// passed in.
-	Store(ctx context.Context, msgs []*protocol.Message) (cm *protocol.ChannelMessage, idempotent bool, err error)
+	Store(ctx context.Context, msgs []*wire.Message) (cm *protocol.ChannelMessage, idempotent bool, err error)
+
+	// StoreSummary publishes the summaries of messages whose annotations have
+	// just been folded (DESIGN.md §14.2). Each summary carries the identity of
+	// the message it is about and that message's current summary, with
+	// action = summary.
+	//
+	// It mints a channelSerial and logs the cm, so the summary reaches every
+	// subscriber and is replayed to one resuming across it, exactly as a
+	// publish is. What it does not do is touch the latest-version projection or
+	// the version chain: a summary is not a version of the message, and the
+	// message's own summary is already on the projection — the fold put it
+	// there, in the same transaction as the annotation that caused it.
+	StoreSummary(ctx context.Context, summaries []*wire.Message) (cm *protocol.ChannelMessage, err error)
 
 	// Mutate persists an update/delete/append to an existing message
 	// (DESIGN.md §13.2). mut carries the mutation: mut.Action is the
@@ -158,7 +187,7 @@ type ChannelStore interface {
 	//
 	// Idempotency works like Store: a mut.ID already seen on the channel
 	// returns the original cm with idempotent=true and mutates nothing.
-	Mutate(ctx context.Context, mut *protocol.Message) (cm *protocol.ChannelMessage, idempotent bool, err error)
+	Mutate(ctx context.Context, mut *wire.Message, merge MergeFunc) (cm *protocol.ChannelMessage, idempotent bool, err error)
 
 	// LatestVersion returns the current latest version of the message
 	// identified by serial — the materialised projection entry, a fully
@@ -166,7 +195,7 @@ type ChannelStore interface {
 	// returned as its tombstone version (Action = delete). Returns
 	// ErrTargetNotFound if no such message exists. Backs
 	// GET .../messages/{serial}.
-	LatestVersion(ctx context.Context, serial string) (*protocol.Message, error)
+	LatestVersion(ctx context.Context, serial string) (*wire.Message, error)
 
 	// Versions returns every version of the message identified by serial
 	// (create + each update/delete) ordered by version, paginated via the
@@ -191,7 +220,7 @@ type ChannelStore interface {
 	//
 	// The returned cm is the persisted annotation cm — the seam the summary
 	// fold slots into at store time (DESIGN.md §14.2).
-	StoreAnnotation(ctx context.Context, annotations []*protocol.Annotation) (cm *protocol.ChannelMessage, idempotent bool, err error)
+	StoreAnnotation(ctx context.Context, annotations []*wire.Annotation, fold FoldFunc) (cm *protocol.ChannelMessage, idempotent bool, err error)
 
 	// Annotations returns the annotations attached to the message identified
 	// by messageSerial, in stream order, paginated via the shared
@@ -214,14 +243,66 @@ type ChannelStore interface {
 	// Idempotency works like Store: a contained PresenceMessage.ID already
 	// seen on this channel returns the original cm with idempotent=true
 	// and folds nothing.
-	StorePresence(ctx context.Context, presence []*protocol.PresenceMessage) (cm *protocol.ChannelMessage, idempotent bool, err error)
+	StorePresence(ctx context.Context, presence []*wire.PresenceMessage) (cm *protocol.ChannelMessage, idempotent bool, err error)
 
 	// Members returns the channel's current presence set plus the
 	// channelSerial the set is current as-of (DESIGN.md §12.4). The
 	// as-of serial is the channel's current watermark; it is empty only
 	// when the channel has no persisted cms at all. Backs presence sync
 	// and the REST presence endpoint.
-	Members(ctx context.Context) (members []*protocol.PresenceMessage, asOfSerial string, err error)
+	Members(ctx context.Context, q MembersQuery) (MembersPage, error)
+
+	// StoreState is the LiveObjects analogue of StorePresence (DESIGN.md
+	// §15.2, §15.3). It mints a channelSerial, stamps each
+	// StateMessage.Serial to the timeserial "<channelSerial>:<idx>",
+	// persists the state ChannelMessage on the same stream (kind = state),
+	// and — atomically with the persist — applies the operations to the
+	// channel's materialised object set.
+	//
+	// The apply is the caller's (core.ApplyOperations): the backend loads
+	// the objects the publish names, hands them to apply along with the
+	// stamped messages, and writes back whichever objects come out changed.
+	// What an operation does to an object is the protocol's, so it runs at
+	// this seam — with the objects loaded and the write not yet made, inside
+	// whatever the backend uses to make the pair atomic (see ApplyFunc).
+	//
+	// The appender then receives the state cm exactly as for a message
+	// publish. Idempotency works like Store: a contained StateMessage.Id
+	// already seen on this channel returns the original cm with
+	// idempotent=true and applies nothing.
+	StoreState(ctx context.Context, state []*wire.StateMessage, apply ApplyFunc) (cm *protocol.ChannelMessage, idempotent bool, err error)
+
+	// Objects returns one page of the channel's materialised LiveObjects set
+	// — the fold of its state stream — ordered by object id, plus the
+	// channelSerial the set is current as-of (DESIGN.md §15.3). The as-of
+	// serial is the channel's current watermark; it is empty only when the
+	// channel has no persisted cms at all. Backs the state sync a client is
+	// served on attach.
+	Objects(ctx context.Context, q ObjectsQuery) (ObjectsPage, error)
+
+	// StoreOccupancy records what this node currently contributes to the
+	// channel's occupancy (DESIGN.md §16.2): how many holders it is serving
+	// and in which modes.
+	//
+	// counts is the whole of the node's contribution, not a delta, so a
+	// store that is lost costs nothing that the next one does not repair —
+	// which is what lets a caller roll several changes into one write. A
+	// contribution of nothing removes the node from the aggregate rather
+	// than recording zeros.
+	//
+	// The backend then calls Appender.OccupancyChanged, on this node and
+	// on every other node holding the channel, so the new aggregate is
+	// read and reported.
+	StoreOccupancy(ctx context.Context, counts *wire.ChannelOccupancy) error
+
+	// Occupancy returns the channel's occupancy across every node
+	// contributing to it (DESIGN.md §16.2): the per-node contributions
+	// summed, with the channelMode the union of theirs.
+	//
+	// PresenceMembers is not a per-node contribution and is not summed: it
+	// is the size of the channel's membership set, which storage already
+	// holds and which is global to begin with (§12.5).
+	Occupancy(ctx context.Context) (*wire.ChannelOccupancy, error)
 
 	// History returns ChannelMessages in publish order. An empty
 	// AfterChannelSerial means "from the oldest retained
@@ -231,8 +312,8 @@ type ChannelStore interface {
 	History(ctx context.Context, q HistoryQuery) (HistoryPage, error)
 }
 
-// Kind distinguishes the two cm streams that share a channel's ordered
-// log and channelSerial namespace (DESIGN.md §12.1). The zero value is
+// Kind distinguishes the cm streams that share a channel's ordered log
+// and channelSerial namespace (DESIGN.md §12.1). The zero value is
 // KindMessage so an unset HistoryQuery reads message history.
 type Kind string
 
@@ -240,6 +321,7 @@ const (
 	KindMessage    Kind = "message"
 	KindPresence   Kind = "presence"
 	KindAnnotation Kind = "annotation"
+	KindState      Kind = "state"
 )
 
 // Normalize maps the zero value to KindMessage.
@@ -250,11 +332,193 @@ func (k Kind) Normalize() Kind {
 	return k
 }
 
+// MembersQuery bounds one page of a channel's presence set.
+type MembersQuery struct {
+	// After is a cursor from a previous page, and the page returned starts
+	// strictly after it. Empty starts at the first member.
+	//
+	// It is opaque and belongs to the backend that issued it: the order a set
+	// is read in is a backend's own, so a cursor from one means nothing to
+	// another.
+	After string
+
+	// Limit is the most members the page may hold. Zero means no limit, which
+	// is for a caller that wants the whole set and knows it is small.
+	Limit int
+}
+
+// MembersPage is one page of a presence set.
+type MembersPage struct {
+	Members []*wire.PresenceMessage
+
+	// AsOfSerial is the channel's watermark when the set was read, empty only
+	// when the channel has no persisted cms at all.
+	AsOfSerial string
+
+	// NextCursor is where the page after this one starts, empty when this page
+	// is the last.
+	NextCursor string
+}
+
+// PageMembers cuts a page out of a set already sorted by MemberKey, and
+// returns it with the cursor the page after it starts at. It is for a backend
+// holding the whole set in memory anyway; one that can bound the read itself
+// should do that instead of reading everything and calling this.
+func PageMembers(members []*wire.PresenceMessage, q MembersQuery) ([]*wire.PresenceMessage, string) {
+	if q.After != "" {
+		for len(members) > 0 && MemberKey(members[0].ConnectionId, members[0].GetClientId()) <= q.After {
+			members = members[1:]
+		}
+	}
+	if q.Limit <= 0 || len(members) <= q.Limit {
+		return members, ""
+	}
+
+	page := members[:q.Limit]
+	last := page[len(page)-1]
+	return page, MemberKey(last.ConnectionId, last.GetClientId())
+}
+
 // MemberKey returns the presence-set key for a member: the pair
 // (connectionId, clientId) that identifies one member, so the same
 // clientId over two connections is two distinct members (DESIGN.md §12.1).
 func MemberKey(connectionID, clientID string) string {
 	return connectionID + ":" + clientID
+}
+
+// ObjectsQuery bounds one page of a channel's materialised LiveObjects set
+// (DESIGN.md §15.3).
+type ObjectsQuery struct {
+	// After is a cursor from a previous page, and the page returned starts
+	// strictly after it. Empty starts at the first object.
+	//
+	// Unlike a presence cursor it is not opaque: the set is ordered by object
+	// id and the cursor is an object id, because that is the order the
+	// protocol's own paging walks the set in (liveslice.Page) and a client
+	// resuming a sync presents the id it stopped at.
+	After string
+
+	// Limit is the most objects the page may hold. Zero means no limit, which
+	// is for a caller that wants the whole set and knows it is small.
+	Limit int
+}
+
+// ObjectsPage is one page of a materialised LiveObjects set.
+type ObjectsPage struct {
+	// Objects are ordered by object id.
+	Objects []*wire.StateObject
+
+	// AsOfSerial is the channel's watermark when the set was read, empty only
+	// when the channel has no persisted cms at all.
+	AsOfSerial string
+
+	// NextCursor is the object id the page after this one starts at, empty
+	// when this page is the last.
+	NextCursor string
+}
+
+// PageObjects cuts a page out of a set already sorted by object id, and
+// returns it with the cursor the page after it starts at. It is the objects
+// counterpart of PageMembers, and is for the same kind of backend: one holding
+// the whole set in memory anyway.
+func PageObjects(objects []*wire.StateObject, q ObjectsQuery) ([]*wire.StateObject, string) {
+	if q.After != "" {
+		for len(objects) > 0 && objects[0].GetObjectId() <= q.After {
+			objects = objects[1:]
+		}
+	}
+	if q.Limit <= 0 || len(objects) <= q.Limit {
+		return objects, ""
+	}
+
+	page := objects[:q.Limit]
+	return page, page[len(page)-1].GetObjectId()
+}
+
+// StateObjectIDs is every object a state publish names: the objects a backend
+// must load before applying it, and — because an operation only ever changes
+// the object it names — the only ones the apply can change.
+//
+// Order is the publish's, deduplicated, so a backend loading them in this
+// order loads each once.
+func StateObjectIDs(state []*wire.StateMessage) []string {
+	ids := make([]string, 0, len(state))
+	seen := make(map[string]bool, len(state))
+	for _, sm := range state {
+		id := sm.GetOperation().GetObjectId()
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// StampStateMessage stamps the position of the idx'th state message in the
+// publish minted at channelSerial: the serial the operation is ordered by, the
+// site it originated at, and the time the serial encodes.
+//
+// The serial is what decides whether an operation is applied — an object keeps
+// the latest serial it has seen from each site and ignores anything not after
+// it (liveobject.shouldApply) — so it is the server's to assign, not the
+// client's.
+func StampStateMessage(sm *wire.StateMessage, channelSerial string, idx int) {
+	sm.Serial = StateSerial(channelSerial, idx)
+	sm.SiteCode = sm.Serial.SiteCode()
+	sm.Timestamp = sm.Serial.Time
+}
+
+// StateSerial is the position of the idx'th state message in the publish
+// minted at channelSerial, as a state message carries it: a timeserial rather
+// than a string, the same shape an annotation's is.
+func StateSerial(channelSerial string, idx int) *wire.Timeserial {
+	return wire.MustTimeserialFromString(serial.MessageSerial(channelSerial, idx))
+}
+
+// SumOccupancy adds one node's contribution into an aggregate: the counts add
+// and the channelMode unions, because a mode is occupied if any node has a
+// holder of it.
+//
+// It does not touch PresenceMembers, which is not a per-node contribution —
+// the membership set is global, so summing it across nodes would multiply it
+// by the number of nodes holding the channel.
+func SumOccupancy(into, from *wire.ChannelOccupancy) {
+	if from == nil {
+		return
+	}
+	into.ChannelMode |= from.ChannelMode
+	into.Connections += from.Connections
+	into.Publishers += from.Publishers
+	into.Subscribers += from.Subscribers
+	into.PresenceConnections += from.PresenceConnections
+	into.PresenceSubscribers += from.PresenceSubscribers
+	into.ObjectSubscribers += from.ObjectSubscribers
+	into.ObjectPublishers += from.ObjectPublishers
+}
+
+// CopyOccupancy is one node's contribution as a backend records it: the
+// counts and the mode, and nothing else.
+//
+// PresenceMembers and GloballyInSync are dropped rather than copied, so that
+// an in-memory backend stores exactly the columns the Postgres one does. A
+// node does not contribute a share of the membership set — the set is global
+// — and GloballyInSync is not a claim this server makes.
+func CopyOccupancy(counts *wire.ChannelOccupancy) *wire.ChannelOccupancy {
+	out := &wire.ChannelOccupancy{}
+	SumOccupancy(out, counts)
+	return out
+}
+
+// OccupancyIsEmpty reports a contribution of nothing: a node serving no
+// holders of the channel at all, which is removed from the aggregate rather
+// than stored as a row of zeros.
+//
+// It is the counts that decide, not the mode: a node with holders but no
+// modes worth naming still occupies the channel, and one with a mode left set
+// but no holders is a bug this must not preserve.
+func OccupancyIsEmpty(counts *wire.ChannelOccupancy) bool {
+	return counts == nil || counts.Connections <= 0
 }
 
 // staticPresenceKey marks a StorePresence call as seeding static fixture
@@ -278,13 +542,13 @@ func IsStaticPresence(ctx context.Context) bool {
 }
 
 // StampMessageIDs resolves the ChannelMessage batch id for a create
-// publish and stamps the contained Message.IDs (DESIGN.md §8). It is
+// publish and stamps the contained Message.Ids (DESIGN.md §8). It is
 // called by every backend's Store before minting the channelSerial, so
 // the batch id — the idempotency key indexed by storage — is derived
 // identically regardless of surface (REST or WS) or backend.
 //
-// If no contained message carries an ID, a fresh 8-char base64 batch id
-// is generated and each Message.ID is stamped "<batchID>:<idx>" (idx
+// If no contained message carries an id, a fresh 8-char base64 batch id
+// is generated and each Message.Id is stamped "<batchID>:<idx>" (idx
 // unpadded, matching Ably's wire shape, e.g. "TojWzTkLiH:0"). If any
 // message carries an ID, the publish is client-idempotent: the batch id
 // is derived from the messages and, for a multi-message batch, each
@@ -293,7 +557,7 @@ func IsStaticPresence(ctx context.Context) bool {
 // accepts any client id (the batch id is that id with a trailing ":0"
 // trimmed), matching Ably. Returns the batch id to stamp onto
 // ChannelMessage.ID.
-func StampMessageIDs(msgs []*protocol.Message) (string, error) {
+func StampMessageIDs(msgs []*wire.Message) (string, error) {
 	base, hasID, err := messageBaseID(msgs)
 	if err != nil {
 		return "", err
@@ -301,7 +565,7 @@ func StampMessageIDs(msgs []*protocol.Message) (string, error) {
 	if !hasID {
 		base = id.NewMessageBaseID()
 		for i, m := range msgs {
-			m.ID = base + ":" + strconv.Itoa(i)
+			m.Id = new(base + ":" + strconv.Itoa(i))
 		}
 	}
 	return base, nil
@@ -311,17 +575,17 @@ func StampMessageIDs(msgs []*protocol.Message) (string, error) {
 // validating the "<batchID>:<idx>" shape for a multi-message batch. It
 // reports hasID=false (and an empty base) when no message carries an id,
 // signalling the caller to generate one. Mirrors Ably's getMessageBaseID.
-func messageBaseID(msgs []*protocol.Message) (base string, hasID bool, err error) {
+func messageBaseID(msgs []*wire.Message) (base string, hasID bool, err error) {
 	if len(msgs) == 1 {
 		// A single-message publish carries no multi-message index
 		// requirement: any id is accepted, and the batch id is that id
 		// with a trailing ":0" trimmed if present.
-		id0 := msgs[0].ID
+		id0 := msgs[0].GetId()
 		return strings.TrimSuffix(id0, ":0"), id0 != "", nil
 	}
 
 	for _, m := range msgs {
-		if m.ID != "" {
+		if m.GetId() != "" {
 			hasID = true
 		} else if hasID {
 			// Some messages carry an id and others do not — all must if any do.
@@ -332,12 +596,12 @@ func messageBaseID(msgs []*protocol.Message) (base string, hasID bool, err error
 		return "", false, nil
 	}
 
-	base, ok := strings.CutSuffix(msgs[0].ID, ":0")
+	base, ok := strings.CutSuffix(msgs[0].GetId(), ":0")
 	if !ok {
 		return "", false, ErrInvalidMessageID
 	}
 	for i := 1; i < len(msgs); i++ {
-		if msgs[i].ID != base+":"+strconv.Itoa(i) {
+		if msgs[i].GetId() != base+":"+strconv.Itoa(i) {
 			return "", false, ErrInvalidMessageID
 		}
 	}
@@ -358,20 +622,25 @@ func messageBaseID(msgs []*protocol.Message) (base string, hasID bool, err error
 // is omitempty, so an unstamped (zero) value is dropped on the wire; the SDK
 // Tree reads the top-level timestamp as the message's create time on every
 // delivery and drives its retention clock from it.
-func StampCreateVersion(m *protocol.Message) {
+func StampCreateVersion(m *wire.Message) {
 	ts, _ := serial.Timestamp(m.Serial)
-	m.Timestamp = ts
-	m.Version = &protocol.MessageVersion{
+	m.Timestamp = uint64(ts)
+	m.Version = &wire.Message_Version{
 		Serial:    m.Serial,
-		Timestamp: ts,
-		ClientID:  m.ClientID,
+		Timestamp: uint64(ts),
+		ClientId:  m.ClientId,
 	}
 }
 
-// StampPresenceMember stamps a freshly-published presence message's
-// server-assigned identity: its Serial (`<channelSerial>:<idx>`) and a
-// server-authoritative Timestamp derived from that serial. Every backend's
-// StorePresence calls it so presence frames carry a timestamp on the wire.
+// StampPresenceMember stamps a freshly-published presence message with a
+// server-authoritative Timestamp, derived from the channelSerial the publish
+// was minted at. Every backend's StorePresence calls it so presence frames
+// carry a timestamp on the wire.
+//
+// A presence message has no serial of its own to stamp. Its position in the
+// stream is `<channelSerial>:<idx>`, which is where it is — not something it
+// carries, and not something a client is ever told; a reader that needs it
+// derives it from where it found the message (PresenceSerial).
 //
 // It deliberately does NOT touch PresenceMessage.ID. A genuine (non-
 // synthesized) presence op is stamped an id of the form
@@ -385,179 +654,73 @@ func StampCreateVersion(m *protocol.Message) {
 // unstamped (zero) timestamp would make a synthesized leave compare as
 // not-newer than its own enter, so the SDK would never remove the member
 // (DESIGN.md §12.1).
-func StampPresenceMember(p *protocol.PresenceMessage, channelSerial string, idx int) {
-	p.Serial = serial.MessageSerial(channelSerial, idx)
-	ts, _ := serial.Timestamp(p.Serial)
-	p.Timestamp = ts
+func StampPresenceMember(p *wire.PresenceMessage, channelSerial string, idx int) {
+	ts, _ := serial.Timestamp(PresenceSerial(channelSerial, idx))
+	p.Timestamp = uint64(ts)
 }
 
-// MergeVersion produces the new merged version of a message for a
-// mutation (DESIGN.md §13.2, §13.3). current is the target's current
-// latest version (a complete Message); mut is the inbound mutation
-// carrying the action, the operating clientId and the supplied fields;
-// versionSerial is the `<channelSerial>:<idx>` minted for this mutation
-// publish. The result is a complete Message that repeats current's
-// stable identity (Serial) and creator (ClientID), applies shallow-mixin
-// for update/delete/append (only supplied fields replace), stamps
-// action=delete as a soft tombstone for a delete (without dropping the
-// carried body), and carries a fresh Version stamped with the operator,
-// serial, and any operator description/metadata.
+// PresenceSerial is the position of the idx'th presence message in the publish
+// minted at channelSerial — the `<channelSerial>:<idx>` a message-stream item
+// would carry on itself. It is the pagination unit for a presence scan, so a
+// backend derives it from where the message sits rather than reading it off
+// the message.
+func PresenceSerial(channelSerial string, idx int) string {
+	return serial.MessageSerial(channelSerial, idx)
+}
+
+// AnnotationSerial is the position of the idx'th annotation in the publish
+// minted at channelSerial, as an annotation carries it: a timeserial rather
+// than a string, because that is the shape the wire gives it.
+func AnnotationSerial(channelSerial string, idx int) *wire.Timeserial {
+	return wire.MustTimeserialFromString(serial.MessageSerial(channelSerial, idx))
+}
+
+// MergeFunc turns the message being edited and the edit into the version to
+// store, by mutating the edit in place and returning it — so a backend must
+// read anything it needs from the edit before calling it, or read it off the
+// returned version instead. FoldFunc folds one annotation into the message it
+// annotates, reporting whether the summary changed.
 //
-// An append is stored and fanned out as a full action=update whose Data
-// is the rolled-up aggregate, carrying the incremental delta in
-// Alt[DeltaAppend] (action=append, just the new data) so the delivery
-// path can hand a caught-up subscriber the delta rather than the full
-// version (DESIGN.md §13.3). An append whose data cannot concatenate onto
-// the current data (incompatible types) returns ErrIncompatibleAppend.
-func MergeVersion(current, mut *protocol.Message, versionSerial string) (*protocol.Message, error) {
-	v := *current // carry every field forward, then mix in the supplied ones
-	v.Serial = current.Serial
-	v.ConnectionID = current.ConnectionID
-	v.Alt = nil // any prior append delta does not carry forward
+// Both are supplied by the caller rather than called from here, because what
+// an edit does to a message and what an annotation does to a summary are the
+// protocol's and not this server's. What is this server's is that they run
+// with the target loaded and the write not yet made — so a backend calls them
+// inside whatever it uses to make that pair atomic, and a concurrent edit
+// cannot slip between the two.
+//
+// ApplyFunc is the same arrangement for LiveObjects: it folds a state publish
+// into the objects it names, and is given them as the store holds them — those
+// that exist, in StateObjectIDs order — together with the publish's stamped
+// messages. It returns the objects that came out changed, which the backend
+// writes back; an object the publish names but does not change is not
+// returned, and an object it names that did not exist is returned as the new
+// one the operation created.
+//
+// It must not mutate the objects it is given: a backend may be handing it the
+// very values a concurrent read is serving.
+type (
+	MergeFunc func(current, mut *wire.Message, versionSerial string) (*wire.Message, error)
+	FoldFunc  func(msg *wire.Message, annotation *wire.Annotation) bool
+	ApplyFunc func(objects []*wire.StateObject, state []*wire.StateMessage) ([]*wire.StateObject, error)
+)
 
-	// Extras follows the same shallow-mixin as data/name (§13.2), mirroring
-	// the reference's buildUpdateMessage: the copy above carries the current
-	// extras forward, and a mutation that supplies its own extras replaces
-	// the whole field. Applies to update, append and delete alike.
-	if mut.Extras != nil {
-		v.Extras = mut.Extras
-	}
+// ProtocolError carries a failure the shared code decided and described — an
+// append onto data it cannot be appended to, an edit that would exceed the
+// message size — out through a storage call, which reports plain errors.
+// Callers unwrap it with AsProtocolError to tell the client what the protocol
+// said, rather than restating it.
+type ProtocolError struct{ Info *errors.ErrorInfo }
 
-	ts, _ := serial.Timestamp(versionSerial)
-	ver := &protocol.MessageVersion{
-		Serial:    versionSerial,
-		Timestamp: ts,
-		ClientID:  mut.ClientID,
-	}
-	if mut.Version != nil {
-		ver.Description = mut.Version.Description
-		ver.Metadata = mut.Version.Metadata
-	}
+func (e *ProtocolError) Error() string { return e.Info.String() }
 
-	switch mut.Action {
-	case protocol.MessageAppend:
-		concatenated, err := concatData(current.Data, mut.Data)
-		if err != nil {
-			return nil, err
-		}
-		// Apply the append's own name if it supplies one; otherwise the name
-		// carried forward from the create (copied into v above) stands. Done
-		// before cloning the delta so the delta inherits the resolved name.
-		if mut.Name != "" {
-			v.Name = mut.Name
-		}
-		// The delta the delivery path hands a caught-up subscriber: the
-		// incremental append alone, sharing this version so newest-wins
-		// convergence treats the delta and the full aggregate as one. It is
-		// built AFTER identity carry-forward (name, extras, top-level create
-		// timestamp) but carries the incremental data only — mirroring the
-		// reference's buildUpdateMessage, which clones the delta after
-		// populating the carried-forward fields but before concatenating data.
-		// A caught-up subscriber routes an append frame by name/extras exactly
-		// as the create; without the carried-forward name the delta arrives on
-		// the wire nameless and a name-filtering subscriber never sees it — the
-		// durable-supersede failure (the AIT encoder omits name on a
-		// streamed append, relying on this carry-forward).
-		delta := &protocol.Message{
-			Serial:       current.Serial,
-			Action:       protocol.MessageAppend,
-			ClientID:     current.ClientID,
-			ConnectionID: current.ConnectionID,
-			Name:         v.Name,      // carried-forward (or append-supplied) name
-			Timestamp:    v.Timestamp, // the create-time top-level timestamp
-			Data:         mut.Data,
-			Encoding:     mut.Encoding,
-			Extras:       v.Extras, // supplied-or-carried-forward extras (matches the aggregate)
-			Version:      ver,
-		}
-		v.Action = protocol.MessageUpdate
-		v.Data = concatenated
-		if mut.Encoding != "" {
-			v.Encoding = mut.Encoding
-		}
-		v.Alt = map[string]*protocol.Message{protocol.DeltaAppend: delta}
-	default: // update or delete
-		// Shallow-mixin merge: a supplied data/name replaces, an unset field
-		// carries forward from the current version. Delete differs from
-		// update only in the action it stamps — a soft tombstone (§13.2)
-		// whose deletedness is carried by action=delete, not by dropping the
-		// payload. This mirrors the reference's buildUpdateMessage, which
-		// applies the same merge for both and keeps whatever body the delete
-		// carried (an SDK delete sends an explicit data:{}, which round-trips
-		// as {} rather than becoming absent).
-		if mut.Data != nil {
-			v.Data = mut.Data
-			v.Encoding = mut.Encoding
-		}
-		if mut.Name != "" {
-			v.Name = mut.Name
-		}
-		if mut.Action == protocol.MessageDelete {
-			v.Action = protocol.MessageDelete
-		} else {
-			v.Action = protocol.MessageUpdate
-		}
+// AsProtocolError reports whether err carries a protocol failure, and what it
+// was.
+func AsProtocolError(err error) (*errors.ErrorInfo, bool) {
+	var pe *ProtocolError
+	if stderrors.As(err, &pe) {
+		return pe.Info, true
 	}
-
-	v.Version = ver
-	return &v, nil
-}
-
-// concatData concatenates an append's data onto the current value. It is
-// defined only for string-onto-string and binary-onto-binary; any other
-// combination of types is rejected with ErrIncompatibleAppend (DESIGN.md
-// §13.3). A nil current is seeded by the append outright, and a nil
-// addition leaves the current value unchanged.
-func concatData(current, add any) (any, error) {
-	if add == nil {
-		return current, nil
-	}
-	if current == nil {
-		return add, nil
-	}
-	switch c := current.(type) {
-	case string:
-		if a, ok := add.(string); ok {
-			return c + a, nil
-		}
-	case []byte:
-		if a, ok := add.([]byte); ok {
-			return append(append([]byte{}, c...), a...), nil
-		}
-	}
-	return nil, ErrIncompatibleAppend
-}
-
-// CollapseAppendVersions reduces an ascending-by-version list of a single
-// message's versions so appends do not appear as individual entries
-// (DESIGN.md §13.3, §13.4): each maximal run of append aggregates
-// collapses to the run's last (most-aggregated) version, while creates,
-// updates and deletes are kept verbatim. The append-only log still
-// carries every append cm for live and resume fan-out — this only shapes
-// the version-history read-path, so GET .../messages/{serial}/versions
-// reflects the aggregate, never each delta. The input is not mutated.
-func CollapseAppendVersions(all []*protocol.Message) []*protocol.Message {
-	out := make([]*protocol.Message, 0, len(all))
-	for i, m := range all {
-		// Keep an append aggregate only when it is the last of its run —
-		// the next version is not itself an append (or there is none).
-		if m.HasAppendDelta() && i+1 < len(all) && all[i+1].HasAppendDelta() {
-			continue
-		}
-		out = append(out, m)
-	}
-	return out
-}
-
-// VersionSerial returns the serial that identifies a single version of a
-// message — Version.Serial when present (every server-stamped message),
-// falling back to the stable identity Serial. It is the pagination unit
-// for a version-history scan (DESIGN.md §13.4).
-func VersionSerial(m *protocol.Message) string {
-	if m.Version != nil && m.Version.Serial != "" {
-		return m.Version.Serial
-	}
-	return m.Serial
+	return nil, false
 }
 
 // PaginateVersions slices an ascending-by-version list of a single
@@ -567,15 +730,15 @@ func VersionSerial(m *protocol.Message) string {
 // single-message ChannelMessage positioned at the version's own
 // channelSerial. Shared by the in-memory and bbolt backends, which hold
 // the versions list directly; Postgres paginates in SQL.
-func PaginateVersions(all []*protocol.Message, q HistoryQuery) HistoryPage {
+func PaginateVersions(all []*wire.Message, q HistoryQuery) HistoryPage {
 	forwards := q.Direction == DirectionForwards
 	cursor := q.Cursor
 	limit := q.Limit
 
 	var page HistoryPage
 	count := 0
-	emit := func(m *protocol.Message) bool {
-		vs := VersionSerial(m)
+	emit := func(m *wire.Message) bool {
+		vs := m.VersionOrSerial()
 		if cursor != "" {
 			if forwards && vs <= cursor {
 				return true
@@ -590,8 +753,9 @@ func PaginateVersions(all []*protocol.Message, q HistoryQuery) HistoryPage {
 		}
 		page.ChannelMessages = append(page.ChannelMessages, &protocol.ChannelMessage{
 			ChannelSerial: CreateChannelSerial(vs),
-			Messages:      []*protocol.Message{m},
+			Messages:      []*wire.Message{m},
 		})
+		page.LastSerial = vs
 		count++
 		return true
 	}
@@ -619,19 +783,20 @@ func PaginateVersions(all []*protocol.Message, q HistoryQuery) HistoryPage {
 // single-annotation ChannelMessage positioned at its own channelSerial.
 // Shared by the in-memory and bbolt backends, which hold the annotation
 // list directly; Postgres paginates in SQL.
-func PaginateAnnotations(all []*protocol.Annotation, q HistoryQuery) HistoryPage {
+func PaginateAnnotations(all []*wire.Annotation, q HistoryQuery) HistoryPage {
 	forwards := q.Direction == DirectionForwards
 	cursor := q.Cursor
 	limit := q.Limit
 
 	var page HistoryPage
 	count := 0
-	emit := func(a *protocol.Annotation) bool {
+	emit := func(a *wire.Annotation) bool {
+		serial := a.Serial.ToTimeserialString()
 		if cursor != "" {
-			if forwards && a.Serial <= cursor {
+			if forwards && serial <= cursor {
 				return true
 			}
-			if !forwards && a.Serial >= cursor {
+			if !forwards && serial >= cursor {
 				return true
 			}
 		}
@@ -640,9 +805,10 @@ func PaginateAnnotations(all []*protocol.Annotation, q HistoryQuery) HistoryPage
 			return false
 		}
 		page.ChannelMessages = append(page.ChannelMessages, &protocol.ChannelMessage{
-			ChannelSerial: CreateChannelSerial(a.Serial),
-			Annotations:   []*protocol.Annotation{a},
+			ChannelSerial: CreateChannelSerial(serial),
+			Annotations:   []*wire.Annotation{a},
 		})
+		page.LastSerial = serial
 		count++
 		return true
 	}
@@ -693,7 +859,7 @@ func CMItems(cm *protocol.ChannelMessage, kind Kind) []HistItem {
 	case KindPresence:
 		out := make([]HistItem, len(cm.Presence))
 		for i, pm := range cm.Presence {
-			out[i] = HistItem{Serial: pm.Serial, Append: func(dst *protocol.ChannelMessage) {
+			out[i] = HistItem{Serial: PresenceSerial(cm.ChannelSerial, i), Append: func(dst *protocol.ChannelMessage) {
 				dst.Presence = append(dst.Presence, pm)
 			}}
 		}
@@ -701,8 +867,16 @@ func CMItems(cm *protocol.ChannelMessage, kind Kind) []HistItem {
 	case KindAnnotation:
 		out := make([]HistItem, len(cm.Annotations))
 		for i, an := range cm.Annotations {
-			out[i] = HistItem{Serial: an.Serial, Append: func(dst *protocol.ChannelMessage) {
+			out[i] = HistItem{Serial: an.Serial.ToTimeserialString(), Append: func(dst *protocol.ChannelMessage) {
 				dst.Annotations = append(dst.Annotations, an)
+			}}
+		}
+		return out
+	case KindState:
+		out := make([]HistItem, len(cm.State))
+		for i, sm := range cm.State {
+			out[i] = HistItem{Serial: sm.GetSerial().ToTimeserialString(), Append: func(dst *protocol.ChannelMessage) {
+				dst.State = append(dst.State, sm)
 			}}
 		}
 		return out
@@ -836,4 +1010,12 @@ type HistoryPage struct {
 	// requested direction). Counted at Message granularity to match
 	// the Limit semantics.
 	HasMore bool
+
+	// LastSerial is the stream position of the last item on the page —
+	// the cursor the next page carries on after. The scan records it
+	// because only the scan knows it: a page may begin or end with a
+	// partial batch, so an item's place in the page is not its place in
+	// the publish it came from, and a presence item does not carry its
+	// position on itself at all.
+	LastSerial string
 }

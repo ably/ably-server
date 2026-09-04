@@ -3,7 +3,7 @@
 // two top-level buckets:
 //
 //   - channel_messages: the append-only log, keyed
-//     "<channel>\0<channelSerial>", value is the msgpack-encoded
+//     "<channel>\0<channelSerial>", value is the protobuf-encoded
 //     protocol.ChannelMessage (a message or presence cm). bbolt's
 //     byte-order iteration over a "<channel>\0" prefix yields a
 //     channel's ChannelMessages in publish order.
@@ -18,10 +18,17 @@
 // (DESIGN.md §12.5). Presence history still persists as ordinary cms
 // in channel_messages.
 //
-// Per-process seriesId is regenerated on every Open — the same
-// rationale as the Postgres backend (DESIGN.md §8). Generator
-// monotonic state is not persisted; restart monotonicity falls out
-// because wall-clock time advances.
+// The materialised LiveObjects set IS persisted, in the objects bucket
+// (DESIGN.md §15.3). It is the opposite case to presence: an object
+// belongs to the channel rather than to a connection, so a restart that
+// dropped it would lose state no client can re-establish.
+//
+// A channel's seriesId and its generator's monotonic state both
+// survive a restart, recovered from the initials bucket and the last
+// persisted cm when the channel is next materialised (DESIGN.md §8).
+// The series has to, because a change of it tells a client the
+// channel's ordering restarted, and reopening a file whose log is
+// intact restarts nothing.
 package bbolt
 
 import (
@@ -32,26 +39,26 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/vmihailenco/msgpack/v5"
 	bolt "go.etcd.io/bbolt"
 
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/serial"
 	"github.com/ably/ably-server/internal/storage"
+	"github.com/ably/server-protocol/go/wire"
 )
 
 var (
 	channelMessagesBucket = []byte("channel_messages")
 	idsBucket             = []byte("ids")
 	// latestBucket is the materialised messages projection (DESIGN.md
-	// §13.4): keyed "<channel>\0<identity>", value the msgpack-encoded
-	// latest merged protocol.Message (a delete leaves a tombstone whose
+	// §13.4): keyed "<channel>\0<identity>", value the protobuf-encoded
+	// latest merged wire.Message (a delete leaves a tombstone whose
 	// Action is delete). Persisted so collapsed history and single-message
 	// reads survive restarts.
 	latestBucket = []byte("latest")
 	// versionsBucket is the serial→versions index (DESIGN.md §13.4):
 	// keyed "<channel>\0<identity>\0<versionSerial>", value the
-	// msgpack-encoded version protocol.Message. A prefix scan over
+	// protobuf-encoded version wire.Message. A prefix scan over
 	// "<channel>\0<identity>\0" yields every version in version order.
 	versionsBucket = []byte("versions")
 	// initialsBucket maps channel name → the immutable initial serial
@@ -63,12 +70,18 @@ var (
 	initialsBucket = []byte("initials")
 	// annotationsBucket is the annotations-for-message index (DESIGN.md
 	// §14.4): keyed "<channel>\0<target>\0<annotationSerial>", value the
-	// msgpack-encoded protocol.Annotation. A prefix scan over
+	// protobuf-encoded wire.Annotation. A prefix scan over
 	// "<channel>\0<target>\0" yields a message's annotations in stream
 	// order — the bbolt analogue of the postgres channel_messages serial
 	// index. The annotation cms also live in channel_messages so they flow
 	// through the appender and are kind-skipped by message/presence history.
 	annotationsBucket = []byte("annotations")
+	// objectsBucket is the materialised LiveObjects set (DESIGN.md §15.3):
+	// keyed "<channel>\0<objectId>", value the protobuf-encoded
+	// wire.StateObject. bbolt's byte-order iteration over a "<channel>\0"
+	// prefix yields a channel's objects in object-id order, which is the
+	// order a state sync pages them in.
+	objectsBucket = []byte("objects")
 )
 
 // keySep separates the channel name from the rest of a composite key.
@@ -88,8 +101,9 @@ type Options struct {
 
 // Storage is the bbolt-backed storage.Storage.
 type Storage struct {
-	db  *bolt.DB
-	gen *serial.Generator
+	db *bolt.DB
+	// now is the clock every channel's generator reads.
+	now func() int64
 
 	mu       sync.Mutex
 	channels map[string]*channelStore
@@ -125,6 +139,9 @@ func Open(opts Options) (*Storage, error) {
 		if _, err := tx.CreateBucketIfNotExists(annotationsBucket); err != nil {
 			return err
 		}
+		if _, err := tx.CreateBucketIfNotExists(objectsBucket); err != nil {
+			return err
+		}
 		return nil
 	}); err != nil {
 		_ = db.Close()
@@ -133,7 +150,7 @@ func Open(opts Options) (*Storage, error) {
 
 	return &Storage{
 		db:       db,
-		gen:      serial.NewGenerator(serial.NewSeriesID(), opts.Now),
+		now:      opts.Now,
 		channels: make(map[string]*channelStore),
 	}, nil
 }
@@ -146,31 +163,53 @@ func Open(opts Options) (*Storage, error) {
 // current channelSerial is the latest persisted cm's serial, or the
 // initial if the channel has no persisted cms. Both are handed to
 // appender.Initialize before this call returns.
+//
+// The channel's generator is built from those two: it carries on the
+// series the channel was first seeded with, and resumes from where the
+// last persisted cm left off. Both matter across a restart — the
+// series because a change of it tells clients the channel's ordering
+// restarted, and the monotonic state because a restart within the same
+// millisecond would otherwise re-mint a serial already on the log.
 func (s *Storage) Channel(_ context.Context, name string, appender storage.Appender) (storage.ChannelStore, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if cs, ok := s.channels[name]; ok {
 		return cs, nil
 	}
+
+	current, initial, err := s.loadOrMintInitial(name)
+	if err != nil {
+		return nil, err
+	}
+	gen, err := s.generatorFor(current)
+	if err != nil {
+		return nil, fmt.Errorf("storage/bbolt: channel %q: %w", name, err)
+	}
+
 	cs := &channelStore{
 		db:       s.db,
-		gen:      s.gen,
+		gen:      gen,
 		name:     name,
 		appender: appender,
 	}
 	s.channels[name] = cs
 
-	if appender == nil {
-		return cs, nil
+	if appender != nil {
+		appender.Initialize(current, initial)
 	}
+	return cs, nil
+}
 
-	current, initial, err := s.loadOrMintInitial(name)
+// generatorFor returns the generator that continues the series current
+// belongs to, seeded so its first Mint is strictly greater than it.
+func (s *Storage) generatorFor(current string) (*serial.Generator, error) {
+	ts, counter, seriesID, err := serial.SplitChannelSerial(current)
 	if err != nil {
-		delete(s.channels, name)
 		return nil, err
 	}
-	appender.Initialize(current, initial)
-	return cs, nil
+	gen := serial.NewGenerator(seriesID, s.now)
+	gen.Restore(ts, counter)
+	return gen, nil
 }
 
 // loadOrMintInitial returns the channel's (current, initial) serials.
@@ -178,13 +217,17 @@ func (s *Storage) Channel(_ context.Context, name string, appender storage.Appen
 // fresh seed is minted and persisted. current is the latest persisted
 // cm's serial within the channel's prefix, or initial if there are no
 // persisted cms.
+//
+// The seed is where a brand-new channel's series comes from, and it is
+// persisted alongside the initial serial that carries it, so every
+// later Open of this file finds the same one.
 func (s *Storage) loadOrMintInitial(name string) (current, initial string, err error) {
 	err = s.db.Update(func(tx *bolt.Tx) error {
 		initials := tx.Bucket(initialsBucket)
 		if v := initials.Get([]byte(name)); v != nil {
 			initial = string(v)
 		} else {
-			initial = s.gen.Mint()
+			initial = serial.NewGenerator(serial.NewSeriesID(), s.now).Mint()
 			if perr := initials.Put([]byte(name), []byte(initial)); perr != nil {
 				return fmt.Errorf("persist initial for %q: %w", name, perr)
 			}
@@ -265,26 +308,35 @@ func versionPrefix(channel, identity string) []byte {
 	return b
 }
 
-// putVersion records m as a version of its message identity: it upserts
-// the latest-version projection and appends to the versions index within
-// tx. m must already carry its Serial (identity) and Version.
-func putVersion(tx *bolt.Tx, channel string, m *protocol.Message) error {
-	blob, err := msgpack.Marshal(m)
+// putVersion records m as the current content of its message identity, and —
+// unless m carries an append — as an entry in its version chain. It upserts the
+// latest-version projection and appends to the versions index within tx. m must
+// already carry its Serial (identity) and Version.
+//
+// An append is not a version of the message (DESIGN.md §13.3). It changes what
+// the message currently says, which the projection records, and it stays on the
+// log for live and resume fan-out — but a version chain of one entry per
+// increment is not what a streamed append is.
+func putVersion(tx *bolt.Tx, channel string, m *wire.Message) error {
+	blob, err := storage.EncodeMessage(m)
 	if err != nil {
-		return fmt.Errorf("storage/bbolt: encode version: %w", err)
+		return err
 	}
 	if err := tx.Bucket(latestBucket).Put(channelKey(channel, m.Serial), blob); err != nil {
 		return fmt.Errorf("storage/bbolt: put latest: %w", err)
 	}
-	if err := tx.Bucket(versionsBucket).Put(versionKey(channel, m.Serial, storage.VersionSerial(m)), blob); err != nil {
+	if m.HasAppend() {
+		return nil
+	}
+	if err := tx.Bucket(versionsBucket).Put(versionKey(channel, m.Serial, m.VersionOrSerial()), blob); err != nil {
 		return fmt.Errorf("storage/bbolt: put version: %w", err)
 	}
 	return nil
 }
 
 // channelStore is the per-channel facet. Concurrency is controlled by
-// bolt (one writer at a time per DB) and by the shared generator's
-// internal mutex.
+// bolt (one writer at a time per DB) and by the generator's internal
+// mutex.
 type channelStore struct {
 	db       *bolt.DB
 	gen      *serial.Generator
@@ -294,10 +346,18 @@ type channelStore struct {
 	// members is the in-memory presence set, guarded by mu. Not
 	// persisted — empty on Open (DESIGN.md §12.5). Lazily allocated.
 	mu      sync.Mutex
-	members map[string]*protocol.PresenceMessage
+	members map[string]*wire.PresenceMessage
+
+	// occupancy is this process's contribution to the channel's occupancy
+	// (DESIGN.md §16.2), nil when it serves no holders. Like the membership
+	// set it is held in memory and not persisted: occupancy is what is
+	// attached right now, and nothing is attached to a freshly-opened file.
+	// This is the opposite case to the objects bucket, which is persisted
+	// because an object outlives every connection that touched it (§15.3).
+	occupancy *wire.ChannelOccupancy
 }
 
-func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*protocol.ChannelMessage, bool, error) {
+func (cs *channelStore) Store(ctx context.Context, msgs []*wire.Message) (*protocol.ChannelMessage, bool, error) {
 	if len(msgs) == 0 {
 		return nil, false, errors.New("storage/bbolt: Store with no messages")
 	}
@@ -324,19 +384,19 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 		// Idempotency: any contained ID that's already indexed makes
 		// this whole publish a duplicate.
 		for _, m := range msgs {
-			if m.ID == "" {
+			if m.GetId() == "" {
 				continue
 			}
-			if existingCS := ids.Get(channelKey(cs.name, m.ID)); existingCS != nil {
+			if existingCS := ids.Get(channelKey(cs.name, m.GetId())); existingCS != nil {
 				blob := messages.Get(channelKey(cs.name, string(existingCS)))
 				if blob == nil {
 					return fmt.Errorf("storage/bbolt: id index points to missing ChannelMessage %q", existingCS)
 				}
-				var original protocol.ChannelMessage
-				if err := msgpack.Unmarshal(blob, &original); err != nil {
-					return fmt.Errorf("storage/bbolt: decode original ChannelMessage: %w", err)
+				original, err := storage.DecodeChannelMessage(blob)
+				if err != nil {
+					return err
 				}
-				resultCM = &original
+				resultCM = original
 				idempotent = true
 				return nil
 			}
@@ -347,7 +407,7 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 		channelSerial := cs.gen.Mint()
 		for i, m := range msgs {
 			m.Serial = serial.MessageSerial(channelSerial, i)
-			m.Action = protocol.MessageCreate
+			m.Action = wire.MessageAction_MESSAGE_CREATE
 			storage.StampCreateVersion(m)
 		}
 		cm := &protocol.ChannelMessage{
@@ -355,16 +415,16 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 			ChannelSerial: channelSerial,
 			Messages:      msgs,
 		}
-		blob, err := msgpack.Marshal(cm)
+		blob, err := storage.EncodeChannelMessage(cm)
 		if err != nil {
-			return fmt.Errorf("storage/bbolt: encode ChannelMessage: %w", err)
+			return err
 		}
 		if err := messages.Put(channelKey(cs.name, channelSerial), blob); err != nil {
 			return err
 		}
 		for _, m := range msgs {
-			if m.ID != "" {
-				if err := ids.Put(channelKey(cs.name, m.ID), []byte(channelSerial)); err != nil {
+			if m.GetId() != "" {
+				if err := ids.Put(channelKey(cs.name, m.GetId()), []byte(channelSerial)); err != nil {
 					return err
 				}
 			}
@@ -392,13 +452,50 @@ func (cs *channelStore) Store(ctx context.Context, msgs []*protocol.Message) (*p
 	return resultCM, idempotent, nil
 }
 
+// StoreSummary logs the summaries of freshly-annotated messages so they reach
+// subscribers, without recording them as versions (see storage.ChannelStore).
+func (cs *channelStore) StoreSummary(ctx context.Context, summaries []*wire.Message) (*protocol.ChannelMessage, error) {
+	if len(summaries) == 0 {
+		return nil, errors.New("storage/bbolt: StoreSummary with no messages")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	var resultCM *protocol.ChannelMessage
+	err := cs.db.Update(func(tx *bolt.Tx) error {
+		channelSerial := cs.gen.Mint()
+		cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Messages: summaries}
+		blob, err := storage.EncodeChannelMessage(cm)
+		if err != nil {
+			return err
+		}
+		if err := tx.Bucket(channelMessagesBucket).Put(channelKey(cs.name, channelSerial), blob); err != nil {
+			return err
+		}
+		resultCM = cm
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if cs.appender != nil {
+		cs.appender.Append(resultCM)
+	}
+	return resultCM, nil
+}
+
 // Mutate applies an update/delete/append to an existing message
 // (DESIGN.md §13.2): validate the target exists in the projection, merge,
 // mint a fresh version cm carrying the complete merged Message, persist
 // it on the log, and update the latest projection + versions index in the
 // same bolt transaction. The appender fires after commit, like Store.
-func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*protocol.ChannelMessage, bool, error) {
-	if mut == nil || !mut.Action.IsMutation() {
+func (cs *channelStore) Mutate(ctx context.Context, mut *wire.Message, merge storage.MergeFunc) (*protocol.ChannelMessage, bool, error) {
+	if mut == nil || !mut.IsMutation() {
 		return nil, false, errors.New("storage/bbolt: Mutate requires a mutation action")
 	}
 	if mut.Serial == "" {
@@ -416,17 +513,17 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 		messages := tx.Bucket(channelMessagesBucket)
 		ids := tx.Bucket(idsBucket)
 
-		if mut.ID != "" {
-			if existingCS := ids.Get(channelKey(cs.name, mut.ID)); existingCS != nil {
+		if mut.GetId() != "" {
+			if existingCS := ids.Get(channelKey(cs.name, mut.GetId())); existingCS != nil {
 				blob := messages.Get(channelKey(cs.name, string(existingCS)))
 				if blob == nil {
 					return fmt.Errorf("storage/bbolt: id index points to missing ChannelMessage %q", existingCS)
 				}
-				var original protocol.ChannelMessage
-				if err := msgpack.Unmarshal(blob, &original); err != nil {
-					return fmt.Errorf("storage/bbolt: decode original ChannelMessage: %w", err)
+				original, err := storage.DecodeChannelMessage(blob)
+				if err != nil {
+					return err
 				}
-				resultCM = &original
+				resultCM = original
 				idempotent = true
 				return nil
 			}
@@ -436,26 +533,26 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 		if curBlob == nil {
 			return storage.ErrTargetNotFound
 		}
-		var current protocol.Message
-		if err := msgpack.Unmarshal(curBlob, &current); err != nil {
-			return fmt.Errorf("storage/bbolt: decode current version: %w", err)
-		}
-
-		channelSerial := cs.gen.Mint()
-		version, err := storage.MergeVersion(&current, mut, serial.MessageSerial(channelSerial, 0))
+		current, err := storage.DecodeMessage(curBlob)
 		if err != nil {
 			return err
 		}
-		cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Messages: []*protocol.Message{version}}
-		blob, err := msgpack.Marshal(cm)
+
+		channelSerial := cs.gen.Mint()
+		version, err := merge(current, mut, serial.MessageSerial(channelSerial, 0))
 		if err != nil {
-			return fmt.Errorf("storage/bbolt: encode mutation ChannelMessage: %w", err)
+			return err
+		}
+		cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Messages: []*wire.Message{version}}
+		blob, err := storage.EncodeChannelMessage(cm)
+		if err != nil {
+			return err
 		}
 		if err := messages.Put(channelKey(cs.name, channelSerial), blob); err != nil {
 			return err
 		}
-		if mut.ID != "" {
-			if err := ids.Put(channelKey(cs.name, mut.ID), []byte(channelSerial)); err != nil {
+		if mut.GetId() != "" {
+			if err := ids.Put(channelKey(cs.name, mut.GetId()), []byte(channelSerial)); err != nil {
 				return err
 			}
 		}
@@ -477,21 +574,21 @@ func (cs *channelStore) Mutate(ctx context.Context, mut *protocol.Message) (*pro
 
 // LatestVersion returns the projection entry for serial, or
 // ErrTargetNotFound (DESIGN.md §13.4).
-func (cs *channelStore) LatestVersion(ctx context.Context, serial string) (*protocol.Message, error) {
+func (cs *channelStore) LatestVersion(ctx context.Context, serial string) (*wire.Message, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	var out *protocol.Message
+	var out *wire.Message
 	err := cs.db.View(func(tx *bolt.Tx) error {
 		blob := tx.Bucket(latestBucket).Get(channelKey(cs.name, serial))
 		if blob == nil {
 			return storage.ErrTargetNotFound
 		}
-		var m protocol.Message
-		if err := msgpack.Unmarshal(blob, &m); err != nil {
-			return fmt.Errorf("storage/bbolt: decode latest version: %w", err)
+		m, err := storage.DecodeMessage(blob)
+		if err != nil {
+			return err
 		}
-		out = &m
+		out = m
 		return nil
 	})
 	if err != nil {
@@ -508,17 +605,16 @@ func (cs *channelStore) Versions(ctx context.Context, serial string, q storage.H
 	if err := ctx.Err(); err != nil {
 		return storage.HistoryPage{}, err
 	}
-	var all []*protocol.Message
+	var all []*wire.Message
 	err := cs.db.View(func(tx *bolt.Tx) error {
 		prefix := versionPrefix(cs.name, serial)
 		c := tx.Bucket(versionsBucket).Cursor()
 		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
-			var m protocol.Message
-			if err := msgpack.Unmarshal(v, &m); err != nil {
-				return fmt.Errorf("storage/bbolt: decode version %q: %w", k, err)
+			m, err := storage.DecodeMessage(v)
+			if err != nil {
+				return fmt.Errorf("storage/bbolt: version %q: %w", k, err)
 			}
-			mc := m
-			all = append(all, &mc)
+			all = append(all, m)
 		}
 		return nil
 	})
@@ -528,9 +624,7 @@ func (cs *channelStore) Versions(ctx context.Context, serial string, q storage.H
 	if len(all) == 0 {
 		return storage.HistoryPage{}, storage.ErrTargetNotFound
 	}
-	// Collapse append runs so history reflects the aggregate, not each
-	// delta (DESIGN.md §13.3, §13.4); the log keeps every append cm.
-	return storage.PaginateVersions(storage.CollapseAppendVersions(all), q), nil
+	return storage.PaginateVersions(all, q), nil
 }
 
 // annotationKey returns the annotations-bucket key for one annotation of a
@@ -554,7 +648,7 @@ func annotationPrefix(channel, target string) []byte {
 // projection (ErrTargetNotFound otherwise, like a mutation). Idempotency
 // shares the ids bucket with messages/presence. The appender fires after
 // commit, like Store. The returned cm is the annotation summary-fold seam.
-func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*protocol.Annotation) (*protocol.ChannelMessage, bool, error) {
+func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*wire.Annotation, fold storage.FoldFunc) (*protocol.ChannelMessage, bool, error) {
 	if len(annotations) == 0 {
 		return nil, false, errors.New("storage/bbolt: StoreAnnotation with no annotations")
 	}
@@ -571,19 +665,19 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 		ids := tx.Bucket(idsBucket)
 
 		for _, a := range annotations {
-			if a.ID == "" {
+			if a.GetId() == "" {
 				continue
 			}
-			if existingCS := ids.Get(channelKey(cs.name, a.ID)); existingCS != nil {
+			if existingCS := ids.Get(channelKey(cs.name, a.GetId())); existingCS != nil {
 				blob := messages.Get(channelKey(cs.name, string(existingCS)))
 				if blob == nil {
 					return fmt.Errorf("storage/bbolt: id index points to missing ChannelMessage %q", existingCS)
 				}
-				var original protocol.ChannelMessage
-				if err := msgpack.Unmarshal(blob, &original); err != nil {
-					return fmt.Errorf("storage/bbolt: decode original ChannelMessage: %w", err)
+				original, err := storage.DecodeChannelMessage(blob)
+				if err != nil {
+					return err
 				}
-				resultCM = &original
+				resultCM = original
 				idempotent = true
 				return nil
 			}
@@ -600,37 +694,34 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 
 		channelSerial := cs.gen.Mint()
 		for i, a := range annotations {
-			a.Serial = serial.MessageSerial(channelSerial, i)
+			a.Serial = storage.AnnotationSerial(channelSerial, i)
 			// Fold the annotation into its target's summary projection (the
-			// latest bucket) and stamp the post-fold snapshot onto the
-			// annotation for delivery, atomically within this write tx
-			// (DESIGN.md §14.2). a.Summary is msgpack:"-", so it is not
-			// persisted in the cm/annotation blobs below — it rides only the
-			// in-memory resultCM to the appender.
-			if err := foldSummaryTx(latest, cs.name, a); err != nil {
+			// latest bucket), atomically within this write tx (DESIGN.md
+			// §14.2).
+			if err := foldSummaryTx(latest, cs.name, a, fold); err != nil {
 				return err
 			}
 		}
 		cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Annotations: annotations}
-		blob, err := msgpack.Marshal(cm)
+		blob, err := storage.EncodeChannelMessage(cm)
 		if err != nil {
-			return fmt.Errorf("storage/bbolt: encode annotation ChannelMessage: %w", err)
+			return err
 		}
 		if err := messages.Put(channelKey(cs.name, channelSerial), blob); err != nil {
 			return err
 		}
 		annBucket := tx.Bucket(annotationsBucket)
 		for _, a := range annotations {
-			if a.ID != "" {
-				if err := ids.Put(channelKey(cs.name, a.ID), []byte(channelSerial)); err != nil {
+			if a.GetId() != "" {
+				if err := ids.Put(channelKey(cs.name, a.GetId()), []byte(channelSerial)); err != nil {
 					return err
 				}
 			}
-			aBlob, err := msgpack.Marshal(a)
+			aBlob, err := storage.EncodeAnnotation(a)
 			if err != nil {
-				return fmt.Errorf("storage/bbolt: encode annotation: %w", err)
+				return err
 			}
-			if err := annBucket.Put(annotationKey(cs.name, a.MessageSerial, a.Serial), aBlob); err != nil {
+			if err := annBucket.Put(annotationKey(cs.name, a.MessageSerial, a.Serial.ToTimeserialString()), aBlob); err != nil {
 				return err
 			}
 		}
@@ -648,30 +739,25 @@ func (cs *channelStore) StoreAnnotation(ctx context.Context, annotations []*prot
 }
 
 // foldSummaryTx folds one annotation into its target message's summary on
-// the latest-version projection (the latest bucket) and stamps the post-fold
-// snapshot onto the annotation for delivery (DESIGN.md §14.2). It runs inside
-// the StoreAnnotation write tx with the target already validated to exist, so
-// the summary persists on the projection payload (message reads carry it) and
-// the snapshot rides the in-memory annotation to the appender.
-func foldSummaryTx(latest *bolt.Bucket, channel string, a *protocol.Annotation) error {
+// the latest-version projection (the latest bucket) (DESIGN.md §14.2). It runs
+// inside the StoreAnnotation write tx with the target already validated to
+// exist, so the summary persists on the projection payload and every later
+// message read carries it.
+func foldSummaryTx(latest *bolt.Bucket, channel string, a *wire.Annotation, fold storage.FoldFunc) error {
 	blob := latest.Get(channelKey(channel, a.MessageSerial))
 	if blob == nil {
 		return nil
 	}
-	var m protocol.Message
-	if err := msgpack.Unmarshal(blob, &m); err != nil {
-		return fmt.Errorf("storage/bbolt: decode projection for summary fold: %w", err)
-	}
-	m.Summary = m.Summary.Apply(a)
-	updated, err := msgpack.Marshal(&m)
+	m, err := storage.DecodeMessage(blob)
 	if err != nil {
-		return fmt.Errorf("storage/bbolt: encode projection after summary fold: %w", err)
-	}
-	if err := latest.Put(channelKey(channel, a.MessageSerial), updated); err != nil {
 		return err
 	}
-	a.Summary = m.Summary.Clone()
-	return nil
+	fold(m, a)
+	updated, err := storage.EncodeMessage(m)
+	if err != nil {
+		return err
+	}
+	return latest.Put(channelKey(channel, a.MessageSerial), updated)
 }
 
 // Annotations returns the annotations attached to messageSerial in stream
@@ -682,17 +768,16 @@ func (cs *channelStore) Annotations(ctx context.Context, messageSerial string, q
 	if err := ctx.Err(); err != nil {
 		return storage.HistoryPage{}, err
 	}
-	var all []*protocol.Annotation
+	var all []*wire.Annotation
 	err := cs.db.View(func(tx *bolt.Tx) error {
 		prefix := annotationPrefix(cs.name, messageSerial)
 		c := tx.Bucket(annotationsBucket).Cursor()
 		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
-			var a protocol.Annotation
-			if err := msgpack.Unmarshal(v, &a); err != nil {
-				return fmt.Errorf("storage/bbolt: decode annotation %q: %w", k, err)
+			a, err := storage.DecodeAnnotation(v)
+			if err != nil {
+				return fmt.Errorf("storage/bbolt: annotation %q: %w", k, err)
 			}
-			ac := a
-			all = append(all, &ac)
+			all = append(all, a)
 		}
 		return nil
 	})
@@ -708,7 +793,7 @@ func (cs *channelStore) Annotations(ctx context.Context, messageSerial string, q
 // persisted (DESIGN.md §12.5). Idempotency shares the ids bucket with
 // messages. cs.mu is held across the persist + fold so a concurrent
 // Members observes a consistent set; the appender fires after unlock.
-func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.PresenceMessage) (*protocol.ChannelMessage, bool, error) {
+func (cs *channelStore) StorePresence(ctx context.Context, presence []*wire.PresenceMessage) (*protocol.ChannelMessage, bool, error) {
 	if len(presence) == 0 {
 		return nil, false, errors.New("storage/bbolt: StorePresence with no messages")
 	}
@@ -727,19 +812,19 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 		ids := tx.Bucket(idsBucket)
 
 		for _, p := range presence {
-			if p.ID == "" {
+			if p.GetId() == "" {
 				continue
 			}
-			if existingCS := ids.Get(channelKey(cs.name, p.ID)); existingCS != nil {
+			if existingCS := ids.Get(channelKey(cs.name, p.GetId())); existingCS != nil {
 				blob := messages.Get(channelKey(cs.name, string(existingCS)))
 				if blob == nil {
 					return fmt.Errorf("storage/bbolt: id index points to missing ChannelMessage %q", existingCS)
 				}
-				var original protocol.ChannelMessage
-				if err := msgpack.Unmarshal(blob, &original); err != nil {
-					return fmt.Errorf("storage/bbolt: decode original ChannelMessage: %w", err)
+				original, err := storage.DecodeChannelMessage(blob)
+				if err != nil {
+					return err
 				}
-				resultCM = &original
+				resultCM = original
 				idempotent = true
 				return nil
 			}
@@ -750,18 +835,18 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 			storage.StampPresenceMember(p, channelSerial, i)
 		}
 		cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, Presence: presence}
-		blob, err := msgpack.Marshal(cm)
+		blob, err := storage.EncodeChannelMessage(cm)
 		if err != nil {
-			return fmt.Errorf("storage/bbolt: encode presence ChannelMessage: %w", err)
+			return err
 		}
 		if err := messages.Put(channelKey(cs.name, channelSerial), blob); err != nil {
 			return err
 		}
 		for _, p := range presence {
-			if p.ID == "" {
+			if p.GetId() == "" {
 				continue
 			}
-			if err := ids.Put(channelKey(cs.name, p.ID), []byte(channelSerial)); err != nil {
+			if err := ids.Put(channelKey(cs.name, p.GetId()), []byte(channelSerial)); err != nil {
 				return err
 			}
 		}
@@ -775,12 +860,12 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 
 	if !idempotent {
 		if cs.members == nil {
-			cs.members = make(map[string]*protocol.PresenceMessage)
+			cs.members = make(map[string]*wire.PresenceMessage)
 		}
 		for _, p := range resultCM.Presence {
-			key := storage.MemberKey(p.ConnectionID, p.ClientID)
+			key := storage.MemberKey(p.ConnectionId, p.GetClientId())
 			switch p.Action {
-			case protocol.PresenceLeave, protocol.PresenceAbsent:
+			case wire.PresenceMessage_LEAVE, wire.PresenceMessage_ABSENT:
 				delete(cs.members, key)
 			default: // Enter, Update, Present
 				cs.members[key] = p
@@ -798,18 +883,21 @@ func (cs *channelStore) StorePresence(ctx context.Context, presence []*protocol.
 // Members returns the in-memory membership set (sorted by Serial) plus
 // the channel's current watermark — the last channelSerial persisted in
 // the log, or empty if the channel has no cms.
-func (cs *channelStore) Members(ctx context.Context) ([]*protocol.PresenceMessage, string, error) {
+func (cs *channelStore) Members(ctx context.Context, q storage.MembersQuery) (storage.MembersPage, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, "", err
+		return storage.MembersPage{}, err
 	}
 
 	cs.mu.Lock()
-	out := make([]*protocol.PresenceMessage, 0, len(cs.members))
+	out := make([]*wire.PresenceMessage, 0, len(cs.members))
 	for _, p := range cs.members {
 		out = append(out, p)
 	}
 	cs.mu.Unlock()
-	sort.Slice(out, func(i, j int) bool { return out[i].Serial < out[j].Serial })
+	sort.Slice(out, func(i, j int) bool {
+		return storage.MemberKey(out[i].ConnectionId, out[i].GetClientId()) <
+			storage.MemberKey(out[j].ConnectionId, out[j].GetClientId())
+	})
 
 	var asOf string
 	err := cs.db.View(func(tx *bolt.Tx) error {
@@ -828,9 +916,210 @@ func (cs *channelStore) Members(ctx context.Context) ([]*protocol.PresenceMessag
 		return nil
 	})
 	if err != nil {
-		return nil, "", fmt.Errorf("storage/bbolt: Members watermark: %w", err)
+		return storage.MembersPage{}, fmt.Errorf("storage/bbolt: Members watermark: %w", err)
 	}
-	return out, asOf, nil
+
+	out, next := storage.PageMembers(out, q)
+	return storage.MembersPage{Members: out, AsOfSerial: asOf, NextCursor: next}, nil
+}
+
+// StoreState persists a LiveObjects publish onto the channel_messages log and
+// applies its operations to the objects bucket, both inside one write tx
+// (DESIGN.md §15.2, §15.3). Idempotency shares the ids bucket with messages
+// and presence.
+//
+// The apply runs inside the tx, between loading the objects the publish names
+// and writing back the ones it changed: bolt allows one writer at a time, so
+// nothing can have changed them in between. cs.mu is held across the tx for
+// the same reason StorePresence holds it — a state publish and a presence
+// publish on the same channel must not interleave their serial mints.
+func (cs *channelStore) StoreState(ctx context.Context, state []*wire.StateMessage, apply storage.ApplyFunc) (*protocol.ChannelMessage, bool, error) {
+	if len(state) == 0 {
+		return nil, false, errors.New("storage/bbolt: StoreState with no messages")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	var (
+		resultCM   *protocol.ChannelMessage
+		idempotent bool
+	)
+	err := cs.db.Update(func(tx *bolt.Tx) error {
+		messages := tx.Bucket(channelMessagesBucket)
+		ids := tx.Bucket(idsBucket)
+		objects := tx.Bucket(objectsBucket)
+
+		for _, sm := range state {
+			if sm.GetId() == "" {
+				continue
+			}
+			if existingCS := ids.Get(channelKey(cs.name, sm.GetId())); existingCS != nil {
+				blob := messages.Get(channelKey(cs.name, string(existingCS)))
+				if blob == nil {
+					return fmt.Errorf("storage/bbolt: id index points to missing ChannelMessage %q", existingCS)
+				}
+				original, err := storage.DecodeChannelMessage(blob)
+				if err != nil {
+					return err
+				}
+				resultCM = original
+				idempotent = true
+				return nil
+			}
+		}
+
+		channelSerial := cs.gen.Mint()
+		for i, sm := range state {
+			storage.StampStateMessage(sm, channelSerial, i)
+		}
+
+		named := make([]*wire.StateObject, 0, len(state))
+		for _, id := range storage.StateObjectIDs(state) {
+			blob := objects.Get(channelKey(cs.name, id))
+			if blob == nil {
+				continue
+			}
+			obj, err := storage.DecodeStateObject(blob)
+			if err != nil {
+				return err
+			}
+			named = append(named, obj)
+		}
+		changed, err := apply(named, state)
+		if err != nil {
+			return err
+		}
+
+		cm := &protocol.ChannelMessage{ChannelSerial: channelSerial, State: state}
+		blob, err := storage.EncodeChannelMessage(cm)
+		if err != nil {
+			return err
+		}
+		if err := messages.Put(channelKey(cs.name, channelSerial), blob); err != nil {
+			return err
+		}
+		for _, sm := range state {
+			if sm.GetId() == "" {
+				continue
+			}
+			if err := ids.Put(channelKey(cs.name, sm.GetId()), []byte(channelSerial)); err != nil {
+				return err
+			}
+		}
+		for _, obj := range changed {
+			objBlob, err := storage.EncodeStateObject(obj)
+			if err != nil {
+				return err
+			}
+			if err := objects.Put(channelKey(cs.name, obj.GetObjectId()), objBlob); err != nil {
+				return err
+			}
+		}
+		resultCM = cm
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+
+	if !idempotent && cs.appender != nil {
+		cs.appender.Append(resultCM)
+	}
+	return resultCM, idempotent, nil
+}
+
+// Objects pages the materialised object set with a prefix scan over the
+// objects bucket, which bolt walks in key order — so the page comes out
+// ordered by object id, and the cursor is the id to Seek to next.
+func (cs *channelStore) Objects(ctx context.Context, q storage.ObjectsQuery) (storage.ObjectsPage, error) {
+	if err := ctx.Err(); err != nil {
+		return storage.ObjectsPage{}, err
+	}
+
+	var page storage.ObjectsPage
+	err := cs.db.View(func(tx *bolt.Tx) error {
+		prefix := channelPrefix(cs.name)
+		c := tx.Bucket(objectsBucket).Cursor()
+
+		seek := prefix
+		if q.After != "" {
+			seek = channelKey(cs.name, q.After)
+		}
+		for k, v := c.Seek(seek); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+			id := string(k[len(prefix):])
+			if q.After != "" && id <= q.After {
+				continue
+			}
+			if q.Limit > 0 && len(page.Objects) == q.Limit {
+				// One past the page: where the next one starts.
+				page.NextCursor = page.Objects[len(page.Objects)-1].GetObjectId()
+				break
+			}
+			obj, err := storage.DecodeStateObject(v)
+			if err != nil {
+				return err
+			}
+			page.Objects = append(page.Objects, obj)
+		}
+
+		messages := tx.Bucket(channelMessagesBucket)
+		mc := messages.Cursor()
+		k, _ := mc.Seek(nextPrefix(prefix))
+		if k == nil {
+			k, _ = mc.Last()
+		} else {
+			k, _ = mc.Prev()
+		}
+		if k != nil && bytes.HasPrefix(k, prefix) {
+			page.AsOfSerial = string(k[len(prefix):])
+		}
+		return nil
+	})
+	if err != nil {
+		return storage.ObjectsPage{}, fmt.Errorf("storage/bbolt: Objects: %w", err)
+	}
+	return page, nil
+}
+
+// StoreOccupancy records this process's contribution and signals the appender.
+// Like the membership set it stays in memory, so there is no write tx: bolt is
+// one process, and the contribution is therefore also the aggregate.
+func (cs *channelStore) StoreOccupancy(ctx context.Context, counts *wire.ChannelOccupancy) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	cs.mu.Lock()
+	if storage.OccupancyIsEmpty(counts) {
+		cs.occupancy = nil
+	} else {
+		cs.occupancy = storage.CopyOccupancy(counts)
+	}
+	cs.mu.Unlock()
+
+	if cs.appender != nil {
+		cs.appender.OccupancyChanged()
+	}
+	return nil
+}
+
+// Occupancy is this process's contribution plus the size of the membership
+// set, which is where presenceMembers comes from.
+func (cs *channelStore) Occupancy(ctx context.Context) (*wire.ChannelOccupancy, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	agg := &wire.ChannelOccupancy{}
+	storage.SumOccupancy(agg, cs.occupancy)
+	agg.PresenceMembers = int32(len(cs.members))
+	return agg, nil
 }
 
 // History runs a direction-aware range scan over the channel's
@@ -894,7 +1183,7 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 	// emit appends one item (Message or PresenceMessage, via put) onto
 	// the trailing ChannelMessage when its channelSerial matches, or
 	// starts a fresh entry otherwise. Returns false once Limit is hit.
-	emit := func(channelSerial string, put func(dst *protocol.ChannelMessage)) bool {
+	emit := func(channelSerial, itemSerial string, put func(dst *protocol.ChannelMessage)) bool {
 		if limit > 0 && count >= limit {
 			page.HasMore = true
 			return false
@@ -907,6 +1196,7 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 			page.ChannelMessages = append(page.ChannelMessages, current)
 		}
 		put(current)
+		page.LastSerial = itemSerial
 		count++
 		return true
 	}
@@ -919,9 +1209,9 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 		c := messages.Cursor()
 
 		decode := func(k, v []byte) (*protocol.ChannelMessage, error) {
-			cm := &protocol.ChannelMessage{}
-			if err := msgpack.Unmarshal(v, cm); err != nil {
-				return nil, fmt.Errorf("storage/bbolt: decode ChannelMessage %q: %w", k, err)
+			cm, err := storage.DecodeChannelMessage(v)
+			if err != nil {
+				return nil, fmt.Errorf("storage/bbolt: ChannelMessage %q: %w", k, err)
 			}
 			return cm, nil
 		}
@@ -939,7 +1229,7 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 					if cursor != "" && it.Serial <= cursor {
 						continue
 					}
-					if !emit(cm.ChannelSerial, it.Append) {
+					if !emit(cm.ChannelSerial, it.Serial, it.Append) {
 						return nil
 					}
 				}
@@ -969,7 +1259,7 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 				if cursor != "" && items[idx].Serial >= cursor {
 					continue
 				}
-				if !emit(cm.ChannelSerial, items[idx].Append) {
+				if !emit(cm.ChannelSerial, items[idx].Serial, items[idx].Append) {
 					return nil
 				}
 			}
@@ -1002,7 +1292,7 @@ func (cs *channelStore) collapsedHistory(q storage.HistoryQuery) (storage.Histor
 
 	var page storage.HistoryPage
 	count := 0
-	emit := func(m *protocol.Message) bool {
+	emit := func(m *wire.Message) bool {
 		if limit > 0 && count >= limit {
 			page.HasMore = true
 			return false
@@ -1013,9 +1303,10 @@ func (cs *channelStore) collapsedHistory(q storage.HistoryQuery) (storage.Histor
 		} else {
 			page.ChannelMessages = append(page.ChannelMessages, &protocol.ChannelMessage{
 				ChannelSerial: ccs,
-				Messages:      []*protocol.Message{m},
+				Messages:      []*wire.Message{m},
 			})
 		}
+		page.LastSerial = m.Serial
 		count++
 		return true
 	}
@@ -1024,13 +1315,13 @@ func (cs *channelStore) collapsedHistory(q storage.HistoryQuery) (storage.Histor
 		c := tx.Bucket(latestBucket).Cursor()
 		// identity == "<channel>\0<createSerial>:<idx>"; time bounds and
 		// cursor compare against the identity (sans the channel prefix).
-		decodeAt := func(k, v []byte) (string, *protocol.Message, error) {
+		decodeAt := func(k, v []byte) (string, *wire.Message, error) {
 			identity := string(k[len(prefix):])
-			var m protocol.Message
-			if err := msgpack.Unmarshal(v, &m); err != nil {
-				return "", nil, fmt.Errorf("storage/bbolt: decode projection %q: %w", k, err)
+			m, err := storage.DecodeMessage(v)
+			if err != nil {
+				return "", nil, fmt.Errorf("storage/bbolt: projection %q: %w", k, err)
 			}
-			return identity, &m, nil
+			return identity, m, nil
 		}
 		inBounds := func(identity string) bool {
 			if timeLower != "" && identity < timeLower {

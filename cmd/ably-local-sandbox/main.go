@@ -1,5 +1,5 @@
 // Command ably-local-sandbox is a disposable-instance provisioner for the Ably
-// SDK test suites (DESIGN.md §15). It implements the sandbox admin API
+// SDK test suites (DESIGN.md §17). It implements the sandbox admin API
 // (POST /apps, DELETE /apps/{appId}, POST /stats) by booting one
 // ably-server child per provisioned app, keeping the core server strictly
 // single-app. Its working name is provisional, pending a final naming decision.

@@ -18,5 +18,6 @@
 # sole prior entry — a suspend/resume run-completion timeout — was an upstream
 # client-side race in the SDK's own test helper (awaitRunComplete fell back to
 # the tree's structural `update` event, which never fires for a status-only
-# run-end); ably-ai-transport-js#276 fixed it to listen on `run` instead, and the
-# test now passes deterministically. Anything failing here now is a regression.
+# run-end); ably-ai-transport-js#276 (bc60790) fixed it to listen on `run`
+# instead, and the test now passes deterministically. Anything failing here now
+# is a regression.

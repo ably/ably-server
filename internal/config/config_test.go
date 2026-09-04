@@ -89,6 +89,11 @@ persisted = true
 id = "mutable"
 mutableMessages = true
 
+[[namespaces]]
+id = "*:edits"
+mode = "matcher"
+mutableMessages = true
+
 [[channels]]
 name = "persisted:presence_fixtures"
 
@@ -108,6 +113,7 @@ name = "persisted:presence_fixtures"
 	wantNS := []Namespace{
 		{ID: "persisted", Persisted: true},
 		{ID: "mutable", MutableMessages: true},
+		{ID: "*:edits", Mode: "matcher", MutableMessages: true},
 	}
 	if !reflect.DeepEqual(f.Namespaces, wantNS) {
 		t.Errorf("Namespaces = %+v, want %+v", f.Namespaces, wantNS)
