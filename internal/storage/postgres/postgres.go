@@ -1288,7 +1288,6 @@ func (cs *channelStore) Versions(ctx context.Context, serial2 string, q storage.
 			ChannelSerial: cs2,
 			Messages:      []*wire.Message{m},
 		})
-		page.LastSerial = m.VersionOrSerial()
 	}
 	if err := rows.Err(); err != nil {
 		return storage.HistoryPage{}, fmt.Errorf("storage/postgres: versions rows: %w", err)
@@ -1299,6 +1298,15 @@ func (cs *channelStore) Versions(ctx context.Context, serial2 string, q storage.
 	if q.Limit > 0 && len(page.ChannelMessages) > q.Limit {
 		page.ChannelMessages = page.ChannelMessages[:q.Limit]
 		page.HasMore = true
+	}
+	// A version scan pages by version rather than by the serial every version
+	// of a message shares, so this cannot go through setLastSerial. Read after
+	// the trim all the same, or the link names the row that was dropped and
+	// the next page starts past it.
+	if n := len(page.ChannelMessages); n > 0 {
+		if msgs := page.ChannelMessages[n-1].Messages; len(msgs) > 0 {
+			page.LastSerial = msgs[len(msgs)-1].VersionOrSerial()
+		}
 	}
 	return page, nil
 }
@@ -1664,6 +1672,7 @@ func (cs *channelStore) Annotations(ctx context.Context, messageSerial string, q
 		trimToLimit(&page, q.Limit)
 		page.HasMore = true
 	}
+	setLastSerial(&page, storage.KindAnnotation)
 	return page, nil
 }
 
@@ -2217,6 +2226,7 @@ func (cs *channelStore) History(ctx context.Context, q storage.HistoryQuery) (st
 		trimToLimit(&page, limit)
 		page.HasMore = true
 	}
+	setLastSerial(&page, wantKind)
 	return page, nil
 }
 
@@ -2284,7 +2294,23 @@ func (cs *channelStore) collapsedHistory(ctx context.Context, q storage.HistoryQ
 		trimToLimit(&page, q.Limit)
 		page.HasMore = true
 	}
+	setLastSerial(&page, storage.KindMessage)
 	return page, nil
+}
+
+// setLastSerial records where the next page starts from. It is read after any
+// trim, so that it names an item the caller was actually sent rather than the
+// extra one fetched to find out whether there was more. Without it the next
+// link carries an empty cursor, which these queries read as no cursor at all,
+// and answer with the first page again.
+func setLastSerial(page *storage.HistoryPage, kind storage.Kind) {
+	n := len(page.ChannelMessages)
+	if n == 0 {
+		return
+	}
+	if items := storage.CMItems(page.ChannelMessages[n-1], kind); len(items) > 0 {
+		page.LastSerial = items[len(items)-1].Serial
+	}
 }
 
 // appendMessage tacks m onto the trailing ChannelMessage when its
