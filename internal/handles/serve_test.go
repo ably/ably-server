@@ -127,6 +127,7 @@ func newTestServers(t *testing.T) *testStack {
 	p, err := New(
 		t.Context(),
 		c,
+		app,
 		NewManager(app, channels, nil, log),
 		NewChannelManager(channels, c, app.Namespaces(), log),
 		NewAuthManager(c.Auth, log),

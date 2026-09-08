@@ -34,13 +34,13 @@ type sharedOptions struct {
 // attachment, the channel semantics, the wire framing, the REST surface — and
 // what this supplies is the storage underneath it, the keys, the namespaces
 // and somewhere to log.
-func newSharedProtocol(ctx context.Context, keys []auth.APIKey, file config.File, channels *core.Manager, m *metrics.Metrics, logger *logging.Logger, opts sharedOptions) (*handles.Protocol, error) {
+func newSharedProtocol(ctx context.Context, keys []auth.APIKey, namespaces []config.Namespace, channels *core.Manager, m *metrics.Metrics, logger *logging.Logger, opts sharedOptions) (*handles.Protocol, error) {
 	appID := "ably-server"
 	if len(keys) > 0 {
 		appID = keys[0].AppID
 	}
 
-	app, err := handles.NewApp(appID, keys, file.Namespaces, m)
+	app, err := handles.NewApp(appID, keys, namespaces, m)
 	if err != nil {
 		return nil, err
 	}
@@ -80,6 +80,7 @@ func newSharedProtocol(ctx context.Context, keys []auth.APIKey, file config.File
 	return handles.New(
 		ctx,
 		c,
+		app,
 		handles.NewManager(app, channels, m, logger),
 		handles.NewChannelManager(channels, c, app.Namespaces(), logger),
 		handles.NewAuthManager(c.Auth, logger),

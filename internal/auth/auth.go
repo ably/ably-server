@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -251,10 +252,15 @@ func (p *Principal) Capabilities() Capability {
 // startup, DESIGN.md §3): the server owns one channel namespace, so the
 // keys differ only in keyId/secret and capability. A request
 // authenticates against ANY configured key.
+//
+// The key set can be replaced while the server is running (SetKeys), since
+// this server's keys can change under it (DESIGN.md §9.1). What must not be
+// replaced with them is the nonce set: a token request's nonce is only good
+// once, and a reconfiguration is not a reason to accept a replay.
 type Authenticator struct {
-	keys   []APIKey
-	byName map[string]APIKey // appId.keyId -> key, for kid / keyName lookup
-	appID  string            // the single appId all keys share (§3)
+	// keys is the current key set, swapped whole by SetKeys so that a request
+	// reads one consistent set without a lock.
+	keys   atomic.Pointer[keySet]
 	parser *jwt.Parser
 
 	// nonceMu guards seenNonces, the set of token-request nonces accepted
@@ -265,25 +271,20 @@ type Authenticator struct {
 	nonceReaped time.Time
 }
 
+// keySet is one generation of the configured keys, indexed the two ways a
+// request reaches one: the whole list for a constant-time secret compare, and
+// by name for a kid or keyName lookup.
+type keySet struct {
+	all    []APIKey
+	byName map[string]APIKey // appId.keyId -> key
+	appID  string            // the single appId all keys share (§3)
+}
+
 // NewAuthenticator constructs an Authenticator accepting any of the
 // given keys. At least one key is required; the caller (cmd/ably-server)
 // enforces that and the shared-appId invariant at startup.
 func NewAuthenticator(keys ...APIKey) *Authenticator {
-	byName := make(map[string]APIKey, len(keys))
-	for _, k := range keys {
-		byName[k.Name()] = k
-	}
-	// All keys share one appId (shared-appId invariant, enforced by the
-	// caller); take it from the first key to distinguish "unknown key on
-	// our app" from "unknown app" during token verification.
-	var appID string
-	if len(keys) > 0 {
-		appID = keys[0].AppID
-	}
-	return &Authenticator{
-		keys:       keys,
-		byName:     byName,
-		appID:      appID,
+	a := &Authenticator{
 		seenNonces: make(map[string]time.Time),
 		parser: jwt.NewParser(
 			jwt.WithValidMethods([]string{"HS256"}),
@@ -294,7 +295,40 @@ func NewAuthenticator(keys ...APIKey) *Authenticator {
 			jwt.WithExpirationRequired(), // exp must be present
 		),
 	}
+	a.SetKeys(keys...)
+	return a
 }
+
+// SetKeys replaces the keys this authenticator accepts. A credential
+// presented from now on is checked against the new set; one already accepted
+// is not revisited, this being the entry point rather than a session.
+//
+// The appId is taken from the new set, and kept when that set is empty: it is
+// what distinguishes a token for another app from a token for an unknown key
+// of this one, and a server that has had its last key removed still hosts the
+// app it was started for.
+func (a *Authenticator) SetKeys(keys ...APIKey) {
+	set := &keySet{
+		all:    keys,
+		byName: make(map[string]APIKey, len(keys)),
+	}
+	for _, k := range keys {
+		set.byName[k.Name()] = k
+	}
+	// All keys share one appId (shared-appId invariant, enforced by the
+	// caller); take it from the first key to distinguish "unknown key on
+	// our app" from "unknown app" during token verification.
+	switch {
+	case len(keys) > 0:
+		set.appID = keys[0].AppID
+	case a.keys.Load() != nil:
+		set.appID = a.keys.Load().appID
+	}
+	a.keys.Store(set)
+}
+
+// Keys are the keys currently accepted.
+func (a *Authenticator) Keys() []APIKey { return a.keys.Load().all }
 
 // matchKey returns the configured key equal to presented, comparing in
 // constant time. Every key is compared (no early return) so the timing
@@ -304,7 +338,7 @@ func (a *Authenticator) matchKey(presented string) (APIKey, bool) {
 	pb := []byte(presented)
 	var matched APIKey
 	found := 0
-	for _, k := range a.keys {
+	for _, k := range a.keys.Load().all {
 		eq := subtle.ConstantTimeCompare(pb, []byte(k.raw))
 		if eq == 1 {
 			matched = k
@@ -343,18 +377,19 @@ func (a *Authenticator) verifyToken(tokenString string) (*Principal, error) {
 	// capability can bound the token's (§3): claim ∩ key, with an absent
 	// claim inheriting the key's capability outright.
 	var signingKey APIKey
+	keys := a.keys.Load()
 	_, err := a.parser.ParseWithClaims(tokenString, claims, func(t *jwt.Token) (any, error) {
 		kid, ok := t.Header["kid"].(string)
 		if !ok {
 			return nil, errors.New("token has no kid header")
 		}
-		k, ok := a.byName[kid]
+		k, ok := keys.byName[kid]
 		if !ok {
 			// A kid is appId.keyId. If its appId isn't the one this server
 			// hosts, the token belongs to a different app entirely — a
 			// non-renewable failure (ErrUnknownApp -> 40400), distinct from
 			// the right-app-wrong-key case below (ErrInvalidJWT -> 40144).
-			if appID, _, found := strings.Cut(kid, "."); found && appID != a.appID {
+			if appID, _, found := strings.Cut(kid, "."); found && appID != keys.appID {
 				return nil, fmt.Errorf("%w: %q", ErrUnknownApp, appID)
 			}
 			return nil, fmt.Errorf("token kid %q names no configured key", kid)
@@ -622,7 +657,7 @@ func (tr *TokenRequest) tokenRequestText() string {
 // for the same key (the key holder is explicitly authenticated). Returns
 // ErrInvalidToken on any failure.
 func (a *Authenticator) ValidateTokenRequest(tr *TokenRequest, r *http.Request) error {
-	key, ok := a.byName[tr.KeyName]
+	key, ok := a.keys.Load().byName[tr.KeyName]
 	if !ok {
 		return fmt.Errorf("%w: unknown key %q", ErrInvalidToken, tr.KeyName)
 	}
@@ -701,7 +736,7 @@ func (a *Authenticator) recordNonce(nonce string) bool {
 // minted token inherits the key's capability at verification time.
 // Returns the signed token and its expiry.
 func (a *Authenticator) MintToken(tr *TokenRequest) (token string, issued, expires time.Time, capability string, err error) {
-	key, ok := a.byName[tr.KeyName]
+	key, ok := a.keys.Load().byName[tr.KeyName]
 	if !ok {
 		return "", time.Time{}, time.Time{}, "", fmt.Errorf("%w: unknown key %q", ErrInvalidToken, tr.KeyName)
 	}

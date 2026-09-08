@@ -52,6 +52,14 @@ type File struct {
 	// seeded at startup as static fixtures (DESIGN.md §9, §12.5),
 	// replacing the retired --fixtures JSON path.
 	Channels []Channel `toml:"channels"`
+	// KeysDir, NamespacesDir and AppStatusFile name the sources that are read
+	// again while the server runs, so that a key, a namespace or the app's
+	// status can change under it (DESIGN.md §9.1). They are paths in the file
+	// tier of the usual precedence chain, like every other option here; what
+	// they point at is described on Dynamic.
+	KeysDir       string `toml:"keys-dir"`
+	NamespacesDir string `toml:"namespaces-dir"`
+	AppStatusFile string `toml:"app-status-file"`
 }
 
 // KeyEntry is one structured [[keys]] entry (DESIGN.md §3.1, §9): an

@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/ably/ably-server/internal/auth"
-	"github.com/ably/ably-server/internal/config"
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/logging"
 	"github.com/ably/ably-server/internal/rest"
@@ -23,7 +22,7 @@ func TestMuxWebSocketOnlyAtRoot(t *testing.T) {
 	}
 	mgr := core.NewManager(memory.New(memory.Options{}))
 	logger := logging.New(slog.DiscardHandler)
-	shared, err := newSharedProtocol(t.Context(), []auth.APIKey{key}, config.File{}, mgr, nil, logger, sharedOptions{})
+	shared, err := newSharedProtocol(t.Context(), []auth.APIKey{key}, nil, mgr, nil, logger, sharedOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +99,7 @@ func TestStatsStubGating(t *testing.T) {
 	newServer := func(enableStatsStub bool) *httptest.Server {
 		mgr := core.NewManager(memory.New(memory.Options{}))
 		logger := logging.New(slog.DiscardHandler)
-		shared, err := newSharedProtocol(t.Context(), []auth.APIKey{key}, config.File{}, mgr, nil, logger, sharedOptions{})
+		shared, err := newSharedProtocol(t.Context(), []auth.APIKey{key}, nil, mgr, nil, logger, sharedOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}

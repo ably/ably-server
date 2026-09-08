@@ -33,9 +33,11 @@ const trimInterval = 30 * time.Second
 // disconnected, and be subscribed-to or not. A channel that is local storage
 // is none of those things, and answers them by saying so.
 type liveChannel struct {
-	ch        *core.Channel
-	cache     *channel.Cache
-	namespace *live.Value[*wire.Namespace]
+	ch    *core.Channel
+	cache *channel.Cache
+	// namespace is the channel's namespace, kept resolved for as long as the
+	// channel lives: this server's namespaces can change under it.
+	namespace *namespaceWatch
 	leaves    *delayedLeaves
 	log       logging.Logger
 
@@ -63,7 +65,7 @@ type liveChannel struct {
 
 var _ channel.Channel = (*liveChannel)(nil)
 
-func newLiveChannel(parent context.Context, ch *core.Channel, cache *channel.Cache, namespace *live.Value[*wire.Namespace], log logging.Logger) *liveChannel {
+func newLiveChannel(parent context.Context, ch *core.Channel, cache *channel.Cache, namespace *namespaceWatch, log logging.Logger) *liveChannel {
 	ctx, stop := context.WithCancel(parent)
 	return &liveChannel{
 		ch:             ch,
@@ -97,6 +99,7 @@ func (c *liveChannel) Start(ctx context.Context) error {
 		go c.tail(stream)
 		go c.trim()
 		go c.occupancy.run(c.ctx)
+		go c.namespace.run(c.ctx)
 	})
 	return c.startErr
 }
@@ -173,11 +176,12 @@ func (c *liveChannel) ChannelSerial() *wire.Timeserial {
 	return c.cache.MessageCache().ChannelSerial()
 }
 
-// Namespace is watched rather than read once, because on a server whose apps
-// are configured live a namespace change has to reach an attached channel.
-// This server reads its config at startup, so the value never changes.
+// Namespace is watched rather than read once, because a namespace change has
+// to reach a channel that is already attached: this server re-reads its
+// namespaces while it runs (DESIGN.md §9.1), and the channel keeps resolving
+// itself against them for as long as it lives.
 func (c *liveChannel) Namespace(context.Context) (*live.Value[*wire.Namespace], *errors.ErrorInfo) {
-	return c.namespace, nil
+	return c.namespace.value, nil
 }
 
 // Publishing is in publish.go.

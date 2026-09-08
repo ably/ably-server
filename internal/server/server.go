@@ -19,6 +19,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,8 +38,6 @@ import (
 	"github.com/ably/ably-server/internal/storage/memory"
 	"github.com/ably/ably-server/internal/storage/postgres"
 	"github.com/ably/ably-server/internal/tracing"
-
-	protoapp "github.com/ably/server-protocol/go/app"
 )
 
 const (
@@ -54,6 +53,9 @@ const (
 	configPathEnv      = "ABLY_SERVER_CONFIG"
 	addrFileEnv        = "ABLY_SERVER_ADDR_FILE"
 	enableStatsStubEnv = "ABLY_SERVER_ENABLE_STATS_STUB"
+	keysDirEnv         = "ABLY_SERVER_KEYS_DIR"
+	namespacesDirEnv   = "ABLY_SERVER_NAMESPACES_DIR"
+	appStatusFileEnv   = "ABLY_SERVER_APP_STATUS_FILE"
 )
 
 // Opts bundles Run's inputs so the production main() and tests
@@ -133,6 +135,9 @@ func Run(ctx context.Context, opts Opts) int {
 	debugListen := fs.String("debug-listen", config.Default(opts.Getenv(debugListenEnv), file.DebugListen, ""), "address for the pprof debug listener; disabled if empty (env: "+debugListenEnv+")")
 	addrFile := fs.String("addr-file", opts.Getenv(addrFileEnv), "path to write the bound listener address to once listening; used by a parent process to discover an ephemeral (--listen :0) port (env: "+addrFileEnv+")")
 	enableStatsStub := fs.Bool("enable-stats-stub", enableStatsStubDefault, "register the GET/POST /stats compatibility stub used by SDK test flows; unregistered (404) by default (env: "+enableStatsStubEnv+")")
+	keysDir := fs.String("keys-dir", config.Default(opts.Getenv(keysDirEnv), file.KeysDir, ""), "directory holding one API key per file, re-read while the server runs (env: "+keysDirEnv+")")
+	namespacesDir := fs.String("namespaces-dir", config.Default(opts.Getenv(namespacesDirEnv), file.NamespacesDir, ""), "directory holding one namespace per file, re-read while the server runs (env: "+namespacesDirEnv+")")
+	appStatusFile := fs.String("app-status-file", config.Default(opts.Getenv(appStatusFileEnv), file.AppStatusFile, ""), "file holding the app's status, re-read while the server runs; no file, or "+strconv.Quote(handles.StatusEnabled)+", means the app is served, and anything else disables it (env: "+appStatusFileEnv+")")
 	if err := fs.Parse(opts.Args); err != nil {
 		return 2
 	}
@@ -143,29 +148,47 @@ func Run(ctx context.Context, opts Opts) int {
 		return 1
 	}
 
-	keySpecs := resolveAPIKeys([]string(keysFlags), opts.Getenv(keysEnv), file)
-	if len(keySpecs) == 0 {
-		logger.Error("at least one api key is required", "flag", "--keys", "env", keysEnv)
+	// The watched sources are read before anything is built, because the keys
+	// and namespaces they carry are as much this server's configuration as the
+	// flags are — the app id is derived from the whole set, and the app is
+	// built holding all of it (DESIGN.md §9.1). They are re-read from here on
+	// by the reloader started below.
+	sources := config.Dynamic{
+		KeysDir:       *keysDir,
+		NamespacesDir: *namespacesDir,
+		AppStatusFile: *appStatusFile,
+	}
+	watched, err := sources.Read()
+	if err != nil {
+		logger.Error("reading the watched config", "err", err)
 		return 1
 	}
-	parsedKeys := make([]auth.APIKey, 0, len(keySpecs))
-	for _, spec := range keySpecs {
-		k, err := auth.ParseAPIKeyWithCapability(spec.key, spec.capability)
-		if err != nil {
-			logger.Error("invalid api key", "err", err)
-			return 1
-		}
-		parsedKeys = append(parsedKeys, k)
+
+	// The keys directory is a key source in its own right, layered over
+	// whatever the flags, the environment or the config file supplied. The
+	// reloader below merges the two the same way on every reload; here it is
+	// done once more, by hand, because the app id has to come out of the whole
+	// set before there is an app to reconfigure.
+	staticKeys := resolveAPIKeys([]string(keysFlags), opts.Getenv(keysEnv), file)
+	keySpecs := make([]keySpec, 0, len(staticKeys)+len(watched.Keys))
+	keySpecs = append(keySpecs, staticKeys...)
+	for _, entry := range watched.Keys {
+		keySpecs = append(keySpecs, keySpec{key: entry.Key, capability: entry.Capability})
 	}
-	// All keys must belong to the same app: the server owns one channel
-	// namespace, so keys spanning multiple appIds are a misconfiguration
-	// (DESIGN.md §3).
-	appID := parsedKeys[0].AppID
-	for _, k := range parsedKeys[1:] {
-		if k.AppID != appID {
-			logger.Error("all api keys must share the same appId", "appId", appID, "conflicting", k.AppID)
-			return 1
-		}
+	if len(keySpecs) == 0 {
+		logger.Error("at least one api key is required", "flag", "--keys", "env", keysEnv, "keysDirFlag", "--keys-dir")
+		return 1
+	}
+	parsedKeys, appID, err := parseAPIKeys(keySpecs)
+	if err != nil {
+		logger.Error("invalid api key configuration", "err", err)
+		return 1
+	}
+
+	namespaces := mergeNamespaces(file.Namespaces, watched.Namespaces)
+	if err := config.ValidateNamespaces(namespaces); err != nil {
+		logger.Error("invalid namespace configuration", "err", err)
+		return 1
 	}
 
 	// OpenTelemetry tracing is off unless the standard OTEL_* env asks for
@@ -231,7 +254,7 @@ func Run(ctx context.Context, opts Opts) int {
 	// server supplies with its storage, its keys and its logger. What is left
 	// here is what that module does not describe: this server's own token
 	// endpoint, its liveness probes, and the stats stub SDK test flows want.
-	shared, err := newSharedProtocol(ctx, parsedKeys, file, manager, m, logger, sharedOptions{
+	shared, err := newSharedProtocol(ctx, parsedKeys, namespaces, manager, m, logger, sharedOptions{
 		heartbeatInterval: *hbInterval,
 		remainPresentFor:  *remainPresentFor,
 	})
@@ -245,6 +268,35 @@ func Run(ctx context.Context, opts Opts) int {
 	// nil and /readyz reports 200 unconditionally.
 	ready, _ := store.(storage.Pinger)
 	rs := rest.NewServer(parsedKeys, logger, ready)
+
+	// The watched sources are applied once more here, over the app that was
+	// just built from them, so that everything a reload does goes through the
+	// one code path — and so that an app-status file saying the app is
+	// disabled is in force before the listener opens.
+	reload := &reloader{
+		sources:          sources,
+		appID:            appID,
+		staticKeys:       staticKeys,
+		staticNamespaces: file.Namespaces,
+		app:              shared.App(),
+		rest:             rs,
+		log:              logger,
+	}
+	if sources.Watched() {
+		logger.Info("watching config",
+			"keysDir", sources.KeysDir,
+			"namespacesDir", sources.NamespacesDir,
+			"appStatusFile", sources.AppStatusFile,
+			"interval", reloadInterval,
+		)
+	}
+	if err := reload.load(); err != nil {
+		logger.Error("applying the watched config", "err", err)
+		return 1
+	}
+	if sources.Watched() {
+		go reload.run(ctx, reloadInterval)
+	}
 
 	mux := newMux(shared, rs, m, *enableStatsStub)
 
@@ -416,26 +468,37 @@ func splitTrim(in []string) []string {
 	return out
 }
 
+// parseAPIKeys parses the resolved key specs and returns them with the app id
+// they share. All keys must belong to the same app: the server owns one
+// channel namespace, so keys spanning multiple appIds are a misconfiguration
+// (DESIGN.md §3).
+func parseAPIKeys(specs []keySpec) ([]auth.APIKey, string, error) {
+	keys := make([]auth.APIKey, 0, len(specs))
+	for _, spec := range specs {
+		k, err := auth.ParseAPIKeyWithCapability(spec.key, spec.capability)
+		if err != nil {
+			return nil, "", err
+		}
+		keys = append(keys, k)
+	}
+	appID := keys[0].AppID
+	for _, k := range keys[1:] {
+		if k.AppID != appID {
+			return nil, "", fmt.Errorf("all api keys must share the same appId; %s is not %s", k.AppID, appID)
+		}
+	}
+	return keys, appID, nil
+}
+
 // fixtureSpec validates the config file's [[namespaces]] and [[channels]]
 // sections and builds the presence-fixture spec to seed at startup
 // (DESIGN.md §9, §12.5). A namespace with no id or an unknown mode, a
 // channel with no name, or a presence member with no clientId is a
 // malformed section and returns an error. Returns a nil spec when no
 // channels are declared.
-//
-// An unknown mode is refused rather than ignored because the protocol code
-// reads any mode it does not recognise as the default one: `mode = "matchers"`
-// would otherwise start a server that silently applied the rule to a different
-// set of channels than the one written down.
 func fixtureSpec(file config.File) (*fixtures.Spec, error) {
-	for i, ns := range file.Namespaces {
-		if ns.ID == "" {
-			return nil, fmt.Errorf("namespace #%d has no id", i)
-		}
-		if ns.Mode != "" && ns.Mode != protoapp.NamespaceModeMatcher {
-			return nil, fmt.Errorf("namespace %q has mode %q, want %q or none",
-				ns.ID, ns.Mode, protoapp.NamespaceModeMatcher)
-		}
+	if err := config.ValidateNamespaces(file.Namespaces); err != nil {
+		return nil, err
 	}
 	if len(file.Channels) == 0 {
 		return nil, nil

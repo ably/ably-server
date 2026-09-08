@@ -170,11 +170,13 @@ SDKs read for the code and message.
 ## 3. Authentication & authorisation
 
 One or more API keys are configured (via repeated `--keys`, a
-comma-separated `ABLY_SERVER_KEYS`, or the config file — §9), each in
+comma-separated `ABLY_SERVER_KEYS`, the config file, or the watched keys
+directory — §9, §9.1), each in
 the canonical Ably format `appId.keyId:keySecret` (so SDKs that parse the
 key work unchanged). Each key carries a **capability** (§3.1): a key
 configured via a flag or an env var grants the full `{"*":["*"]}`
-capability, while a structured `[[keys]]` config entry (§9) may narrow it
+capability, while a structured `[[keys]]` config entry or a file in the
+keys directory (§9, §9.1) may narrow it
 to a scoped set. A Basic-auth holder of a
 key resolves to that key's capability, and a token minted or signed by a
 key is bounded by it (§3.3). At least one key is required; the server
@@ -182,7 +184,13 @@ refuses to start with none. All configured keys must share the same
 `appId`: the
 server owns one channel namespace (mirroring how one Ably app owns one
 namespace), so keys spanning multiple appIds are a misconfiguration and
-startup fails. A request authenticates against **any** configured key,
+startup fails.
+
+Keys are not fixed for the process's lifetime. A key in the watched keys
+directory (§9.1) can have its capability narrowed, or be removed
+altogether, while the server runs; a connection holding the key sees the
+change without re-authenticating, and a removed key is marked *gone* so
+the holder is refused rather than served on a key that no longer exists. A request authenticates against **any** configured key,
 and JWT verification selects the signing key by the token's `kid` header
 (falling back to trying every key's secret when `kid` is absent or names
 no configured key). The server **verifies** tokens presented on
@@ -1407,6 +1415,9 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --config ably-server.toml     optional TOML file, see below
 --addr-file                   path to write the bound listener address to once listening
 --enable-stats-stub           register the GET/POST /stats compatibility stub (§1); default: false (404)
+--keys-dir                    directory of one-key-per-file, re-read while running (§9.1)
+--namespaces-dir              directory of one-namespace-per-file, re-read while running (§9.1)
+--app-status-file             file holding the app's status, re-read while running (§9.1)
 ```
 
 `--addr-file` writes the listener's resolved `host:port` to the given path
@@ -1419,7 +1430,8 @@ reader polling the path never sees a partial address.
 Configuration may also be supplied via an optional TOML config file
 (`--config ably-server.toml`), covering the same keys as the flags above
 (`mode`, `listen`, `data-dir`, `postgres-dsn`, `shutdown-grace`,
-`log-level`, `log-format`, `debug-listen`, `enable-stats-stub` —
+`log-level`, `log-format`, `debug-listen`, `enable-stats-stub`,
+`keys-dir`, `namespaces-dir`, `app-status-file` —
 `shutdown-grace` as a duration string, e.g. `"10s"`). API keys are
 declared as structured
 `[[keys]]` entries, each a `key` spec plus an optional `capability` — an
@@ -1497,6 +1509,75 @@ name = "persisted:presence_fixtures"
   clientId = "client_string"
   data = "This is a string clientData payload"
 ```
+
+### 9.1 Configuration read while the server runs
+
+Everything in §9 is read once, before the listener opens. On Ably an app's
+keys, its namespaces and its status all change under a running server, and
+the shared protocol code is built for that: a key reference keeps
+resolving, a channel watches the namespace it fell in, a connection
+watches for the app becoming unserviceable. A server whose whole
+configuration is fixed at startup exercises none of that, and neither can
+an SDK be developed against one.
+
+So three sources are **watched**, and re-read every second:
+
+- `--keys-dir` — a directory holding **one API key per file**, each file a
+  TOML document in the same shape as a `[[keys]]` entry (`key`, and an
+  optional `capability`). The key's identity comes from the file's
+  contents, so a file may be named anything; files whose names begin with
+  a dot are skipped, which keeps an editor's swap file and a Kubernetes
+  ConfigMap's internal `..data` directory out of the configuration.
+- `--namespaces-dir` — the same, one file per namespace, each in the shape
+  of a `[[namespaces]]` entry.
+- `--app-status-file` — whether the app is served, as a bare string with
+  the surrounding whitespace stripped. **No file, or `enabled`, means the
+  app is served; anything else means it is not.** So an operator who never
+  writes one gets a server that always serves, and `disabled` is the word
+  to write to stop it.
+
+  It is a boolean wearing a word, deliberately. Ably's app status is an
+  enum whose members differ in what each still permits — a restricted app
+  is not a deleted one — but every one of those distinctions is
+  commercial, and this server has no account behind its app to make them
+  for. Offering the vocabulary would imply the words did different things
+  here, and they would not. A word this server does not know therefore
+  disables the app rather than being refused; the reloader logs the word
+  as written, so a typo that disabled the app is visible next to the fact
+  that it did.
+
+A watched key or namespace **layers over** the statically configured one
+of the same id rather than replacing the set: what a flag, an environment
+variable or the config file supplied is the floor, and the directories are
+what moves on top of it. So a server started with `--keys` still has that
+key however the keys directory is edited, and an entry declared in both
+places is the directory's. A key file may be the only key source, in which
+case the app id comes from it like any other.
+
+Applying a change:
+
+- **A key** whose capability changed keeps the reference already resolved
+  against it, so a connection holding it is not made to re-authenticate;
+  its `modified` moves, which is how the protocol code sees the change. A
+  key whose file is deleted is marked *gone* before it is dropped.
+- **A namespace** added, changed or removed re-resolves every attached
+  channel: which namespace applies to a channel is decided by matching
+  every configured one against its name, so a change anywhere can change
+  what a given channel is allowed to do. A channel whose resolution did
+  not actually change is told nothing.
+- **A disabled app** refuses every request and every new connection with
+  `40300`, and closes every established connection with the same error.
+  Enabling it again restores both. The three status checks the module asks
+  and the fatal error it watches are the same value, so what a request is
+  refused with and what a connection is closed with cannot come apart.
+
+At startup a watched source that cannot be read or applied is fatal: a
+directory named explicitly and not there is a typo, and a typo that
+quietly configures nothing is worse than a refusal to start. Once the
+server is running neither is: a half-written file is a reason to keep
+serving the last good configuration rather than to stop, so the failure is
+logged (once, not once a second) and the previous configuration kept until
+the file is fixed.
 
 ## 10. Observability
 

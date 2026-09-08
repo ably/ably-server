@@ -4,14 +4,18 @@
 // The module declares the handles as interfaces and never names anything of
 // ours; everything here is the answer to one of its questions, given from this
 // server's config, keys and storage. Where an answer is "nothing to say" —
-// this server has no limits, no accounting, and one app that is always
-// serviceable — the method says so plainly rather than being left to a
-// default, so that reading this file tells you what this server does not do.
+// this server has no limits and no accounting — the method says so plainly
+// rather than being left to a default, so that reading this file tells you
+// what this server does not do.
 package handles
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ably/ably-server/internal/auth"
@@ -29,6 +33,7 @@ import (
 	"github.com/ably/server-protocol/go/live"
 	protocollog "github.com/ably/server-protocol/go/logging"
 	"github.com/ably/server-protocol/go/scope"
+	"github.com/ably/server-protocol/go/unixtime"
 	"github.com/ably/server-protocol/go/wire"
 )
 
@@ -136,34 +141,89 @@ func (a *appHandle) ConnectionRefusal() handles.Connection {
 // clientId may hold.
 func (a *appHandle) ClientIDLimiter() handles.ClientIDLimiter { return nil }
 
-// App is the one app this server serves. Its keys and namespaces come from the
-// config file, and neither changes while the process runs.
+// App is the one app this server serves. Its keys, its namespaces and whether
+// it is served at all are what a watched config source can change while the
+// process runs (DESIGN.md §9.1); its identity is not, since this server is its
+// app.
 type App struct {
 	protoapp.NopLimits
-	handles.NopChecks
 	handles.NopReporter
 
 	// metrics counts this app's traffic, and is nil when nothing is counted.
 	metrics *metrics.Metrics
 
-	id         string
-	appScope   scope.ID
-	keys       map[string]*live.Reference[*protoapp.Key]
-	namespaces protoapp.NamespaceMap
+	id       string
+	appScope scope.ID
+
+	namespaces *namespaces
+
+	// keysMu guards keys. A key is replaced by setting the value its
+	// reference already points at, so a connection holding one sees the change
+	// without re-resolving; the map itself is only rebuilt under the lock.
+	keysMu sync.Mutex
+	keys   map[string]*live.Reference[*protoapp.Key]
+
+	// enabled is whether the app is served, and fatal is what an established
+	// connection is closed with once it is not. They are set together and
+	// always agree: fatal is the same fact in the terms the module's
+	// connections read it in.
+	enabled atomic.Bool
+	fatal   *live.Value[*errors.ErrorInfo]
 }
 
-// NewApp builds the app from the configured keys and namespaces. The app id is
-// the one every key shares, which config loading has already checked.
+// NewApp builds the app from the configured keys and namespaces, enabled. The
+// app id is the one every key shares, which config loading has already
+// checked.
 func NewApp(appID string, keys []auth.APIKey, namespaces []config.Namespace, m *metrics.Metrics) (*App, error) {
-	appScope := scope.New(scope.App, appID)
+	app := &App{
+		metrics:    m,
+		id:         appID,
+		appScope:   scope.New(scope.App, appID),
+		namespaces: newNamespaces(namespaces),
+		keys:       map[string]*live.Reference[*protoapp.Key]{},
+		fatal:      live.NewValue[*errors.ErrorInfo](nil),
+	}
+	app.enabled.Store(true)
+	if err := app.SetKeys(keys); err != nil {
+		return nil, err
+	}
+	return app, nil
+}
 
-	byID := make(map[string]*live.Reference[*protoapp.Key], len(keys))
+func (a *App) ID() string                        { return a.id }
+func (a *App) Scope() scope.ID                   { return a.appScope }
+func (a *App) Namespaces() protoapp.NamespaceMap { return a.namespaces }
+
+// SetNamespaces replaces the app's namespaces, which reaches the channels
+// already attached: a channel watches the namespace it resolved to, so one
+// whose settings change here starts behaving differently without being
+// reattached.
+func (a *App) SetNamespaces(configured []config.Namespace) {
+	a.namespaces.Set(configured)
+}
+
+// SetKeys replaces the app's API keys.
+//
+// A key that is still configured keeps the reference it already had, its value
+// replaced only where something about it actually changed — so a connection
+// that resolved the key sees the new capability without re-authenticating, and
+// one whose key was not touched sees nothing at all. A key that is no longer
+// configured is marked gone before it is dropped, which is how a holder of it
+// finds out rather than going on using a key that is no longer there.
+//
+// Every key is built before any is installed, so a malformed capability leaves
+// the app exactly as it was rather than half reconfigured.
+func (a *App) SetKeys(keys []auth.APIKey) error {
+	built := make([]*protoapp.Key, 0, len(keys))
 	for _, k := range keys {
-		capabilities, err := resourceCapabilities(k, appScope)
-		if err != nil {
-			return nil, err
+		if k.AppID != a.id {
+			return fmt.Errorf("key %s belongs to app %s, not %s", k.Name(), k.AppID, a.id)
 		}
-		byID[k.KeyID] = live.NewReference(live.NewRefCounter(&protoapp.Key{
+		capabilities, err := resourceCapabilities(k, a.appScope)
+		if err != nil {
+			return err
+		}
+		built = append(built, &protoapp.Key{
 			ID:           k.KeyID,
 			AppID:        k.AppID,
 			Value:        []byte(k.KeySecret),
@@ -171,31 +231,105 @@ func NewApp(appID string, keys []auth.APIKey, namespaces []config.Namespace, m *
 			Capability:   k.CapabilityString(),
 			Capabilities: capabilities,
 			Status:       protoapp.KeyStatusEnabled,
-		}, nil))
+		})
 	}
 
-	return &App{
-		metrics:    m,
-		id:         appID,
-		appScope:   appScope,
-		keys:       byID,
-		namespaces: newNamespaces(namespaces),
-	}, nil
+	a.keysMu.Lock()
+	defer a.keysMu.Unlock()
+
+	now := unixtime.Now()
+	next := make(map[string]*live.Reference[*protoapp.Key], len(built))
+	for _, key := range built {
+		ref, ok := a.keys[key.ID]
+		if !ok {
+			key.Created, key.Modified = now, now
+			next[key.ID] = live.NewReference(live.NewRefCounter(key, nil))
+			continue
+		}
+		next[key.ID] = ref
+		prev := ref.Get()
+		key.Created = prev.Created
+		if sameKey(prev, key) {
+			continue
+		}
+		// Modified has to move, since it is how the protocol code orders two
+		// versions of a key. Two edits within the same millisecond would
+		// otherwise land on the same timestamp and the second look like no
+		// change at all.
+		key.Modified = max(now, prev.Modified+1)
+		ref.Set(key)
+	}
+	for id, ref := range a.keys {
+		if _, ok := next[id]; ok {
+			continue
+		}
+		gone := *ref.Get()
+		gone.Status = protoapp.KeyStatusGone
+		gone.Modified = max(now, gone.Modified+1)
+		ref.Set(&gone)
+	}
+	a.keys = next
+	return nil
 }
 
-func (a *App) ID() string                        { return a.id }
-func (a *App) Scope() scope.ID                   { return a.appScope }
-func (a *App) Namespaces() protoapp.NamespaceMap { return a.namespaces }
+// sameKey reports whether two versions of a key differ in anything this
+// server configures. Created and Modified are excluded: they are how a change
+// is reported, not part of what changed.
+func sameKey(a, b *protoapp.Key) bool {
+	return a.Status == b.Status &&
+		a.Capability == b.Capability &&
+		bytes.Equal(a.Value, b.Value)
+}
+
+// SetEnabled sets whether the app is served. Disabling it refuses every new
+// request and connection, and closes every established one; enabling it again
+// restores both.
+func (a *App) SetEnabled(enabled bool) {
+	if a.enabled.Swap(enabled) == enabled {
+		return
+	}
+	if enabled {
+		a.fatal.Set(nil)
+		return
+	}
+	a.fatal.Set(errAppDisabled)
+}
+
+// Enabled reports whether the app is currently served.
+func (a *App) Enabled() bool { return a.enabled.Load() }
+
+// Whether the app is served, in the three questions the module asks about it.
+// This server draws no distinction between them: it has one app, served or
+// not, so an app that will not take a connection will not answer a REST
+// request either.
+//
+// All three read the fatal error rather than deriving one, so that what a
+// request is refused with and what an established connection is closed with
+// cannot come apart, and so that the common case — an enabled app, checked on
+// every request — is one atomic load and a nil.
+func (a *App) CheckStatus() *errors.ErrorInfo               { return a.fatal.Get() }
+func (a *App) CheckStatusForAPIRequests() *errors.ErrorInfo { return a.fatal.Get() }
+func (a *App) CheckStatusForConnections() *errors.ErrorInfo { return a.fatal.Get() }
+
+// FatalError is what an established connection must be closed with once the
+// app stops being serviceable, and holds nil while it is. It is a watched
+// value rather than a check, because a connection that was admitted has
+// nowhere left to be refused: it has to be told.
+func (a *App) FatalError() *live.Value[*errors.ErrorInfo] { return a.fatal }
 
 // This server has no accounts, so the app stands in for its own: one app, one
 // billing relationship, nothing above it to aggregate to.
 func (a *App) AccountID() string      { return a.id }
 func (a *App) AccountScope() scope.ID { return a.appScope }
 
-// WatchKey resolves one of the configured keys. The reference never changes,
-// because this server's keys are read once at startup: a key cannot be revoked
-// or have its capability changed under a live connection.
+// WatchKey resolves one of the configured keys, and keeps resolving it: the
+// reference tracks whatever SetKeys does to that key afterwards, so a
+// long-lived connection sees its capability narrowed, or the key removed,
+// without having to authenticate again.
 func (a *App) WatchKey(_ context.Context, keyID string) (*live.Reference[*protoapp.Key], *errors.ErrorInfo) {
+	a.keysMu.Lock()
+	defer a.keysMu.Unlock()
+
 	key, ok := a.keys[keyID]
 	if !ok {
 		return nil, errors.New(40400, 404, "Key not found")

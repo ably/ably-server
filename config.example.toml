@@ -48,6 +48,34 @@
 # enable this so compat suites' stats round-trip doesn't wedge.
 # enable-stats-stub = false
 
+# The three settings below name the config this server reads again while
+# it runs, so that a key, a namespace or the app's status can change under
+# it the way it can on Ably (DESIGN.md §9.1). They are re-read once a
+# second; a change is applied, and a file that cannot be parsed or applied
+# is logged and the last good configuration kept.
+
+# Directory holding one API key per file, each file a TOML document in the
+# same shape as a [[keys]] entry below (env: ABLY_SERVER_KEYS_DIR). The
+# key's identity comes from the file's contents, so a file may be named
+# anything; a dotfile is skipped. A key here layers over a [[keys]] entry
+# naming the same key, and deleting a file marks that key gone.
+# keys-dir = "./config/keys"
+
+# Directory holding one namespace per file, each file a TOML document in
+# the same shape as a [[namespaces]] entry below (env:
+# ABLY_SERVER_NAMESPACES_DIR). A namespace here layers over a
+# [[namespaces]] entry with the same id, and a change reaches the channels
+# already attached.
+# namespaces-dir = "./config/namespaces"
+
+# File holding whether the app is served (env: ABLY_SERVER_APP_STATUS_FILE).
+# It is a boolean wearing a word: "enabled", or no file at all, means the app
+# is served, and anything else means it is not — every request and every new
+# connection is refused with 40300, and every established connection is
+# closed. Write "disabled" to disable it; no other word is given a meaning,
+# because this server would do the same thing for all of them.
+# app-status-file = "./config/app-status"
+
 # [[keys]] entries are the only file-tier source of API keys, and the
 # only one that can carry a narrowing capability. Each entry is an
 # Ably-format key spec plus an optional `capability` — an

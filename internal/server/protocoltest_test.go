@@ -1,14 +1,20 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"log/slog"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/ably/ably-server/internal/auth"
+	"github.com/BurntSushi/toml"
+
 	"github.com/ably/ably-server/internal/config"
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/integration"
@@ -84,8 +90,15 @@ func TestProtocol(t *testing.T) {
 
 // newProtocolTarget returns the suite's way of bringing up a whole server for
 // the app it asked for, keeping its state in the storage given:
-// this server serves one app, whose keys and namespaces it reads before it
-// starts, so an app is a server rather than something provisioned on one.
+// this server serves one app, so an app is a server rather than something
+// provisioned on one.
+//
+// Everything about the app that can change while it runs — its keys, its
+// namespaces, its status — is written to a watched config directory rather
+// than passed in (DESIGN.md §9.1), and the server is left watching it. That is
+// what lets this target implement the suite's updaters: a test asking for a
+// key's capability to change gets the same code path an operator editing that
+// file would, rather than a back door into the app.
 //
 // Its storage is in memory and nothing else shares it, so each target is an
 // empty server with the suite's app on it.
@@ -95,61 +108,178 @@ func newProtocolTarget(newStorage func(t *testing.T) storage.Storage) protocolte
 
 		appID := "app" + random.String(8)
 
-		keys := make([]auth.APIKey, 0, len(spec.Keys))
-		names := make([]protocoltest.Key, 0, len(spec.Keys))
-		for i, keySpec := range spec.Keys {
-			name := appID + ".key" + random.String(8)
-			secret := "secret" + random.String(8)
-
-			key, err := auth.ParseAPIKeyWithCapability(name+":"+secret, keySpec.Capability)
-			if err != nil {
-				t.Fatalf("parsing key #%d: %s", i, err)
+		dir := t.TempDir()
+		sources := config.Dynamic{
+			KeysDir:       filepath.Join(dir, "keys"),
+			NamespacesDir: filepath.Join(dir, "namespaces"),
+			AppStatusFile: filepath.Join(dir, "app-status"),
+		}
+		for _, d := range []string{sources.KeysDir, sources.NamespacesDir} {
+			if err := os.Mkdir(d, 0o755); err != nil {
+				t.Fatalf("making the watched config directory: %s", err)
 			}
-			keys = append(keys, key)
-			names = append(names, protocoltest.Key{Name: name, Secret: secret})
 		}
 
-		namespaces := make([]config.Namespace, 0, len(spec.Namespaces))
-		for _, ns := range spec.Namespaces {
-			namespaces = append(namespaces, config.Namespace{
-				ID:              ns.GetId(),
-				Persisted:       ns.GetPersisted(),
-				MutableMessages: ns.GetMutableMessages(),
-				PushEnabled:     ns.GetPushEnabled(),
+		target := &protocolTarget{
+			sources: sources,
+			app:     protocoltest.App{ID: appID},
+		}
+
+		for _, spec := range spec.Keys {
+			keyID := "key" + random.String(8)
+			secret := "secret" + random.String(8)
+			target.keys = append(target.keys, protocoltest.Key{Name: appID + "." + keyID, Secret: secret})
+			target.writeKey(t, keyID, config.KeyEntry{
+				Key:        appID + "." + keyID + ":" + secret,
+				Capability: spec.Capability,
 			})
+		}
+		for _, ns := range spec.Namespaces {
+			target.UpdateNamespace(ctx, t, ns)
+		}
+
+		watched, err := sources.Read()
+		if err != nil {
+			t.Fatalf("reading the watched config: %s", err)
+		}
+		specs := make([]keySpec, 0, len(watched.Keys))
+		for _, entry := range watched.Keys {
+			specs = append(specs, keySpec{key: entry.Key, capability: entry.Capability})
+		}
+		keys, _, err := parseAPIKeys(specs)
+		if err != nil {
+			t.Fatalf("parsing the app's keys: %s", err)
 		}
 
 		logger := logging.New(slog.DiscardHandler)
 		store := core.NewManager(newStorage(t))
 
-		shared, err := newSharedProtocol(ctx, keys, config.File{Namespaces: namespaces}, store, nil, logger, sharedOptions{})
+		shared, err := newSharedProtocol(ctx, keys, watched.Namespaces, store, nil, logger, sharedOptions{})
 		if err != nil {
 			t.Fatalf("wiring the shared protocol code: %s", err)
 		}
 		t.Cleanup(shared.Close)
 
-		srv := httptest.NewServer(newMux(shared, rest.NewServer(keys, logger, nil), nil, false))
+		rs := rest.NewServer(keys, logger, nil)
+		reload := &reloader{
+			sources: sources,
+			appID:   appID,
+			app:     shared.App(),
+			rest:    rs,
+			log:     logger,
+		}
+		if err := reload.load(); err != nil {
+			t.Fatalf("applying the watched config: %s", err)
+		}
+		// Faster than the production cadence, so a test waiting on a change
+		// waits on the change rather than on the poll.
+		go reload.run(t.Context(), 20*time.Millisecond)
+
+		srv := httptest.NewServer(newMux(shared, rs, nil, false))
 		t.Cleanup(srv.Close)
 
-		return &protocolTarget{
-			protocol: shared.Protocol,
-			url:      srv.URL,
-			app:      protocoltest.App{ID: appID},
-			keys:     names,
-		}
+		target.protocol = shared.Protocol
+		target.url = srv.URL
+		return target
 	}
 }
 
 // protocolTarget is one server, serving one app, for the suite to test.
 //
-// It implements none of the suite's optional interfaces: this server's keys,
-// apps and namespaces are read once before it starts, so there is no change
-// for those tests to watch for and the suite skips them.
+// It changes the app the way this server means one to be changed: by writing
+// the watched config sources it was started against, and letting the server
+// pick the change up on its own.
 type protocolTarget struct {
 	protocol *protocol.Protocol
 	url      string
 	app      protocoltest.App
 	keys     []protocoltest.Key
+	sources  config.Dynamic
+}
+
+var (
+	_ protocoltest.KeyUpdater       = (*protocolTarget)(nil)
+	_ protocoltest.NamespaceUpdater = (*protocolTarget)(nil)
+	_ protocoltest.AppDisabler      = (*protocolTarget)(nil)
+)
+
+// UpdateKey rewrites the key's file with the capability given. The key keeps
+// the secret it already has: what the suite is changing is what the key
+// grants, not who holds it.
+func (s *protocolTarget) UpdateKey(_ context.Context, t *testing.T, keyID, capability string) {
+	t.Helper()
+
+	for _, key := range s.keys {
+		if _, id, _ := strings.Cut(key.Name, "."); id == keyID {
+			s.writeKey(t, keyID, config.KeyEntry{Key: key.Name + ":" + key.Secret, Capability: capability})
+			return
+		}
+	}
+	t.Fatalf("the app has no key %q to update", keyID)
+}
+
+// UpdateNamespace rewrites the namespace's file with the settings given. Only
+// the settings this server configures are written; the rest of a wire
+// namespace is not something it has anywhere to put.
+func (s *protocolTarget) UpdateNamespace(_ context.Context, t *testing.T, ns *wire.Namespace) {
+	t.Helper()
+
+	writeConfigEntry(t, s.namespacePath(ns.GetId()), config.Namespace{
+		ID:              ns.GetId(),
+		Mode:            ns.GetMode(),
+		Persisted:       ns.GetPersisted(),
+		MutableMessages: ns.GetMutableMessages(),
+		PushEnabled:     ns.GetPushEnabled(),
+	})
+}
+
+// DisableApp writes the app's status file, which is how this server is told
+// its app can no longer be served.
+func (s *protocolTarget) DisableApp(_ context.Context, t *testing.T) {
+	t.Helper()
+
+	writeFileAtomically(t, s.sources.AppStatusFile, []byte("disabled\n"))
+}
+
+// writeKey writes one key's file, named for the key id so that updating a key
+// rewrites its own file rather than adding a second one for the same key.
+func (s *protocolTarget) writeKey(t *testing.T, keyID string, entry config.KeyEntry) {
+	t.Helper()
+
+	writeConfigEntry(t, filepath.Join(s.sources.KeysDir, keyID+".toml"), entry)
+}
+
+// namespacePath is the file a namespace is written to. The id is hex-encoded
+// because a namespace id is a channel-name expression, which may hold anything
+// including the one byte a filename may not.
+func (s *protocolTarget) namespacePath(id string) string {
+	return filepath.Join(s.sources.NamespacesDir, hex.EncodeToString([]byte(id))+".toml")
+}
+
+// writeConfigEntry writes one TOML config entry.
+func writeConfigEntry(t *testing.T, path string, entry any) {
+	t.Helper()
+
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(entry); err != nil {
+		t.Fatalf("encoding %s: %s", path, err)
+	}
+	writeFileAtomically(t, path, buf.Bytes())
+}
+
+// writeFileAtomically writes the file through a rename, so the watching server
+// never reads a half-written one and complains about a file that is about to
+// be fine.
+func writeFileAtomically(t *testing.T, path string, content []byte) {
+	t.Helper()
+
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, content, 0o644); err != nil {
+		t.Fatalf("writing %s: %s", path, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatalf("renaming %s into place: %s", path, err)
+	}
 }
 
 func (*protocolTarget) Name() string                   { return "ably-server" }

@@ -7,6 +7,8 @@ import (
 	"github.com/ably/ably-server/internal/core"
 	"github.com/ably/ably-server/internal/logging"
 
+	"google.golang.org/protobuf/proto"
+
 	"github.com/ably/server-protocol/go/analytics"
 	protoapp "github.com/ably/server-protocol/go/app"
 	"github.com/ably/server-protocol/go/channel"
@@ -48,7 +50,9 @@ type ChannelManager struct {
 	// namespaces are the app's, as configured. A channel's settings — whether
 	// its messages can be edited, whether it is persisted — come from the
 	// namespace its name falls in, so a channel handed the wrong one is told
-	// it cannot do things this server was configured to let it do.
+	// it cannot do things this server was configured to let it do. The map is
+	// live: it changes as the app's namespaces are reconfigured under it
+	// (DESIGN.md §9.1).
 	namespaces protoapp.NamespaceMap
 
 	log *logging.Logger
@@ -145,12 +149,45 @@ func (m *ChannelManager) newChannel(ctx context.Context, spec *channel.Spec, cac
 // match expression, several can match one name, and which of them wins is
 // decided by specificity. A server resolving that itself would tell a channel
 // something different about itself than realtime does.
-//
-// The result is a value that never changes, because this server's namespaces
-// are read once at startup — nothing can reconfigure one under an attached
-// channel, so there is nothing to notify.
-func (m *ChannelManager) namespaceFor(spec *channel.Spec) *live.Value[*wire.Namespace] {
-	return live.NewValue(channel.CalculatedNamespaceFor(spec, m.namespaces))
+func (m *ChannelManager) namespaceFor(spec *channel.Spec) *namespaceWatch {
+	resolved := channel.ResolveNamespace(spec, m.namespaces)
+	return &namespaceWatch{
+		spec:       spec,
+		namespaces: m.namespaces,
+		resolved:   resolved,
+		value:      live.NewValue(resolved.Namespace),
+	}
+}
+
+// namespaceWatch is one channel's namespace, kept resolved. This server's
+// namespaces can be reconfigured while it runs (DESIGN.md §9.1), and which
+// namespace applies to a channel is decided by matching every configured one
+// against its name — so a namespace added, changed or removed anywhere can
+// change what an already attached channel is allowed to do.
+type namespaceWatch struct {
+	spec       *channel.Spec
+	namespaces protoapp.NamespaceMap
+
+	// resolved is the last resolution, held for the notifications it carries:
+	// waiting on those is how the loop below learns to resolve again.
+	resolved channel.ResolvedNamespace
+
+	// value is what the channel hands to whoever asks for its namespace, and
+	// what they watch.
+	value *live.Value[*wire.Namespace]
+}
+
+// run re-resolves the channel's namespace whenever the app's namespaces
+// change, until ctx is done. The value is only set when the resolution
+// actually differs: a namespace added elsewhere in the app notifies every
+// channel, and all but the few it applies to should see nothing.
+func (w *namespaceWatch) run(ctx context.Context) {
+	for w.resolved.WaitForChange(ctx) {
+		w.resolved = channel.ResolveNamespace(w.spec, w.namespaces)
+		if !proto.Equal(w.resolved.Namespace, w.value.Get()) {
+			w.value.Set(w.resolved.Namespace)
+		}
+	}
 }
 
 // attachmentHandle is what this server hands one attachment: somewhere to log,

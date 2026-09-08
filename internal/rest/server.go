@@ -49,6 +49,11 @@ func NewServer(keys []auth.APIKey, logger *logging.Logger, ready storage.Pinger)
 	}
 }
 
+// SetKeys replaces the keys the token endpoint mints from and authenticates
+// against, so that a key changed under the running server (DESIGN.md §9.1) is
+// changed here too rather than only on the protocol module's side.
+func (s *Server) SetKeys(keys []auth.APIKey) { s.authn.SetKeys(keys...) }
+
 // publishResponse is the REST POST /messages response body (Ably RSL1):
 // the channel name, the publish's messageId, and the per-message serials
 // (RSL1n) the SDK's PublishWithResult decodes to address each message.

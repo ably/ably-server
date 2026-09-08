@@ -63,6 +63,9 @@ Supported:
   expression.
 - **Auth** — API key, Ably JWT and token requests, with Ably-style
   capabilities.
+- **Reconfiguration while running** — keys, channel rules and the app's
+  status are read from watched directories, so a key can be narrowed or
+  revoked, a rule changed, or the app disabled, under a connected client.
 
 Not supported: push notifications, integrations, message queues, Spaces,
 Chat, LiveSync, the admin and account APIs, multi-region, statistics
@@ -133,6 +136,15 @@ Run `ably-server --help` for the full flag list. Every option can also be
 set in a TOML config file passed via `--config`; see
 [`config.example.toml`](./config.example.toml) for every key documented
 with its default.
+
+Most configuration is read once, at startup. Three sources are not:
+`--keys-dir` and `--namespaces-dir` hold one API key and one channel rule
+per file, and `--app-status-file` says whether the app is served at all
+(no file means it is). Those are re-read every second, so an SDK can be
+developed against a key whose capability changes, a rule that changes
+under an attached channel, or an app that stops being served
+mid-connection — the things a real Ably app does and a fixed
+configuration cannot.
 
 ### Local cluster (Docker Compose)
 

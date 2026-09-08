@@ -109,8 +109,13 @@ func (Analytics) RecordRequestCounters(*http.Request, string, *protoauth.Params,
 type Protocol struct {
 	*protocol.Protocol
 
+	app      *App
 	channels *ChannelManager
 }
+
+// App is the one app this Protocol serves, which is where a reconfiguration
+// of its keys, its namespaces or its status is applied.
+func (p *Protocol) App() *App { return p.app }
 
 // Close stops the work the channels do on their own behalf, and the collection
 // of idle ones. Connections are shed separately, by cancelling the requests
@@ -132,11 +137,12 @@ func (p *Protocol) Close() { p.channels.Close() }
 // no renderer. Its Prometheus collectors are likewise left unregistered: what
 // this server exposes is the low-cardinality set DESIGN.md §10 enumerates, and
 // the module's are named for the server they were written in.
-func New(ctx context.Context, c *conf.Conf, handles *Manager, channels *ChannelManager, authMgr *protoauth.Manager, log *logging.Logger) (*Protocol, error) {
+func New(ctx context.Context, c *conf.Conf, app *App, handles *Manager, channels *ChannelManager, authMgr *protoauth.Manager, log *logging.Logger) (*Protocol, error) {
 	if err := channels.Start(ctx); err != nil {
 		return nil, err
 	}
 	return &Protocol{
+		app: app,
 		Protocol: protocol.New(protocol.Config{
 			Conf:      c,
 			Log:       log.Protocol(),

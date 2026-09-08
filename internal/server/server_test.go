@@ -3,7 +3,9 @@ package server
 import (
 	"bytes"
 	"context"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -409,4 +411,119 @@ key = "app.key:secret"
 	case <-time.After(5 * time.Second):
 		t.Fatal("server did not shut down within 5s")
 	}
+}
+
+// TestRunKeysDirSuppliesTheAppsKeys proves the watched keys directory is a key
+// source in its own right: the server starts with no --keys, no
+// ABLY_SERVER_KEYS and no [[keys]] entry, on nothing but a file in that
+// directory (DESIGN.md §9.1).
+func TestRunKeysDirSuppliesTheAppsKeys(t *testing.T) {
+	keysDir := filepath.Join(t.TempDir(), "keys")
+	if err := os.Mkdir(keysDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(keysDir, "only.toml"), []byte(`key = "app.only:s3cr3t"`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan net.Addr, 1)
+	done := make(chan int, 1)
+	var out bytes.Buffer
+	go func() {
+		done <- Run(ctx, Opts{
+			Args:   []string{"--listen=127.0.0.1:0", "--keys-dir=" + keysDir},
+			Getenv: emptyEnv,
+			Out:    &out,
+			Ready:  ready,
+		})
+	}()
+
+	select {
+	case <-ready:
+	case code := <-done:
+		t.Fatalf("server exited before ready (code=%d), output: %s", code, out.String())
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not become ready within 5s")
+	}
+
+	cancel()
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Errorf("exit code = %d, want 0; output: %s", code, out.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not shut down within 5s")
+	}
+}
+
+// A watched directory named explicitly and not there is a typo, and a typo
+// that quietly configures nothing is worse than a refusal to start.
+func TestRunRejectsAMissingWatchedDirectory(t *testing.T) {
+	var out bytes.Buffer
+	code := Run(context.Background(), Opts{
+		Args:   []string{"--keys=app.k:s", "--namespaces-dir=" + filepath.Join(t.TempDir(), "nope")},
+		Getenv: emptyEnv,
+		Out:    &out,
+	})
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(out.String(), "reading the watched config") {
+		t.Errorf("output = %q, want substring %q", out.String(), "reading the watched config")
+	}
+}
+
+// An app-status file saying the app is disabled is in force before the
+// listener opens, rather than a second later once the first poll runs — so a
+// server started against a disabled app never serves a request for it.
+func TestRunAppStatusFileIsAppliedBeforeServing(t *testing.T) {
+	statusFile := filepath.Join(t.TempDir(), "app-status")
+	if err := os.WriteFile(statusFile, []byte("disabled\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready := make(chan net.Addr, 1)
+	done := make(chan int, 1)
+	var out bytes.Buffer
+	go func() {
+		done <- Run(ctx, Opts{
+			Args:   []string{"--listen=127.0.0.1:0", "--keys=app.k:s3cr3t", "--app-status-file=" + statusFile},
+			Getenv: emptyEnv,
+			Out:    &out,
+			Ready:  ready,
+		})
+	}()
+
+	var addr net.Addr
+	select {
+	case addr = <-ready:
+	case code := <-done:
+		t.Fatalf("server exited before ready (code=%d), output: %s", code, out.String())
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not become ready within 5s")
+	}
+
+	// The very first request the server ever sees is refused: nothing here
+	// waited for a poll.
+	req, err := http.NewRequest("GET", "http://"+addr.String()+"/channels/c/history", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetBasicAuth("app.k", "s3cr3t")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("requesting history: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		body, _ := io.ReadAll(resp.Body)
+		t.Errorf("status = %d, want 403; body: %s", resp.StatusCode, body)
+	}
+
+	cancel()
+	<-done
 }
