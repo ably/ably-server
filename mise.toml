@@ -8,7 +8,7 @@
 #   mise run image       # Build the container image
 
 [tools]
-golang = "1.26.3"
+golang = "1.26.8"
 
 [settings]
 # Automatically install tools when entering the directory

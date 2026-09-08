@@ -19,7 +19,7 @@
 # toolchain determines the stdlib version linked into the binary, which
 # is a component in its own right in the SBOM and a source of CVEs of
 # its own. It should change because we changed it.
-ARG GO_VERSION=1.26.3
+ARG GO_VERSION=1.26.8
 ARG ALPINE_VERSION=3.20
 
 # Cross-compiles rather than emulating: the binary is pure Go with
