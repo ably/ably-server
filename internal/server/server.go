@@ -19,6 +19,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +39,7 @@ import (
 	"github.com/ably/ably-server/internal/storage/memory"
 	"github.com/ably/ably-server/internal/storage/postgres"
 	"github.com/ably/ably-server/internal/tracing"
+	"github.com/ably/ably-server/internal/version"
 )
 
 const (
@@ -88,6 +90,13 @@ type Opts struct {
 // inputs are passed via Opts so the function is testable without
 // touching package-level state.
 func Run(ctx context.Context, opts Opts) int {
+	// --version is answered before anything else, so identifying a
+	// binary never depends on its configuration being loadable.
+	if hasVersionFlag(opts.Args) {
+		fmt.Fprintln(opts.Out, version.String())
+		return 0
+	}
+
 	// The config file's path must be known before the flags it seeds
 	// are defined below, so it's resolved by hand (flag > env) ahead
 	// of the real flag.Parse pass. --config is still registered as a
@@ -121,6 +130,9 @@ func Run(ctx context.Context, opts Opts) int {
 	fs := flag.NewFlagSet("ably-server", flag.ContinueOnError)
 	fs.SetOutput(opts.Out)
 	fs.String("config", configPath, "path to an optional TOML config file (env: "+configPathEnv+")")
+	// Handled above, ahead of config loading; registered only so
+	// fs.Parse accepts it and --help lists it.
+	fs.Bool("version", false, "print the version, commit and toolchain, then exit")
 	listen := fs.String("listen", config.Default(opts.Getenv(listenEnv), file.Listen, ":8080"), "address for HTTP/WS listener (env: "+listenEnv+")")
 	var keysFlags multiFlag
 	fs.Var(&keysFlags, "keys", "API key in appId.keyId:keySecret format; repeatable (env: "+keysEnv+", comma-separated)")
@@ -147,6 +159,11 @@ func Run(ctx context.Context, opts Opts) int {
 		fmt.Fprintln(opts.Out, err)
 		return 1
 	}
+	logger.Info("starting",
+		"version", version.Version(),
+		"commit", version.Commit(),
+		"go", runtime.Version(),
+	)
 
 	// The watched sources are read before anything is built, because the keys
 	// and namespaces they carry are as much this server's configuration as the
@@ -725,4 +742,25 @@ func newLogger(level, format string, w io.Writer) (*logging.Logger, error) {
 	default:
 		return nil, fmt.Errorf("unknown --log-format %q (valid: text, json)", format)
 	}
+}
+
+// hasVersionFlag reports whether args ask for --version. Scanned by
+// hand, ahead of flag.Parse, because Run answers it before it has a
+// FlagSet — or a loadable config to build one from.
+func hasVersionFlag(args []string) bool {
+	for _, a := range args {
+		switch {
+		case a == "--":
+			return false
+		case a == "--version", a == "-version":
+			return true
+		case strings.HasPrefix(a, "--version="), strings.HasPrefix(a, "-version="):
+			// A bool flag also accepts --version=false, which asks
+			// to run the server. A value flag.Parse would reject is
+			// left to it to report.
+			v, err := strconv.ParseBool(a[strings.Index(a, "=")+1:])
+			return err == nil && v
+		}
+	}
+	return false
 }

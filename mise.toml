@@ -45,9 +45,116 @@ run = "go build -o bin/ably-local-sandbox ./cmd/ably-local-sandbox"
 # =============================================================================
 
 # --ssh forwards the host's SSH agent into the build, which is how it reaches
-# the private protocol module (see the Dockerfile). ably-server:local is the
-# tag docker-compose.yml expects, so building here means `docker compose up`
-# needs no --build.
+# the private protocol module (see the Dockerfile).
+#
+# `image` builds the development image, because ably-server:local is the tag
+# docker-compose.yml expects and the Compose healthcheck needs that base.
+# `image-release` builds what we actually publish, so it can be run and
+# scanned locally before a release does the same thing in CI.
 [tasks.image]
-description = "Build the ably-server image, tagged ably-server:local"
-run = "docker build --ssh default -t ably-server:local ."
+description = "Build the development image, tagged ably-server:local"
+run = "docker build --ssh default --target dev -t ably-server:local ."
+
+[tasks.image-release]
+description = "Build the published scratch image, tagged ably-server:release"
+run = """
+docker build --ssh default --target scratch   --build-arg VERSION="$(git describe --tags --always --dirty)"   --build-arg COMMIT="$(git rev-parse HEAD)"   -t ably-server:release .
+"""
+
+# =============================================================================
+# Supply chain
+# =============================================================================
+#
+# These are the artefacts a customer needs to assess what we shipped without
+# trusting us: an inventory of what is in the image, and a scan of it. CI runs
+# these same tasks against the pushed image (.github/workflows/release.yml), so
+# what a release produces can be reproduced here against a local build.
+#
+# The tools are pinned per task rather than in [tools], so a normal `mise
+# install` — and the ordinary build-and-test CI job — does not pull them.
+
+# Generated from the image rather than from go.mod on purpose. The manifest
+# lists every module the module graph reaches, including test-only ones that
+# never link into anything shipped: 160 modules against the 51 actually in the
+# binary. On a scratch base the image contains only the binary, so the image
+# SBOM and the binary SBOM are the same document, and it is the one that
+# describes what is running.
+#
+# Both formats, because SPDX and CycloneDX each have tools and policies that
+# expect them and generating the second costs one more invocation of the first.
+# Extracts the binary rather than scanning the image, for two reasons. It is
+# what makes the inventory accurate — syft only reads the Go symbol table from
+# a binary it is pointed at directly, and without those symbols a scanner falls
+# back to module-granularity matching and reports things we do not call. And on
+# a scratch base the binary is the whole image, so nothing is lost by scanning
+# it instead. Extraction does not run the binary, so a foreign architecture
+# extracts fine on any host.
+[tasks.image-binary]
+description = "Extract the ably-server binary from an image into dist/ (IMAGE, PLATFORM)"
+run = """
+set -eu
+image="${IMAGE:-ably-server:release}"
+platform="${PLATFORM:-linux/amd64}"
+slug="$(echo "$platform" | tr '/' '-')"
+mkdir -p dist
+cid="$(docker create --platform "$platform" "$image")"
+trap 'docker rm -f "$cid" >/dev/null' EXIT
+docker cp "$cid:/usr/local/bin/ably-server" "dist/ably-server-$slug"
+echo "dist/ably-server-$slug"
+"""
+
+# Both formats, because SPDX and CycloneDX each have tools and policies that
+# expect one or the other, and generating the second costs one more invocation.
+#
+# --source-version names the release the document describes: the Go main module
+# carries no version of its own in a binary built from a checkout — the
+# toolchain records "(devel)" — so without it the SBOM is an inventory of the
+# dependencies of an unidentified thing.
+[tasks.sbom]
+description = "Write SPDX and CycloneDX SBOMs for an extracted binary (PLATFORM, VERSION)"
+tools = { syft = "1.51.1" }
+depends = ["image-binary"]
+run = """
+set -eu
+platform="${PLATFORM:-linux/amd64}"
+slug="$(echo "$platform" | tr '/' '-')"
+version="${VERSION:-$(git describe --tags --always --dirty)}"
+mkdir -p sbom
+for format in spdx-json cyclonedx-json; do
+  syft scan --quiet \
+    --source-name ably-server --source-version "$version" \
+    -o "$format=sbom/ably-server-$slug.$format.json" \
+    "file:dist/ably-server-$slug"
+done
+ls -l sbom
+"""
+
+# Two scanners because they answer different questions. grype matches the
+# shipped components against vulnerability data, which is what a customer's own
+# scanner will do. govulncheck additionally asks whether the vulnerable function
+# is reachable, which is what turns "links something with a CVE" into a
+# defensible statement either way. Both run before either failure is reported,
+# because seeing only the first is misleading.
+#
+# Both scan the binary rather than the SBOM, and that distinction matters: the
+# SPDX and CycloneDX formats carry no Go symbol table, so a scan of the SBOM
+# alone falls back to module-granularity matching. Here that is the difference
+# between 15 findings and 13. A customer scanning our published SBOM will see
+# the coarser number, which is why the published advisory has to say which
+# findings we assess as unreachable rather than leaving them to infer it.
+[tasks.scan]
+description = "Scan the extracted binary for known vulnerabilities (PLATFORM, FAIL_ON)"
+tools = { grype = "0.118.0", "go:golang.org/x/vuln/cmd/govulncheck" = "latest" }
+depends = ["image-binary"]
+run = """
+set -eu
+platform="${PLATFORM:-linux/amd64}"
+binary="dist/ably-server-$(echo "$platform" | tr '/' '-')"
+rc=0
+echo "== grype: what the shipped components are known to be vulnerable to"
+grype "$binary" --fail-on "${FAIL_ON:-high}" || rc=$?
+echo
+echo "== govulncheck: which of those the shipped binary can actually reach"
+govulncheck -mode=binary "$binary" || rc=$?
+exit $rc
+"""

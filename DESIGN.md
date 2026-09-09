@@ -1418,7 +1418,17 @@ upper-casing and underscoring the flag — e.g. `--log-format` is
 --keys-dir                    directory of one-key-per-file, re-read while running (§9.1)
 --namespaces-dir              directory of one-namespace-per-file, re-read while running (§9.1)
 --app-status-file             file holding the app's status, re-read while running (§9.1)
+--version                     print the build's identity and exit
 ```
+
+`--version` prints one line — release, commit, Go toolchain and
+platform — and exits 0. It is answered before any configuration is
+read, so a binary can always identify itself even when the
+configuration it would otherwise load is missing or broken. A release
+build has its release and commit stamped in at link time; an
+unstamped build reports `dev` alongside the commit the toolchain
+recorded, so every binary traces to a source revision. The same
+identity is logged at `info` as the first line of startup (§11).
 
 `--addr-file` writes the listener's resolved `host:port` to the given path
 once the bind succeeds, then keeps running. It exists so a parent process
@@ -1620,7 +1630,10 @@ the file is fixed.
 
 ## 11. Lifecycle & operations
 
-**Startup.** Each backend bootstraps its storage at `Open` time. The
+**Startup.** The first line logged is the build's identity — release,
+commit and toolchain, the same values `--version` prints (§9) — so
+every log stream states which build produced it. Each backend then
+bootstraps its storage at `Open` time. The
 bbolt backend creates the two top-level buckets if missing (§6.2).
 The Postgres backend runs the auto-migrate sweep described in §6.3 —
 a session-scoped advisory lock serialises N concurrently-starting

@@ -19,6 +19,10 @@ x-ably-node: &ably-node
   build:
     context: .
     dockerfile: Dockerfile
+    # The development image, not the scratch one we publish: the
+    # healthcheck below needs a shell and busybox wget, which the
+    # published image deliberately has neither of (see the Dockerfile).
+    target: dev
     # The image fetches the private protocol module over SSH, so the build
     # needs the host's agent forwarded (see the Dockerfile).
     ssh:
