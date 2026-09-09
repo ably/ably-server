@@ -7,6 +7,7 @@ import (
 	"github.com/ably/ably-server/internal/logging"
 	"github.com/ably/ably-server/internal/storage/memory"
 
+	protoapp "github.com/ably/server-protocol/go/app"
 	"github.com/ably/server-protocol/go/channel"
 	"github.com/ably/server-protocol/go/conf"
 	"github.com/ably/server-protocol/go/scope"
@@ -22,7 +23,7 @@ func newTestChannels(t *testing.T) (*ChannelManager, *core.Manager) {
 	t.Helper()
 
 	store := core.NewManager(memory.New(memory.Options{}))
-	m := NewChannelManager(store, conf.Default(), newNamespaces(nil), logging.Default())
+	m := NewChannelManager(store, conf.Default(), protoapp.NewNamespaceMap(), logging.Default())
 	t.Cleanup(m.Close)
 	return m, store
 }

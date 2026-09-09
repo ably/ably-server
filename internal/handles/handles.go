@@ -155,7 +155,11 @@ type App struct {
 	id       string
 	appScope scope.ID
 
-	namespaces *namespaces
+	// namespaces is live, so that a namespace edited while the server runs
+	// reaches the channels already resolved against it (DESIGN.md §9.1). It is
+	// fed whole rather than a change at a time: this server re-reads its whole
+	// configuration and knows what is absent as well as what is present.
+	namespaces *protoapp.NamespaceMap
 
 	// keysMu guards keys. A key is replaced by setting the value its
 	// reference already points at, so a connection holding one sees the change
@@ -179,27 +183,34 @@ func NewApp(appID string, keys []auth.APIKey, namespaces []config.Namespace, m *
 		metrics:    m,
 		id:         appID,
 		appScope:   scope.New(scope.App, appID),
-		namespaces: newNamespaces(namespaces),
+		namespaces: protoapp.NewNamespaceMap(),
 		keys:       map[string]*live.Reference[*protoapp.Key]{},
 		fatal:      live.NewValue[*errors.ErrorInfo](nil),
 	}
 	app.enabled.Store(true)
+	app.SetNamespaces(namespaces)
+
+	// The namespaces are read before the listener opens, so the map is loaded
+	// as soon as it is built: nothing ever waits to find out whether a
+	// namespace it cannot find is absent or merely not read yet.
+	app.namespaces.SetLoaded()
+
 	if err := app.SetKeys(keys); err != nil {
 		return nil, err
 	}
 	return app, nil
 }
 
-func (a *App) ID() string                        { return a.id }
-func (a *App) Scope() scope.ID                   { return a.appScope }
-func (a *App) Namespaces() protoapp.NamespaceMap { return a.namespaces }
+func (a *App) ID() string                         { return a.id }
+func (a *App) Scope() scope.ID                    { return a.appScope }
+func (a *App) Namespaces() *protoapp.NamespaceMap { return a.namespaces }
 
 // SetNamespaces replaces the app's namespaces, which reaches the channels
 // already attached: a channel watches the namespace it resolved to, so one
 // whose settings change here starts behaving differently without being
 // reattached.
 func (a *App) SetNamespaces(configured []config.Namespace) {
-	a.namespaces.Set(configured)
+	a.namespaces.Replace(wireNamespaces(configured))
 }
 
 // SetKeys replaces the app's API keys.

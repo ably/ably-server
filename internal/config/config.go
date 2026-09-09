@@ -88,6 +88,18 @@ type Namespace struct {
 	Persisted       bool   `toml:"persisted"`
 	MutableMessages bool   `toml:"mutableMessages"`
 	PushEnabled     bool   `toml:"pushEnabled"`
+
+	// Modified is which version of this namespace this is, in milliseconds
+	// since the epoch. It is not written in the TOML: a namespace read from
+	// --namespaces-dir takes its file's modification time, and one from the
+	// config file or the flags takes the time the server started, since those
+	// are re-applied unchanged for as long as it runs.
+	//
+	// The namespace map compares it to decide whether a namespace it is given
+	// is the one it already holds, so editing a file is what makes an attached
+	// channel resolve again. Two edits within the same millisecond read as one;
+	// touching a file with no edit reads as a change and costs a re-resolve.
+	Modified int64 `toml:"-"`
 }
 
 // Channel is one [[channels]] entry: a channel name plus the presence

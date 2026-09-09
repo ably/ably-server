@@ -6,80 +6,76 @@ import (
 	"github.com/ably/ably-server/internal/config"
 )
 
-// TestNamespacesNotifyWhatChanged proves the map tells a watcher apart what it
-// needs to act on from what it does not: an addition notifies added, a change
-// or a removal notifies updated, and re-applying the same set notifies
-// neither.
-func TestNamespacesNotifyWhatChanged(t *testing.T) {
-	n := newNamespaces([]config.Namespace{{ID: "chat", Persisted: true}})
+// The configured namespaces reach the map, in the terms the protocol code
+// reads them in. What the map does with them is its own tests' business; what
+// is this server's is that every field it can configure is carried over.
+func TestSetNamespacesCarriesTheConfiguredSettings(t *testing.T) {
+	app, _ := newTestApp(t, config.Namespace{
+		ID:              "chat",
+		Persisted:       true,
+		MutableMessages: true,
+		PushEnabled:     true,
+		Modified:        1,
+	}, config.Namespace{
+		ID:       "*:edits",
+		Mode:     "matcher",
+		Modified: 1,
+	})
+
+	ns := app.Namespaces().MostSpecific("chat:room")
+	if !ns.GetPersisted() || !ns.GetMutableMessages() || !ns.GetPushEnabled() {
+		t.Errorf("chat:room resolved to %+v, want the configured settings", ns)
+	}
+	if got := app.Namespaces().MostSpecific("anything:edits").GetId(); got != "*:edits" {
+		t.Errorf("anything:edits resolved to %q, want the matcher", got)
+	}
+}
+
+// Applying namespaces is what a reload does with every namespace this server
+// has, changed or not, so the version each carries is what decides whether an
+// attached channel has to resolve again.
+func TestSetNamespacesAppliesWhatChanged(t *testing.T) {
+	app, _ := newTestApp(t, config.Namespace{ID: "chat", Modified: 1})
 
 	// A watcher takes the notification channels the way ResolveNamespace does,
 	// before reading anything.
-	added, updated := n.Added().Notify, n.Updated().Notify
+	added, updated := app.Namespaces().Added().Notify, app.Namespaces().Updated().Notify
 
-	// Re-applying the same set changes nothing, so a re-read of an unedited
-	// directory costs an attached channel no work.
-	n.Set([]config.Namespace{{ID: "chat", Persisted: true}})
+	// Re-reading an unedited directory costs an attached channel no work.
+	app.SetNamespaces([]config.Namespace{{ID: "chat", Modified: 1}})
 	if isClosed(added) || isClosed(updated) {
 		t.Error("an unchanged set notified a watcher")
 	}
 
-	// A new namespace notifies added: any namespace may be the one that
-	// matches a given channel, so an addition matters as much as a change.
-	n.Set([]config.Namespace{{ID: "chat", Persisted: true}, {ID: "*:edits", Mode: "matcher"}})
-	if !isClosed(added) {
-		t.Error("an added namespace did not notify")
-	}
-	if n.Size() != 2 {
-		t.Errorf("Size() = %d, want 2", n.Size())
-	}
-
-	// A changed namespace notifies updated, and the index it is resolved
-	// through is rebuilt before the notification fires.
-	added, updated = n.Added().Notify, n.Updated().Notify
-	n.Set([]config.Namespace{{ID: "chat", Persisted: true, MutableMessages: true}, {ID: "*:edits", Mode: "matcher"}})
+	// A file written again is a new version of the namespace, and the index a
+	// channel resolves through carries the edit.
+	app.SetNamespaces([]config.Namespace{{ID: "chat", Persisted: true, Modified: 2}})
 	if !isClosed(updated) {
-		t.Error("a changed namespace did not notify")
+		t.Error("an edited namespace did not notify")
 	}
-	if isClosed(added) {
-		t.Error("a changed namespace was reported as added")
-	}
-	if got := n.Index().MostSpecific("chat:room"); !got.GetMutableMessages() {
+	if !app.Namespaces().MostSpecific("chat:room").GetPersisted() {
 		t.Error("the index still resolves chat:room to the old settings")
 	}
 
-	// A namespace that is no longer configured notifies updated too: a channel
-	// that resolved to it has to resolve again.
-	added, updated = n.Added().Notify, n.Updated().Notify
-	n.Set([]config.Namespace{{ID: "chat", Persisted: true, MutableMessages: true}})
-	if !isClosed(updated) {
-		t.Error("a removed namespace did not notify")
-	}
-	if isClosed(added) {
-		t.Error("a removed namespace was reported as added")
-	}
-	if _, ok := n.Get("*:edits"); ok {
-		t.Error("a removed namespace is still in the map")
+	// A namespace no longer configured leaves the map: deleting its file
+	// deletes the namespace.
+	app.SetNamespaces(nil)
+	if _, held := app.Namespaces().Get("chat"); held {
+		t.Error("a namespace that is no longer configured is still in the map")
 	}
 }
 
-// A held state keeps resolving: the value a watcher took before a change reads
-// the new settings after it.
-func TestNamespacesUpdateAHeldState(t *testing.T) {
-	n := newNamespaces([]config.Namespace{{ID: "chat"}})
+// A file dropped from --namespaces-dir reverts to the namespace the config
+// file configured, which is an older version than the one it is replacing.
+func TestSetNamespacesRevertsToAnOlderVersion(t *testing.T) {
+	const startup, edited = 100, 200
 
-	state, ok := n.Get("chat")
-	if !ok {
-		t.Fatal("the configured namespace is not in the map")
-	}
+	app, _ := newTestApp(t, config.Namespace{ID: "chat", Modified: startup})
+	app.SetNamespaces([]config.Namespace{{ID: "chat", Persisted: true, Modified: edited}})
 
-	n.Set([]config.Namespace{{ID: "chat", PushEnabled: true}})
-
-	if !isClosed(state.Notify) {
-		t.Fatal("the held state was not notified")
-	}
-	if !state.Next.Value.GetPushEnabled() {
-		t.Error("the held state's successor does not carry the change")
+	app.SetNamespaces([]config.Namespace{{ID: "chat", Modified: startup}})
+	if app.Namespaces().MostSpecific("chat").GetPersisted() {
+		t.Error("dropping the overriding file left its settings in force")
 	}
 }
 
@@ -87,8 +83,9 @@ func TestNamespacesUpdateAHeldState(t *testing.T) {
 // namespaces before it opens its listener, so nothing ever waits to find out
 // whether a namespace it cannot find is absent or merely not read yet.
 func TestNamespacesAreLoadedImmediately(t *testing.T) {
+	app, _ := newTestApp(t)
 	select {
-	case <-newNamespaces(nil).Loaded():
+	case <-app.Namespaces().Loaded():
 	default:
 		t.Error("the namespace map reports itself still loading")
 	}

@@ -5,7 +5,7 @@ go 1.26.8
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/ably/ably-go v1.4.1
-	github.com/ably/server-protocol/go v0.0.0-20260908001228-4209f8ab3f22
+	github.com/ably/server-protocol/go v0.0.0-20260909203048-bfe2c8a4ed6d
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/jackc/pgx/v5 v5.9.2

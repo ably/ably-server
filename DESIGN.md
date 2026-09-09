@@ -1575,6 +1575,18 @@ Applying a change:
   every configured one against its name, so a change anywhere can change
   what a given channel is allowed to do. A channel whose resolution did
   not actually change is told nothing.
+
+  What counts as a change is **the file's modification time**. The
+  protocol module's namespace map versions a namespace so that a source
+  redelivering one unchanged does not look like an edit, and the file is
+  this server's record of what a namespace says, so when it was last
+  written is its version. Two edits within the same millisecond therefore
+  read as one, and touching a file with no edit reads as a change and
+  costs a re-resolve. A namespace from a flag, an environment variable or
+  the config file takes the time the server started instead, since those
+  are re-applied unchanged for as long as it runs — so dropping a file
+  that overrode one of them puts the configured namespace back, even
+  though it is older than the file that was overriding it.
 - **A disabled app** refuses every request and every new connection with
   `40300`, and closes every established connection with the same error.
   Enabling it again restores both. The three status checks the module asks

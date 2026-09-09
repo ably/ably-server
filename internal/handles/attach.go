@@ -53,7 +53,7 @@ type ChannelManager struct {
 	// it cannot do things this server was configured to let it do. The map is
 	// live: it changes as the app's namespaces are reconfigured under it
 	// (DESIGN.md §9.1).
-	namespaces protoapp.NamespaceMap
+	namespaces *protoapp.NamespaceMap
 
 	log *logging.Logger
 
@@ -72,7 +72,7 @@ type ChannelManager struct {
 	public *channel.Manager
 }
 
-func NewChannelManager(manager *core.Manager, c *conf.Conf, namespaces protoapp.NamespaceMap, log *logging.Logger) *ChannelManager {
+func NewChannelManager(manager *core.Manager, c *conf.Conf, namespaces *protoapp.NamespaceMap, log *logging.Logger) *ChannelManager {
 	ctx, stop := context.WithCancel(context.Background())
 	m := &ChannelManager{
 		manager:    manager,
@@ -86,7 +86,14 @@ func NewChannelManager(manager *core.Manager, c *conf.Conf, namespaces protoapp.
 		Conf:       c.Channel,
 		// The site code is empty because this server has one site: there is no
 		// other site for a serial to belong to, so no resume is another's.
-		SiteCode:         "",
+		SiteCode: "",
+		// This server enforces no limit of its own — the app handle embeds
+		// app.NopLimits (handles.go), and a publish is only rejected above
+		// the app's own maximum. What this bounds is how large a STATE_SYNC
+		// page the state cache builds, which has to be some finite size, and
+		// the default is the 64 KiB maxMessageSize the CONNECTED reports
+		// (DESIGN.md §2.1).
+		Limits:           conf.DefaultLimits(),
 		AttachmentHandle: m.attachmentHandle,
 		GCInterval:       runtime.NewDuration(gcInterval),
 		GCAfter:          runtime.NewDuration(gcAfter),
@@ -166,7 +173,7 @@ func (m *ChannelManager) namespaceFor(spec *channel.Spec) *namespaceWatch {
 // change what an already attached channel is allowed to do.
 type namespaceWatch struct {
 	spec       *channel.Spec
-	namespaces protoapp.NamespaceMap
+	namespaces *protoapp.NamespaceMap
 
 	// resolved is the last resolution, held for the notifications it carries:
 	// waiting on those is how the loop below learns to resolve again.

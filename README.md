@@ -140,7 +140,8 @@ with its default.
 Most configuration is read once, at startup. Three sources are not:
 `--keys-dir` and `--namespaces-dir` hold one API key and one channel rule
 per file, and `--app-status-file` says whether the app is served at all
-(no file means it is). Those are re-read every second, so an SDK can be
+(no file means it is). Those are re-read every second — a namespace file's
+modification time is what marks it edited — so an SDK can be
 developed against a key whose capability changes, a rule that changes
 under an attached channel, or an app that stops being served
 mid-connection — the things a real Ably app does and a fixed

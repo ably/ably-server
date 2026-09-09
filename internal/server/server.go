@@ -202,7 +202,14 @@ func Run(ctx context.Context, opts Opts) int {
 		return 1
 	}
 
-	namespaces := mergeNamespaces(file.Namespaces, watched.Namespaces)
+	// The namespaces the config file and the flags supplied are re-applied
+	// unchanged for as long as this server runs, so they are all one version of
+	// themselves, stamped now. A namespace from --namespaces-dir carries its
+	// file's modification time instead, so editing that file is what makes the
+	// namespace map see a new version of it.
+	staticNamespaces := config.StampNamespaces(file.Namespaces, time.Now())
+
+	namespaces := mergeNamespaces(staticNamespaces, watched.Namespaces)
 	if err := config.ValidateNamespaces(namespaces); err != nil {
 		logger.Error("invalid namespace configuration", "err", err)
 		return 1
@@ -294,7 +301,7 @@ func Run(ctx context.Context, opts Opts) int {
 		sources:          sources,
 		appID:            appID,
 		staticKeys:       staticKeys,
-		staticNamespaces: file.Namespaces,
+		staticNamespaces: staticNamespaces,
 		app:              shared.App(),
 		rest:             rs,
 		log:              logger,

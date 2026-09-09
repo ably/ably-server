@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 
@@ -121,6 +122,11 @@ func readKeysDir(dir string) ([]KeyEntry, error) {
 }
 
 // readNamespacesDir reads one [[namespaces]] entry per file in dir.
+//
+// Each entry is stamped with its file's modification time, which is the version
+// the namespace map compares (see Namespace.Modified): the file is the record
+// of what the namespace says, so when it was last written is the record of
+// which version of it this is.
 func readNamespacesDir(dir string) ([]Namespace, error) {
 	paths, err := entryFiles(dir)
 	if err != nil {
@@ -135,9 +141,27 @@ func readNamespacesDir(dir string) ([]Namespace, error) {
 		if entry.ID == "" {
 			return nil, fmt.Errorf("config: %q declares no namespace id", path)
 		}
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, fmt.Errorf("config: %q: %w", path, err)
+		}
+		entry.Modified = info.ModTime().UnixMilli()
 		entries = append(entries, entry)
 	}
 	return entries, nil
+}
+
+// StampNamespaces returns the namespaces with the given version, for the ones
+// which do not come from a watched file: the config file's and the flags' are
+// re-applied unchanged for as long as the server runs, so one version for the
+// lot of them is the whole truth about them.
+func StampNamespaces(namespaces []Namespace, modified time.Time) []Namespace {
+	stamped := make([]Namespace, len(namespaces))
+	for i, ns := range namespaces {
+		ns.Modified = modified.UnixMilli()
+		stamped[i] = ns
+	}
+	return stamped
 }
 
 // readAppStatusFile reads the app's status, which is the file's whole

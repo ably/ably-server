@@ -102,7 +102,7 @@ func TestReloadLayersOverStaticConfig(t *testing.T) {
 
 	// The namespace declared in both places is the directory's; the one only
 	// the static config declares is still there.
-	if got := app.Namespaces().Index().MostSpecific("chat:room"); !got.GetMutableMessages() {
+	if got := app.Namespaces().MostSpecific("chat:room"); !got.GetMutableMessages() {
 		t.Error("the watched namespace did not win over the static one")
 	}
 	if _, ok := app.Namespaces().Get("other"); !ok {
@@ -137,7 +137,7 @@ func TestReloadRunAppliesEdits(t *testing.T) {
 
 	write(t, filepath.Join(sources.NamespacesDir, "chat.toml"), "id = \"chat\"\npersisted = true\n")
 	waitFor(t, "the namespace to arrive", func() bool {
-		return app.Namespaces().Index().MostSpecific("chat:room").GetPersisted()
+		return app.Namespaces().MostSpecific("chat:room").GetPersisted()
 	})
 }
 
@@ -163,7 +163,7 @@ func TestReloadKeepsTheLastGoodConfig(t *testing.T) {
 			waitFor(t, "the failure to be reported", func() bool {
 				return strings.Contains(out.String(), "watched config")
 			})
-			if !app.Namespaces().Index().MostSpecific("chat:room").GetPersisted() {
+			if !app.Namespaces().MostSpecific("chat:room").GetPersisted() {
 				t.Error("a refused config was applied anyway")
 			}
 			out.Reset()
@@ -172,11 +172,11 @@ func TestReloadKeepsTheLastGoodConfig(t *testing.T) {
 			// on the last good config forever.
 			write(t, filepath.Join(sources.NamespacesDir, "chat.toml"), "id = \"chat\"\nmutableMessages = true\n")
 			waitFor(t, "the fixed config to be applied", func() bool {
-				return app.Namespaces().Index().MostSpecific("chat:room").GetMutableMessages()
+				return app.Namespaces().MostSpecific("chat:room").GetMutableMessages()
 			})
 			write(t, filepath.Join(sources.NamespacesDir, "chat.toml"), "id = \"chat\"\npersisted = true\n")
 			waitFor(t, "the original config to be restored", func() bool {
-				ns := app.Namespaces().Index().MostSpecific("chat:room")
+				ns := app.Namespaces().MostSpecific("chat:room")
 				return ns.GetPersisted() && !ns.GetMutableMessages()
 			})
 		})

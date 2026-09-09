@@ -48,7 +48,9 @@ func TestDynamicReadsEachSource(t *testing.T) {
 			{Key: "app.one:s1", Capability: `{"chat:*":["subscribe"]}`},
 			{Key: "app.two:s2"},
 		},
-		Namespaces: []Namespace{{ID: "persisted", Persisted: true}},
+		// A namespace carries its file's modification time, which is the
+		// version the namespace map compares to decide what changed.
+		Namespaces: []Namespace{{ID: "persisted", Persisted: true, Modified: modTime(t, filepath.Join(namespacesDir, "persisted.toml"))}},
 		AppStatus:  "disabled",
 	}
 	if !got.Equal(want) {
@@ -167,4 +169,14 @@ func TestValidateNamespaces(t *testing.T) {
 			}
 		})
 	}
+}
+
+// modTime is a file's modification time in the units Namespace.Modified is in.
+func modTime(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.ModTime().UnixMilli()
 }
