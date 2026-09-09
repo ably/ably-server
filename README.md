@@ -256,9 +256,27 @@ Feedback and bug reports are welcome via
 [CONTRIBUTING.md](CONTRIBUTING.md) for how to build, test, and open a pull
 request.
 
+## Container image
+
+Releases are published as a signed multi-architecture image built on
+`scratch` — the binary and nothing else, running as a non-root user,
+with a Cosign signature, a provenance attestation and an SBOM in both
+SPDX and CycloneDX attached to each digest.
+
+[docs/releases.md](docs/releases.md) covers how to verify all of that,
+how to mirror the image into your own registry without losing it, and
+what our patch cadence is.
+
+Locally, `mise run image-release` builds the same image, and
+`mise run sbom` and `mise run scan` produce its inventory and scan it
+with the same tools CI uses. `docker compose` builds a development
+variant on Alpine instead, which has a shell in it.
+
 ## Further reading
 
 - [DESIGN.md](DESIGN.md) — full design, protocol coverage, semantics.
+- [docs/releases.md](docs/releases.md) — what a release consists of and
+  how to check it.
 - [Ably protocol docs](https://ably.com/docs) — the protocol this
   server implements a subset of.
 

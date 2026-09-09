@@ -158,3 +158,30 @@ echo "== govulncheck: which of those the shipped binary can actually reach"
 govulncheck -mode=binary "$binary" || rc=$?
 exit $rc
 """
+
+# Keyless. There is no key for us to hold, rotate or lose: cosign gets a
+# short-lived certificate from Fulcio bound to the OIDC identity of whatever
+# is running it — in CI, this workflow at this ref — and records the signature
+# in the Rekor transparency log. What a verifier checks is therefore "this was
+# built by that workflow", which is a stronger and more auditable claim than
+# "someone had the key".
+[tasks.sign]
+description = "Sign an image by digest (REF)"
+tools = { cosign = "3.1.3" }
+run = 'cosign sign --yes "${REF:?set REF to an image reference by digest}"'
+
+# Attaches the SBOMs to the image in the registry, so the inventory travels
+# with the artifact and is discoverable from the digest a deployment pins,
+# rather than having to be found and matched up separately.
+[tasks.attest]
+description = "Attach an architecture's SBOMs to an image as attestations (REF, PLATFORM)"
+tools = { cosign = "3.1.3" }
+run = """
+set -eu
+ref="${REF:?set REF to an image reference by digest}"
+slug="$(echo "${PLATFORM:-linux/amd64}" | tr '/' '-')"
+cosign attest --yes --type spdxjson \
+  --predicate "sbom/ably-server-$slug.spdx-json.json" "$ref"
+cosign attest --yes --type cyclonedx \
+  --predicate "sbom/ably-server-$slug.cyclonedx-json.json" "$ref"
+"""

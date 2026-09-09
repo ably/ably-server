@@ -1,0 +1,155 @@
+name: Security
+
+# Two questions, asked separately.
+#
+# On a change: does what we would ship today have a known vulnerability?
+# That is a gate, and it is the same scan the release runs.
+#
+# On a schedule: does what we have already shipped have one? Nothing in
+# a published image changes, but what is known about it does, and a
+# customer holding a digest needs us to notice before they do. This is
+# the half of the commitment that a change-triggered scan cannot make.
+
+on:
+  pull_request:
+  schedule:
+    # Early UTC daily, so a disclosure overnight is triaged the same
+    # working day.
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Scan the current build
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Authorise the private protocol module
+        env:
+          KEY: ${{ secrets.SERVER_PROTOCOL_DEPLOY_KEY }}
+        run: |
+          mkdir -p -m 700 ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          eval "$(ssh-agent -s)"
+          printf '%s\n' "$KEY" | ssh-add -
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+
+      - name: Set up the tool environment
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          version: 2026.9.1
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          target: release
+          platforms: linux/amd64
+          ssh: default
+          load: true
+          tags: ably-server:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan
+        env:
+          IMAGE: ably-server:scan
+          PLATFORM: linux/amd64
+        run: mise run scan
+
+  published:
+    name: Rescan what has been published
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC, for reading the published images from ECR
+    timeout-minutes: 30
+    env:
+      IMAGE_REPOSITORY: ${{ vars.IMAGE_REPOSITORY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up the tool environment
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          version: 2026.9.1
+
+      - name: Assume the reading role
+        if: env.IMAGE_REPOSITORY != ''
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'eu-west-1' }}
+
+      - name: Log in to the registry
+        if: env.IMAGE_REPOSITORY != ''
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
+
+      # Not just the newest, because the point is the ones a customer
+      # is still running; bounded to the most recent 20 so a preview
+      # branch pushing daily does not turn this into an hour's work.
+      # Scanning one architecture is enough: the inventory is the Go
+      # module graph and the toolchain version, which are the same
+      # source built the same way, so it does not vary between them.
+      #
+      # A finding here does not fail the run. It cannot be fixed by
+      # rerunning it — the image is already published and immutable —
+      # and the response is an advisory and a patch release. Failing
+      # would only train us to ignore a red schedule.
+      - name: Rescan
+        if: env.IMAGE_REPOSITORY != ''
+        env:
+          PLATFORM: linux/amd64
+          # Low and above: the severities we have committed a
+          # remediation window for.
+          FAIL_ON: low
+        run: |
+          set -euo pipefail
+          repo="${IMAGE_REPOSITORY##*/}"
+          digests="$(aws ecr describe-images --repository-name "$repo" \
+            --query 'sort_by(imageDetails, &imagePushedAt)[-20:].imageDigest' \
+            --output text | tr '\t' '\n')"
+
+          affected=()
+          for digest in $digests; do
+            echo "::group::$digest"
+            if IMAGE="${IMAGE_REPOSITORY}@${digest}" mise run scan; then
+              echo "clean"
+            else
+              affected+=("$digest")
+            fi
+            echo "::endgroup::"
+          done
+
+          {
+            echo "## Rescan of published images"
+            echo
+            if [ ${#affected[@]} -eq 0 ]; then
+              echo "No published digest has a known vulnerability."
+            else
+              echo "These published digests now have known vulnerabilities."
+              echo "Each needs an advisory and a patch release:"
+              echo
+              printf -- '- `%s`\n' "${affected[@]}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ ${#affected[@]} -gt 0 ]; then
+            echo "::warning::${#affected[@]} published digest(s) now have known vulnerabilities"
+          fi

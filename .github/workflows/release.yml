@@ -1,0 +1,247 @@
+name: Release
+
+# Publishes the container image, signs it, and attaches everything a
+# customer needs to assess it without trusting us: a provenance
+# attestation saying where it was built from, and an SBOM in both
+# formats saying what is in it.
+#
+# It runs on every push to main and to the branch that carries the
+# private protocol module, so the release path is exercised
+# continuously rather than being tried for the first time when there is
+# something to ship. main produces a release build, anything else a dev
+# build.
+
+on:
+  push:
+    branches: [main, public-protocol-package]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # OIDC: assuming the AWS role, and keyless signing
+  attestations: write # actions/attest-build-provenance
+
+# Releases are not interchangeable, so a second push waits rather than
+# cancelling the first: a cancelled run can leave a pushed image with
+# no signature.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # The registry is a variable so that going public — to
+  # public.ecr.aws/ably/ably-server — is a settings change and a
+  # registry-type on the login step below, not a rewrite.
+  IMAGE: ${{ vars.IMAGE_REPOSITORY }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'eu-west-1' }}
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  release:
+    name: Build, scan, publish, sign
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      # Both are repository configuration rather than secrets, so a
+      # missing one is a setup mistake worth naming plainly instead of
+      # failing later as an unauthenticated push to an empty registry.
+      - name: Check the publishing configuration
+        run: |
+          : "${IMAGE:?set the IMAGE_REPOSITORY repository variable}"
+          : "${ROLE:?set the AWS_ROLE_ARN repository variable}"
+        env:
+          ROLE: ${{ vars.AWS_ROLE_ARN }}
+
+      # Ably's internal build identifier: a release from main, a dev
+      # build from anywhere else, then the day, the run and the commit.
+      # Every build therefore has a distinct, sortable, immutable tag,
+      # and the channel prefix is what the registry's retention rules
+      # key off.
+      #
+      # No moving tag is published: the digest is what a deployment
+      # should pin, and offering a "latest" invites pinning something
+      # else.
+      #
+      # Semver will be wanted at GA, when there are supported release
+      # lines to patch into and a customer needs to work out which of
+      # them they are on. There are none yet.
+      - name: Work out the version
+        id: version
+        run: |
+          commit="$(git rev-parse HEAD)"
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            channel=release
+          else
+            channel=dev
+          fi
+          version="$(printf '%s-%s.%03d-%s' "$channel" "$(date -u +%Y%m%d)" \
+            "${GITHUB_RUN_NUMBER}" "$(git rev-parse --short HEAD)")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "Building $version from $commit"
+
+      # The shared protocol module is in a private repository, so the
+      # image build fetches it over SSH. buildx forwards the agent this
+      # starts into the build (`ssh: default` below); the Dockerfile
+      # mounts it. All of this goes away when the module is published.
+      - name: Authorise the private protocol module
+        env:
+          KEY: ${{ secrets.SERVER_PROTOCOL_DEPLOY_KEY }}
+        run: |
+          mkdir -p -m 700 ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          eval "$(ssh-agent -s)"
+          printf '%s\n' "$KEY" | ssh-add -
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+
+      # Supplies syft, grype, govulncheck and cosign at the versions
+      # mise.toml pins, so a release scans and signs with exactly what
+      # a developer running `mise run scan` locally does.
+      - name: Set up the tool environment
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          version: 2026.9.1
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # Built for the host architecture and loaded locally first, so
+      # the scan below is a gate on publishing rather than a report
+      # about something already published. The multi-arch push that
+      # follows is a cache hit on this.
+      - name: Build for scanning
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          target: release
+          platforms: linux/amd64
+          ssh: default
+          load: true
+          tags: ably-server:scan
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+            COMMIT=${{ steps.version.outputs.commit }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Fails the release on a High. That threshold is the commitment
+      # we have made on remediation, so shipping past it should take a
+      # deliberate act rather than an unread log.
+      - name: Scan
+        env:
+          IMAGE: ably-server:scan
+          PLATFORM: linux/amd64
+        run: mise run scan
+
+      - name: Assume the publishing role
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to the registry
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          target: release
+          platforms: ${{ env.PLATFORMS }}
+          ssh: default
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+            COMMIT=${{ steps.version.outputs.commit }}
+          # mode=max records the full build, including the base images
+          # and build arguments, not just the result.
+          provenance: mode=max
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Keyless: the signing identity is this workflow, certified by
+      # Fulcio against the OIDC token above and logged in Rekor. There
+      # is no key for us to hold or for anyone to steal, and the
+      # identity a verifier checks is a workflow at a ref rather than a
+      # key someone might have copied.
+      - name: Sign the image
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: REF="${IMAGE}@${DIGEST}" mise run sign
+
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      # The index is signed above; each architecture's own manifest is
+      # signed here too, because a node that resolved the index to a
+      # single architecture has that digest, not the index's, and
+      # should still be able to verify what it is running.
+      #
+      # SBOMs are attached the same way, per architecture rather than
+      # to the index, so whichever image was actually pulled is the one
+      # its SBOM describes.
+      - name: Sign and attest each architecture
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          raw="$(docker buildx imagetools inspect --raw "${IMAGE}@${DIGEST}")"
+          for platform in ${PLATFORMS//,/ }; do
+            slug="${platform//\//-}"
+            child="$(jq -r --arg os "${platform%/*}" --arg arch "${platform#*/}" \
+              '.manifests[] | select(.platform.os == $os and .platform.architecture == $arch) | .digest' \
+              <<<"$raw")"
+            test -n "$child"
+            echo "::group::$platform ($child)"
+
+            ref="${IMAGE}@${child}"
+            REF="$ref" mise run sign
+            IMAGE="$ref" PLATFORM="$platform" mise run sbom
+            REF="$ref" PLATFORM="$platform" mise run attest
+
+            echo "::endgroup::"
+          done
+
+      # Also published as plain files, because reading an SBOM should
+      # not require a registry client and a Sigstore trust root.
+      - name: Publish the SBOMs as files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom-${{ steps.version.outputs.version }}
+          path: sbom/
+          if-no-files-found: error
+
+      - name: Summarise
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          {
+            echo "## \`$VERSION\`"
+            echo
+            echo "Deploy by digest — the tag is a convenience, the digest is the artifact:"
+            echo
+            echo '```'
+            echo "${IMAGE}@${DIGEST}"
+            echo '```'
+            echo
+            echo "Verify it (see docs/releases.md for what these check):"
+            echo
+            echo '```sh'
+            echo "cosign verify \\"
+            echo "  --certificate-identity-regexp '^https://github.com/${GITHUB_REPOSITORY}/\\.github/workflows/release\\.yml@' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  ${IMAGE}@${DIGEST}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
