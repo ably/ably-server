@@ -185,3 +185,64 @@ cosign attest --yes --type spdxjson \
 cosign attest --yes --type cyclonedx \
   --predicate "sbom/ably-server-$slug.cyclonedx-json.json" "$ref"
 """
+
+# For delivering an image to someone who cannot reach the registry it was
+# published to. `oras cp --recursive` is what makes this a transport rather
+# than a lossy copy: it follows the OCI referrers, so the signature and the
+# provenance attestation travel with the image, and the index digest is
+# preserved. Loading the result into any other registry and running the
+# published `cosign verify` against it therefore still passes.
+#
+# `docker save` cannot do this — signatures are separate artifacts in the
+# registry rather than part of the image, so it would silently produce an
+# unsigned tarball. `cosign save` cannot either: it does not follow referrers.
+#
+# The recipient needs oras or skopeo, not docker: `docker load` rejects an OCI
+# layout unless the containerd image store is enabled.
+#
+#   tar xf ably-server-<version>.tar
+#   oras cp --recursive --from-oci-layout ably-server-<version>:<version> \
+#     <their-registry>/ably-server:<version>
+[tasks.bundle]
+description = "Bundle a published image with its signatures into dist/ for delivery (REF, VERSION)"
+tools = { oras = "1.3.4" }
+run = """
+set -eu
+ref="${REF:?set REF to a published image, by tag or digest}"
+version="${VERSION:-}"
+if [ -z "$version" ]; then
+  case "$ref" in
+    *@sha256:*) version="$(printf '%s' "${ref##*@sha256:}" | cut -c1-12)" ;;
+    */*:*)      version="${ref##*:}" ;;
+    *)          echo "cannot infer a version from $ref; set VERSION" >&2; exit 1 ;;
+  esac
+fi
+
+dir="dist/ably-server-$version"
+out="$dir.tar"
+mkdir -p dist
+rm -rf "$dir" "$out"
+
+log="$(oras cp --recursive "$ref" --to-oci-layout "$dir:$version" 2>&1)"
+printf '%s\n' "$log"
+
+# A bundle carrying only the image would load fine and verify nowhere,
+# which is a failure worth catching here rather than on the recipient's
+# machine. Asking the bundle what it holds is the honest check: the
+# signature is a referrer, so if it did not travel, it is not there.
+echo
+refs="$(oras discover --oci-layout "$dir:$version" 2>&1)"
+printf '%s\n' "$refs"
+if ! printf '%s\n' "$refs" | grep -q 'sigstore.dev/cosign/sign/v1'; then
+  echo "no cosign signature in the bundle: it would verify nowhere" >&2
+  exit 1
+fi
+
+tar cf "$out" -C dist "ably-server-$version"
+rm -rf "$dir"
+
+echo
+echo "bundle:  $out ($(du -h "$out" | cut -f1))"
+echo "digest:  $(printf '%s\n' "$log" | sed -n 's/^Digest: //p' | tail -1)"
+echo "load it: oras cp --recursive --from-oci-layout ably-server-$version:$version <registry>/ably-server:$version"
+"""
