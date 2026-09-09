@@ -3,3 +3,9 @@
 
 # Local task-tracking notes, not published
 /backlog/
+
+# Binaries built by `mise run build`
+/bin/
+
+# API key generated for the local Docker Compose cluster
+/.cluster/

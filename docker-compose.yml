@@ -5,9 +5,10 @@
 #   docker compose up --build
 #
 # Each node is reachable on its own host port (8081/8082/8083) and all
-# three share one key, so a client can attach to any of them. The
-# nodes auto-migrate the empty database on boot under a Postgres
-# advisory lock (TASK-23), so the stack needs no manual setup.
+# three share one key, so a client can attach to any of them. The `init`
+# service generates that key on first run and the nodes auto-migrate the
+# empty database on boot under a Postgres advisory lock, so the stack
+# needs no manual setup.
 
 name: ably-cluster
 
@@ -18,15 +19,23 @@ x-ably-node: &ably-node
   build:
     context: .
     dockerfile: Dockerfile
+    # The image fetches the private protocol module over SSH, so the build
+    # needs the host's agent forwarded (see the Dockerfile).
+    ssh:
+      - default
   image: ably-server:local
   restart: unless-stopped
   depends_on:
     postgres:
       condition: service_healthy
+    init:
+      condition: service_completed_successfully
   environment:
-    ABLY_SERVER_KEYS: app.key:secret
     ABLY_SERVER_POSTGRES_DSN: postgres://ably:ably@postgres:5432/ably?sslmode=disable
+  volumes:
+    - ./.cluster:/etc/ably:ro
   command:
+    - --config=/etc/ably/ably-server.toml
     - --mode=cluster
     - --listen=:8080
     - --log-level=info
@@ -37,6 +46,15 @@ x-ably-node: &ably-node
     retries: 15
 
 services:
+  # Generates the cluster's API key into .cluster on first run, before any
+  # node starts. See scripts/init-cluster-key.sh.
+  init:
+    image: alpine:3.20
+    volumes:
+      - ./.cluster:/etc/ably
+      - ./scripts/init-cluster-key.sh:/init-cluster-key.sh:ro
+    command: ["sh", "/init-cluster-key.sh"]
+
   postgres:
     image: postgres:16-alpine
     environment:

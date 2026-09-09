@@ -3,11 +3,12 @@
 [![CI](https://github.com/ably/ably-server/actions/workflows/ci.yml/badge.svg)](https://github.com/ably/ably-server/actions/workflows/ci.yml)
 
 A single-binary, [Ably](https://ably.com)-compatible server. Speaks Ably's
-realtime WebSocket protocol and the core REST pub/sub endpoints, so
-existing Ably client SDKs can connect with only a host/port override.
+realtime WebSocket protocol and the REST API, so existing Ably client
+SDKs can connect with only a host/port override.
 
-> Work in progress. This is an experimental implementation — interesting
-> to look at, not yet something to depend on. See [Status](#status) below.
+> **Experimental release.** Not generally available yet — the features
+> listed below work, and we're looking for feedback from people using
+> them before GA. See [Status](#status).
 
 ## Why this exists
 
@@ -38,36 +39,65 @@ Server processes are stateless: any node can serve any connection.
 There's no peer-to-peer membership or gossip — in `cluster` mode, the
 database is the coordination point.
 
-Surface area (subset of Ably's protocol — see [DESIGN.md](DESIGN.md) for
-the full spec):
+The client-visible protocol is served by
+[github.com/ably/server-protocol](https://github.com/ably/server-protocol),
+the same code Ably's own service runs, so what a client observes here is
+not a second implementation of it. What this server supplies underneath is
+the storage, the keys and the channel rules.
 
-- **WebSocket** at `GET /` — `ATTACH` / `DETACH` / `MESSAGE` with
-  `channelSerial`-based attachment continuity and `rewind`.
-- **REST** — `POST/GET /channels/{name}/messages`,
-  `GET /channels/{name}/presence[/history]`, `GET /time`,
-  `GET /healthz`, `GET /readyz`.
-- **Presence** — enter/update/leave, sync on attach, presence history.
-- **Mutable messages** — message update/delete/append with version history.
-- **Auth** — API key (Basic) or JWT (HS256) with Ably-style capabilities.
+Supported:
 
-Out of scope: push, integrations, multi-region, Spaces, Chat,
-LiveObjects, and the rest of the cloud-only product surface.
+- **Connections** over WebSocket, SSE and comet, so an SDK that falls back
+  from WebSocket still connects.
+- **Channels** — attach and detach, publish and subscribe, attachment
+  continuity by `channelSerial`, and `rewind`.
+- **Presence** — enter, update and leave, sync on attach, presence history.
+- **History** — persisted messages, paged, on attach and over REST.
+- **Mutable messages** — update, delete and append, with version history.
+- **Annotations** — annotations on a message, and the summaries folded
+  from them.
+- **LiveObjects** — objects created and mutated over a channel, and read
+  back over REST.
+- **Occupancy** — served over the realtime connection.
+- **Channel rules** — namespace settings, selected by name or by match
+  expression.
+- **Auth** — API key, Ably JWT and token requests, with Ably-style
+  capabilities.
+
+Not supported: push notifications, integrations, message queues, Spaces,
+Chat, LiveSync, the admin and account APIs, multi-region, statistics
+(`GET /stats` is a compatibility stub), token revocation, filtered
+subscriptions, and object garbage collection. See
+[DESIGN.md](DESIGN.md) for why each is left out, and for the full spec.
 
 ## Quickstart
 
-Requires Go 1.26+.
+Requires [mise](https://mise.jdx.dev/) and read access to
+[github.com/ably/server-protocol](https://github.com/ably/server-protocol)
+over SSH — the protocol module is in a private repository for now.
 
 ```sh
-# Pick any key in the Ably format: <appId>.<keyId>:<secret>
-export ABLY_SERVER_KEYS=app.key:secret
+mise run build-server
+```
 
-go run ./cmd/ably-server --listen :8080
+> Without mise, install Go 1.26+ yourself and set the environment from the
+> `[env]` section of [`mise.toml`](mise.toml) — it resolves the private
+> protocol module over SSH rather than the module proxy — then run
+> `go build -o bin/ably-server ./cmd/ably-server`.
+
+```sh
+# Generate a key in the Ably format: <appId>.<keyId>:<secret>
+export ABLY_API_KEY="app.key:$(openssl rand -base64 24)"
+echo "$ABLY_API_KEY"
+
+export ABLY_SERVER_KEYS="$ABLY_API_KEY"
+./bin/ably-server --listen :8080
 ```
 
 Publish via REST:
 
 ```sh
-curl -u "$ABLY_SERVER_KEYS" \
+curl -u "$ABLY_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"name":"greeting","data":"hello"}' \
   http://localhost:8080/channels/test/messages
@@ -77,7 +107,7 @@ Connect with an Ably SDK by pointing it at the local host:
 
 ```go
 client, _ := ably.NewRealtime(
-    ably.WithKey("app.key:secret"),
+    ably.WithKey(os.Getenv("ABLY_API_KEY")),
     ably.WithRealtimeHost("localhost"),
     ably.WithEnvironment(""),
     ably.WithPort(8080),
@@ -114,9 +144,10 @@ docker compose up --build
 ```
 
 The nodes auto-migrate the empty database on boot (under a Postgres
-advisory lock), so there's no manual setup. Each node is reachable on its
-own host port and all three share the key `app.key:secret`, so a
-client can attach to any of them:
+advisory lock), and a random API key is generated into `.cluster/` on
+first run, so there's no manual setup. Each node is reachable on its own
+host port and all three share that key, so a client can attach to any of
+them:
 
 | Node  | Endpoint              |
 |-------|-----------------------|
@@ -128,19 +159,25 @@ Publish to one node and read it back from another (the shared DB carries
 the message across):
 
 ```sh
-curl -u app.key:secret -H 'Content-Type: application/json' \
+export ABLY_API_KEY=$(cat .cluster/api-key)
+
+curl -u "$ABLY_API_KEY" -H 'Content-Type: application/json' \
   -d '{"name":"greeting","data":"hello"}' \
   http://localhost:8081/channels/test/messages
 
-curl -u app.key:secret http://localhost:8082/channels/test/history
+curl -u "$ABLY_API_KEY" http://localhost:8082/channels/test/history
 ```
+
+The key is stable across restarts; delete `.cluster/` to rotate it.
 
 ## Benchmarking
 
 `cmd/ably-bench` drives pub/sub load against a running server (a single
 node or the Compose cluster above), checks delivery correctness, measures
 end-to-end latency, and can search for the highest throughput that stays
-within a latency budget.
+within a latency budget. Against the Compose cluster, export its key
+first — `export ABLY_SERVER_KEYS=$(cat .cluster/api-key)` — or pass
+`--key`.
 
 ```sh
 # Fixed-rate run against the local cluster (default endpoints):
@@ -176,10 +213,11 @@ spawning one isolated, in-memory `ably-server` child per provisioned app:
 - `DELETE /apps/{appId}` tears that child down (idempotent).
 
 ```sh
-go build -o ably-server ./cmd/ably-server
-go build -o ably-local-sandbox ./cmd/ably-local-sandbox
+mise run build
 
-./ably-local-sandbox --listen :9080 --server-bin ./ably-server
+# The sandbox finds bin/ably-server beside itself, so it needs no
+# --server-bin.
+./bin/ably-local-sandbox --listen :9080
 ```
 
 Children are always booted with the stats stub enabled
@@ -193,14 +231,13 @@ it against local infrastructure instead of Ably's hosted sandbox.
 
 ## Status
 
-Some of [DESIGN.md](DESIGN.md) is implemented; some is still to come.
-The code is not feature-complete and the protocol coverage is
-partial. Treat it as a sketch you can run, not a product.
+The surface listed under [How it works](#how-it-works) is implemented, and
+checked against the ably-go, ably-js and AI Transport test suites (see
+[`compat/`](compat/README.md)). What that list marks as not supported is
+out of scope rather than pending — a deliberate boundary, not a roadmap.
 
-This is an experimental server whose protocol internals will
-progressively be replaced by code extracted from Ably's production
-realtime stack. Interfaces, wire coverage, and behaviour may change
-without notice, and there are no stability or support guarantees.
+There are not yet any stability or support guarantees, and interfaces and
+behaviour may change without notice.
 
 Feedback and bug reports are welcome via
 [GitHub Issues](https://github.com/ably/ably-server/issues); see

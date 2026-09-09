@@ -1,0 +1,53 @@
+# Mise configuration for ably-server
+# https://mise.jdx.dev/
+#
+# Quick start:
+#   mise install         # Install the Go toolchain
+#   mise run --list      # List available tasks
+#   mise run build       # Build both binaries into bin/
+#   mise run image       # Build the container image
+
+[tools]
+golang = "1.26.3"
+
+[settings]
+# Automatically install tools when entering the directory
+auto_install = true
+
+# The shared protocol module is in a private repository, so it is fetched over
+# SSH rather than from the proxy. Only that repository is named, so every other
+# module still comes from the proxy. Set for the directory rather than per task
+# because a plain `go build` or `go test` resolves modules too.
+[env]
+GOPRIVATE = "github.com/ably/server-protocol"
+GIT_CONFIG_COUNT = 1
+GIT_CONFIG_KEY_0 = "url.ssh://git@github.com/ably/server-protocol.insteadOf"
+GIT_CONFIG_VALUE_0 = "https://github.com/ably/server-protocol"
+
+# =============================================================================
+# Binaries
+# =============================================================================
+
+[tasks.build]
+description = "Build every binary into bin/"
+depends = ["build-server", "build-sandbox"]
+
+[tasks.build-server]
+description = "Build the ably-server binary into bin/"
+run = "go build -o bin/ably-server ./cmd/ably-server"
+
+[tasks.build-sandbox]
+description = "Build the ably-local-sandbox binary into bin/"
+run = "go build -o bin/ably-local-sandbox ./cmd/ably-local-sandbox"
+
+# =============================================================================
+# Container image
+# =============================================================================
+
+# --ssh forwards the host's SSH agent into the build, which is how it reaches
+# the private protocol module (see the Dockerfile). ably-server:local is the
+# tag docker-compose.yml expects, so building here means `docker compose up`
+# needs no --build.
+[tasks.image]
+description = "Build the ably-server image, tagged ably-server:local"
+run = "docker build --ssh default -t ably-server:local ."
