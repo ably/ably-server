@@ -6,8 +6,7 @@ A single-binary, [Ably](https://ably.com)-compatible server. Speaks Ably's
 realtime WebSocket protocol and the core REST pub/sub endpoints, so
 existing Ably client SDKs can connect with only a host/port override.
 
-> Work in progress. This is an experimental implementation — interesting
-> to look at, not yet something to depend on. See [Status](#status) below.
+This is work in progress; see [Status](#status) below.
 
 ## Why this exists
 
@@ -193,14 +192,12 @@ it against local infrastructure instead of Ably's hosted sandbox.
 
 ## Status
 
-Some of [DESIGN.md](DESIGN.md) is implemented; some is still to come.
+This is an preview of a project under active development.
 The code is not feature-complete and the protocol coverage is
-partial. Treat it as a sketch you can run, not a product.
+partial.Expect interfaces, feature coverage and conformance to 
+change as the project progresses towards a formal release.
 
-This is an experimental server whose protocol internals will
-progressively be replaced by code extracted from Ably's production
-realtime stack. Interfaces, wire coverage, and behaviour may change
-without notice, and there are no stability or support guarantees.
+See [DESIGN.md](DESIGN.md) for the target functionality and scope.
 
 Feedback and bug reports are welcome via
 [GitHub Issues](https://github.com/ably/ably-server/issues); see
