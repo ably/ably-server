@@ -1,5 +1,3 @@
-//go:build integration
-
 package postgres
 
 import (
@@ -12,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/ably/ably-server/internal/integration"
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/storage"
 	"github.com/ably/ably-server/internal/storage/postgres/pgtest"
@@ -23,6 +22,7 @@ import (
 // and asserts the appender still observes every cm — pre-gap, in-gap,
 // and post-gap — exactly once and in channelSerial order.
 func TestListenReconnectReconcilesGap(t *testing.T) {
+	integration.Require(t)
 	// Shrink the reconnect backoff so the test runs in ms, not seconds.
 	defer swapReconnectDelays(20*time.Millisecond, 100*time.Millisecond)()
 

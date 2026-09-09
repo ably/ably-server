@@ -1,5 +1,3 @@
-//go:build integration
-
 package integrationtest
 
 import (
@@ -12,6 +10,7 @@ import (
 
 	"github.com/ably/ably-go/ably"
 
+	"github.com/ably/ably-server/internal/integration"
 	"github.com/ably/ably-server/internal/storage/postgres/pgtest"
 )
 
@@ -99,11 +98,14 @@ func sameStrings(a, b []string) bool {
 	return true
 }
 
-// TestIntegrationClusterPresenceSyncAcrossNodes: a member entered on one
-// node is visible — via cross-node SYNC — to a client attaching on
-// another node, and once both have entered, both nodes report the same
-// set.
-func TestIntegrationClusterPresenceSyncAcrossNodes(t *testing.T) {
+// TestIntegrationClusterPresenceFanout covers both ways presence has to cross
+// nodes on a shared Postgres. A client attaching on one node learns by SYNC
+// the members entered on another, which only works if membership reaches the
+// shared table rather than staying node-local; and a subscriber already
+// attached sees enter, update and leave arrive live over the NOTIFY broker,
+// which is a different path from the read on attach.
+func TestIntegrationClusterPresenceFanout(t *testing.T) {
+	integration.Require(t)
 	pgc := pgtest.Start(t)
 	dsn := pgc.FreshSchemaDSN(t)
 	addrA := startServerOnDSN(t, dsn)
@@ -112,64 +114,50 @@ func TestIntegrationClusterPresenceSyncAcrossNodes(t *testing.T) {
 	ctx, cancel := testCtx(t)
 	defer cancel()
 
-	// alice enters on node A.
-	a := newClientWithID(t, addrA, "alice")
-	connect(t, a)
-	chA := a.Channels.Get("room")
-	if err := chA.Presence.Enter(ctx, "hi"); err != nil {
-		t.Fatalf("alice enter: %v", err)
-	}
-
-	// A client on node B sees alice via cross-node SYNC (AC #1).
-	b := newClientWithID(t, addrB, "bob")
-	connect(t, b)
-	chB := b.Channels.Get("room")
-	waitPresenceSet(t, ctx, chB, "alice")
-
-	// bob enters on node B; both nodes converge to {alice, bob} (AC #3).
-	if err := chB.Presence.Enter(ctx, "yo"); err != nil {
-		t.Fatalf("bob enter: %v", err)
-	}
-	waitPresenceSet(t, ctx, chA, "alice", "bob")
-	waitPresenceSet(t, ctx, chB, "alice", "bob")
-}
-
-// TestIntegrationClusterPresenceEventsAcrossNodes: enter/update/leave
-// published on one node are delivered, in order, to a presence
-// subscriber on another node via the NOTIFY broker.
-func TestIntegrationClusterPresenceEventsAcrossNodes(t *testing.T) {
-	pgc := pgtest.Start(t)
-	dsn := pgc.FreshSchemaDSN(t)
-	addrA := startServerOnDSN(t, dsn)
-	addrB := startServerOnDSN(t, dsn)
-
-	ctx, cancel := testCtx(t)
-	defer cancel()
-
-	// Subscriber on node B, attached before any presence activity so the
-	// channel is registered on B and its LISTEN delivery is live.
-	b := newClientWithID(t, addrB, "observer")
-	connect(t, b)
-	chB := b.Channels.Get("room")
-	if err := chB.Attach(ctx); err != nil {
-		t.Fatalf("B attach: %v", err)
+	// An observer attached on B before any presence activity, so the channel
+	// is registered there and its LISTEN delivery is live. Only alice's
+	// events are kept: bob enters below to show the set converging, and he is
+	// no part of the sequence being read.
+	observer := newClientWithID(t, addrB, "observer")
+	connect(t, observer)
+	chObserver := observer.Channels.Get("room")
+	if err := chObserver.Attach(ctx); err != nil {
+		t.Fatalf("observer attach: %v", err)
 	}
 	events := make(chan *ably.PresenceMessage, 8)
-	unsub, err := chB.Presence.SubscribeAll(ctx, func(m *ably.PresenceMessage) {
-		events <- m
+	unsub, err := chObserver.Presence.SubscribeAll(ctx, func(m *ably.PresenceMessage) {
+		if m.ClientID == "alice" {
+			events <- m
+		}
 	})
 	if err != nil {
-		t.Fatalf("B SubscribeAll: %v", err)
+		t.Fatalf("observer SubscribeAll: %v", err)
 	}
 	defer unsub()
 
-	// alice's lifecycle on node A.
+	// alice enters on node A.
 	a := newClientWithID(t, addrA, "alice")
 	connect(t, a)
 	chA := a.Channels.Get("room")
 	if err := chA.Presence.Enter(ctx, "1"); err != nil {
 		t.Fatalf("alice enter: %v", err)
 	}
+
+	// bob attaches on B afterwards, so he learns of alice by SYNC rather than
+	// by having watched her enter.
+	b := newClientWithID(t, addrB, "bob")
+	connect(t, b)
+	chB := b.Channels.Get("room")
+	waitPresenceSet(t, ctx, chB, "alice")
+
+	// Both nodes report the same set once bob has entered on B as well.
+	if err := chB.Presence.Enter(ctx, "yo"); err != nil {
+		t.Fatalf("bob enter: %v", err)
+	}
+	waitPresenceSet(t, ctx, chA, "alice", "bob")
+	waitPresenceSet(t, ctx, chB, "alice", "bob")
+
+	// The rest of alice's lifecycle on A reaches the observer on B, in order.
 	if err := chA.Presence.Update(ctx, "2"); err != nil {
 		t.Fatalf("alice update: %v", err)
 	}
@@ -177,15 +165,11 @@ func TestIntegrationClusterPresenceEventsAcrossNodes(t *testing.T) {
 		t.Fatalf("alice leave: %v", err)
 	}
 
-	// B observes enter, update, leave for alice, in order.
 	for i, want := range []ably.PresenceAction{
 		ably.PresenceActionEnter, ably.PresenceActionUpdate, ably.PresenceActionLeave,
 	} {
 		select {
 		case m := <-events:
-			if m.ClientID != "alice" {
-				t.Errorf("event %d clientId = %q, want alice", i, m.ClientID)
-			}
 			if m.Action != want {
 				t.Errorf("event %d action = %v, want %v", i, m.Action, want)
 			}

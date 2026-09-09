@@ -1,5 +1,3 @@
-//go:build integration
-
 package postgres_test
 
 import (
@@ -14,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ably/ably-server/internal/core"
+	"github.com/ably/ably-server/internal/integration"
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/serial"
 	"github.com/ably/ably-server/internal/storage"
@@ -25,6 +24,7 @@ import (
 )
 
 func TestPostgresChannelStoreContract(t *testing.T) {
+	integration.Require(t)
 	c := pgtest.Start(t)
 	storagetest.RunChannelStoreTests(t, func(t *testing.T) storage.Storage {
 		dsn := c.FreshSchemaDSN(t)
@@ -38,6 +38,7 @@ func TestPostgresChannelStoreContract(t *testing.T) {
 }
 
 func TestPostgresBootstrapIsIdempotent(t *testing.T) {
+	integration.Require(t)
 	c := pgtest.Start(t)
 	dsn := c.FreshSchemaDSN(t)
 
@@ -65,6 +66,7 @@ func TestPostgresBootstrapIsIdempotent(t *testing.T) {
 // one row per shipped migration (no duplicates from concurrent
 // inserts); the messages table is correctly created.
 func TestPostgresMigrateIsConcurrentSafe(t *testing.T) {
+	integration.Require(t)
 	c := pgtest.Start(t)
 	dsn := c.FreshSchemaDSN(t)
 	ctx := context.Background()
@@ -161,6 +163,7 @@ func shippedMigrations(t *testing.T) []string {
 // receipt arrives via the same NOTIFY path (no self-dedup) — that's
 // the unified flow.
 func TestPostgresClusterBrokerDeliversCrossNode(t *testing.T) {
+	integration.Require(t)
 	c := pgtest.Start(t)
 	dsn := c.FreshSchemaDSN(t)
 	ctx := context.Background()
@@ -231,6 +234,7 @@ func TestPostgresClusterBrokerDeliversCrossNode(t *testing.T) {
 // be disambiguated only by seriesId, which could produce serials that
 // lex-ordered out of commit order.
 func TestPostgresClusterSerialsAreStrictlyMonotonic(t *testing.T) {
+	integration.Require(t)
 	c := pgtest.Start(t)
 	dsn := c.FreshSchemaDSN(t)
 	ctx := context.Background()
@@ -325,6 +329,7 @@ func TestPostgresClusterSerialsAreStrictlyMonotonic(t *testing.T) {
 // ordering every time the node behind a publish changed — on a channel
 // nothing had happened to.
 func TestPostgresChannelSeriesIsTheChannelsNotTheNodes(t *testing.T) {
+	integration.Require(t)
 	c := pgtest.Start(t)
 	dsn := c.FreshSchemaDSN(t)
 	ctx := context.Background()
@@ -387,6 +392,7 @@ func TestPostgresChannelSeriesIsTheChannelsNotTheNodes(t *testing.T) {
 // message in the database rather than something a node has to have witnessed
 // the history to know — node2 reads it having only ever seen the NOTIFY.
 func TestPostgresClusterSummaryIsCrossNodeDeterministic(t *testing.T) {
+	integration.Require(t)
 	c := pgtest.Start(t)
 	dsn := c.FreshSchemaDSN(t)
 	ctx := context.Background()
@@ -545,6 +551,7 @@ func (a *recordingAppender) count() int {
 // read of local counts — and the node that did not write is told the aggregate
 // moved, without which nothing would ever prompt it to re-read.
 func TestPostgresClusterOccupancyAggregatesAcrossNodes(t *testing.T) {
+	integration.Require(t)
 	ctx := context.Background()
 	c := pgtest.Start(t)
 	dsn := c.FreshSchemaDSN(t)

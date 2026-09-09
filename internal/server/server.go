@@ -1,8 +1,8 @@
 // Package server assembles the ably-server process: flag/env/config
 // parsing, storage/realtime/REST wiring, HTTP routing, and graceful
 // shutdown. cmd/ably-server is a thin wrapper that calls Run; tests
-// (including the //go:build integration SDK suites in
-// internal/server/integrationtest) call Run directly so they can
+// (including the SDK suites in internal/server/integrationtest) call
+// Run directly so they can
 // discover ephemeral listener addresses via Opts.Ready/DebugReady
 // without shelling out to a built binary.
 package server

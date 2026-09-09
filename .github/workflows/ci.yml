@@ -2,21 +2,57 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, public-protocol-package]
   pull_request:
+
+permissions:
+  contents: read
+
+# One run per branch or PR; a new push supersedes the run it interrupts.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-test:
-    name: Build, vet, unit test
+    name: Build, vet, test
     runs-on: ubuntu-latest
+    # Above `go test`'s own 10m timeout, so a hung test panics with a
+    # goroutine dump rather than being killed with the job.
+    timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      # The shared protocol module is in a private repository, so the build
+      # fetches it over SSH, authenticated by a read-only deploy key. Git
+      # finds the key here without an agent. mise.toml's [env] supplies the
+      # GOPRIVATE and URL rewrite that send it this way.
+      - name: Authorise the private protocol module
+        env:
+          KEY: ${{ secrets.SERVER_PROTOCOL_DEPLOY_KEY }}
+        run: |
+          mkdir -p -m 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      # Pinned because mise-action's "latest" resolves from a version marker
+      # that can run ahead of the published release, and then 404s fetching
+      # a tarball that does not exist yet.
+      - name: Set up Go and the module environment
+        uses: jdx/mise-action@v4
         with:
-          go-version-file: go.mod
+          version: 2026.9.1
+
+      - name: Cache modules and build output
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-go-
 
       - name: go build
         run: go build ./...
@@ -24,24 +60,5 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      - name: go vet (integration build tag)
-        run: go vet -tags=integration ./...
-
-      - name: go test (race)
-        run: go test -race ./...
-
-  integration:
-    name: Integration tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: go test (integration, race)
+      - name: go test
         run: go test -tags=integration -race ./...

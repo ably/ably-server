@@ -1,5 +1,3 @@
-//go:build integration
-
 package postgres
 
 import (
@@ -8,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ably/ably-server/internal/integration"
 	"github.com/ably/ably-server/internal/protocol"
 	"github.com/ably/ably-server/internal/storage"
 	"github.com/ably/ably-server/internal/storage/postgres/pgtest"
@@ -20,6 +19,7 @@ import (
 // disappears from Members and a synthetic LEAVE reaches node B's
 // appender exactly once.
 func TestCrashedNodePresenceReaped(t *testing.T) {
+	integration.Require(t)
 	// Shrink the lease/bump/reaper cadences so the test runs in seconds.
 	defer swapPresenceTimings(1*time.Second, 200*time.Millisecond, 200*time.Millisecond)()
 
@@ -97,6 +97,7 @@ func TestCrashedNodePresenceReaped(t *testing.T) {
 // fixture member carries an 'infinity' lease and a sentinel owner, so
 // node B's reaper never removes it.
 func TestStaticFixturePresenceSurvivesReaper(t *testing.T) {
+	integration.Require(t)
 	defer swapPresenceTimings(1*time.Second, 200*time.Millisecond, 200*time.Millisecond)()
 
 	c := pgtest.Start(t)

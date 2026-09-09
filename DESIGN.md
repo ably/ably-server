@@ -2560,6 +2560,13 @@ runs under `go run`).
   cross-node publish and `channelSerial`-based replay on reconnect to a
   different node.
 
+The integration and cluster tests carry no build constraint, so an
+ordinary `go build` or `go vet` compiles them and a change that breaks one
+fails the build. The `integration` tag decides only whether they *run*:
+each integration test calls `internal/integration.Require`, which skips it
+unless the tag is set. The guard is per test, not per package, so a package
+may hold unit and integration tests side by side.
+
 There is no existing Ably protocol conformance suite to target; the
 ably-go integration tests are the de-facto external check on SDK
 compatibility.

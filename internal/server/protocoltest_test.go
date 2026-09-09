@@ -4,15 +4,21 @@ import (
 	"context"
 	"log/slog"
 	"net/http/httptest"
+	"path/filepath"
 	"runtime"
 	"testing"
 
 	"github.com/ably/ably-server/internal/auth"
 	"github.com/ably/ably-server/internal/config"
 	"github.com/ably/ably-server/internal/core"
+	"github.com/ably/ably-server/internal/integration"
 	"github.com/ably/ably-server/internal/logging"
 	"github.com/ably/ably-server/internal/rest"
+	"github.com/ably/ably-server/internal/storage"
+	"github.com/ably/ably-server/internal/storage/bbolt"
 	"github.com/ably/ably-server/internal/storage/memory"
+	"github.com/ably/ably-server/internal/storage/postgres"
+	"github.com/ably/ably-server/internal/storage/postgres/pgtest"
 
 	protocol "github.com/ably/server-protocol/go"
 	"github.com/ably/server-protocol/go/channel"
@@ -26,62 +32,111 @@ import (
 // TestProtocol runs the shared module's suite against this server: the module
 // states what it requires of a server embedding it, and this is where this
 // server is held to it.
+//
+// It runs once per storage backend the server can be configured with. What a
+// client observes is meant not to depend on where the server keeps its state,
+// so the suite is the same for all three and only the storage differs.
 func TestProtocol(t *testing.T) {
-	protocoltest.Run(t, newProtocolTarget)
+	for _, backend := range []struct {
+		name string
+		// integration marks a backend needing something outside the
+		// process, so the suite only runs against it when asked for.
+		integration bool
+		storage     func(t *testing.T) storage.Storage
+	}{
+		{
+			name:    "Memory",
+			storage: func(*testing.T) storage.Storage { return memory.New(memory.Options{}) },
+		},
+		{
+			name: "Bbolt",
+			storage: func(t *testing.T) storage.Storage {
+				s, err := bbolt.Open(bbolt.Options{Path: filepath.Join(t.TempDir(), "ably.db")})
+				if err != nil {
+					t.Fatalf("opening bbolt storage: %s", err)
+				}
+				t.Cleanup(func() { _ = s.Close() })
+				return s
+			},
+		},
+		{
+			name:        "Postgres",
+			integration: true,
+			storage: func(t *testing.T) storage.Storage {
+				dsn := pgtest.Start(t).FreshSchemaDSN(t)
+				s, err := postgres.Open(t.Context(), postgres.Options{DSN: dsn})
+				if err != nil {
+					t.Fatalf("opening postgres storage: %s", err)
+				}
+				t.Cleanup(func() { _ = s.Close() })
+				return s
+			},
+		},
+	} {
+		t.Run(backend.name, func(t *testing.T) {
+			if backend.integration {
+				integration.Require(t)
+			}
+			protocoltest.Run(t, newProtocolTarget(backend.storage))
+		})
+	}
 }
 
-// newProtocolTarget brings up a whole server for the app the suite asked for:
+// newProtocolTarget returns the suite's way of bringing up a whole server for
+// the app it asked for, keeping its state in the storage given:
 // this server serves one app, whose keys and namespaces it reads before it
 // starts, so an app is a server rather than something provisioned on one.
 //
 // Its storage is in memory and nothing else shares it, so each target is an
 // empty server with the suite's app on it.
-func newProtocolTarget(ctx context.Context, t *testing.T, spec protocoltest.AppSpec) protocoltest.Target {
-	t.Helper()
+func newProtocolTarget(newStorage func(t *testing.T) storage.Storage) protocoltest.NewTargetFunc {
+	return func(ctx context.Context, t *testing.T, spec protocoltest.AppSpec) protocoltest.Target {
+		t.Helper()
 
-	appID := "app" + random.String(8)
+		appID := "app" + random.String(8)
 
-	keys := make([]auth.APIKey, 0, len(spec.Keys))
-	names := make([]protocoltest.Key, 0, len(spec.Keys))
-	for i, keySpec := range spec.Keys {
-		name := appID + ".key" + random.String(8)
-		secret := "secret" + random.String(8)
+		keys := make([]auth.APIKey, 0, len(spec.Keys))
+		names := make([]protocoltest.Key, 0, len(spec.Keys))
+		for i, keySpec := range spec.Keys {
+			name := appID + ".key" + random.String(8)
+			secret := "secret" + random.String(8)
 
-		key, err := auth.ParseAPIKeyWithCapability(name+":"+secret, keySpec.Capability)
-		if err != nil {
-			t.Fatalf("parsing key #%d: %s", i, err)
+			key, err := auth.ParseAPIKeyWithCapability(name+":"+secret, keySpec.Capability)
+			if err != nil {
+				t.Fatalf("parsing key #%d: %s", i, err)
+			}
+			keys = append(keys, key)
+			names = append(names, protocoltest.Key{Name: name, Secret: secret})
 		}
-		keys = append(keys, key)
-		names = append(names, protocoltest.Key{Name: name, Secret: secret})
-	}
 
-	namespaces := make([]config.Namespace, 0, len(spec.Namespaces))
-	for _, ns := range spec.Namespaces {
-		namespaces = append(namespaces, config.Namespace{
-			ID:              ns.GetId(),
-			Persisted:       ns.GetPersisted(),
-			MutableMessages: ns.GetMutableMessages(),
-			PushEnabled:     ns.GetPushEnabled(),
-		})
-	}
+		namespaces := make([]config.Namespace, 0, len(spec.Namespaces))
+		for _, ns := range spec.Namespaces {
+			namespaces = append(namespaces, config.Namespace{
+				ID:              ns.GetId(),
+				Persisted:       ns.GetPersisted(),
+				MutableMessages: ns.GetMutableMessages(),
+				PushEnabled:     ns.GetPushEnabled(),
+			})
+		}
 
-	logger := logging.New(slog.DiscardHandler)
-	store := core.NewManager(memory.New(memory.Options{}))
+		logger := logging.New(slog.DiscardHandler)
+		store := core.NewManager(newStorage(t))
 
-	shared, err := newSharedProtocol(ctx, keys, config.File{Namespaces: namespaces}, store, nil, logger, sharedOptions{})
-	if err != nil {
-		t.Fatalf("wiring the shared protocol code: %s", err)
-	}
-	t.Cleanup(shared.Close)
+		shared, err := newSharedProtocol(ctx, keys, config.File{Namespaces: namespaces}, store, nil, logger, sharedOptions{})
+		if err != nil {
+			t.Fatalf("wiring the shared protocol code: %s", err)
+		}
+		t.Cleanup(shared.Close)
 
-	srv := httptest.NewServer(newMux(shared, rest.NewServer(keys, logger, nil), nil, false))
-	t.Cleanup(srv.Close)
+		srv := httptest.NewServer(newMux(shared, rest.NewServer(keys, logger, nil), nil, false))
+		t.Cleanup(srv.Close)
 
-	return &protocolTarget{
-		protocol: shared.Protocol,
-		url:      srv.URL,
-		app:      protocoltest.App{ID: appID},
-		keys:     names,
+		return &protocolTarget{
+			protocol: shared.Protocol,
+			url:      srv.URL,
+			app:      protocoltest.App{ID: appID},
+			keys:     names,
+		}
 	}
 }
 

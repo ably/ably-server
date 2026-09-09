@@ -1,5 +1,3 @@
-//go:build integration
-
 // Package integrationtest holds the SDK-driven integration suite: it
 // boots ably-server in-process (via internal/server.Run) and drives it
 // with the real ably-go realtime/REST client, exercising end-to-end
@@ -31,24 +29,12 @@ import (
 
 	"github.com/ably/ably-go/ably"
 
+	"github.com/ably/ably-server/internal/integration"
 	"github.com/ably/ably-server/internal/server"
 	"github.com/ably/ably-server/internal/storage/postgres/pgtest"
 )
 
 const integrationAPIKey = "app.key:secret"
-
-// startServer boots a single ably-server instance in cluster mode
-// against a fresh Postgres schema, on a free TCP port discovered via
-// the Ready hook in runOpts. It returns the bound "host:port" string;
-// the server is torn down on t.Cleanup.
-//
-// For multi-node tests use startServerOnDSN with a shared
-// FreshSchemaDSN so every node speaks to the same database state.
-func startServer(t *testing.T, extraArgs ...string) string {
-	t.Helper()
-	pgc := pgtest.Start(t)
-	return startServerOnDSN(t, pgc.FreshSchemaDSN(t), extraArgs...)
-}
 
 // editableChannelsConfig writes a config file declaring the named namespaces
 // with message editing allowed, and returns its path.
@@ -179,93 +165,15 @@ func postPublish(t *testing.T, addr, channel, jsonBody string) {
 	}
 }
 
-// TestIntegrationRESTPublishToWSSubscribe boots ably-server against a
-// real Postgres testcontainer, opens a WS subscription via the SDK,
-// publishes via REST, and asserts the WS subscriber receives the
-// message. Exercises the full end-to-end path:
-// REST → core.Channel.Publish → postgres.Store → NOTIFY → LISTEN
-// goroutine → Appender → core.Channel.Append → realtime attachment →
-// WS MESSAGE frame.
-func TestIntegrationRESTPublishToWSSubscribe(t *testing.T) {
-	addr := startServer(t)
-	client := newClient(t, addr)
-	connect(t, client)
-
-	ctx, cancel := testCtx(t)
-	defer cancel()
-
-	ch := client.Channels.Get("foo")
-	received := make(chan *ably.Message, 4)
-	unsub, err := ch.SubscribeAll(ctx, func(m *ably.Message) {
-		received <- m
-	})
-	if err != nil {
-		t.Fatalf("SubscribeAll: %v", err)
-	}
-	defer unsub()
-
-	postPublish(t, addr, "foo", `{"name":"greeting","data":"hello"}`)
-
-	select {
-	case m := <-received:
-		if m.Name != "greeting" {
-			t.Errorf("received Name = %q, want %q", m.Name, "greeting")
-		}
-		if got, ok := m.Data.(string); !ok || got != "hello" {
-			t.Errorf("received Data = %v, want %q", m.Data, "hello")
-		}
-	case <-ctx.Done():
-		t.Fatalf("subscriber did not receive REST publish before deadline (%v)", ctx.Err())
-	}
-}
-
-// TestIntegrationWSPublishSelfLoop publishes via the SDK and asserts
-// the same client receives its own message — proving the unified
-// delivery path goes through the LISTEN/NOTIFY round-trip even for
-// the publisher's own publishes.
-func TestIntegrationWSPublishSelfLoop(t *testing.T) {
-	addr := startServer(t)
-	client := newClient(t, addr)
-	connect(t, client)
-
-	ctx, cancel := testCtx(t)
-	defer cancel()
-
-	ch := client.Channels.Get("bar")
-	received := make(chan *ably.Message, 4)
-	unsub, err := ch.SubscribeAll(ctx, func(m *ably.Message) {
-		received <- m
-	})
-	if err != nil {
-		t.Fatalf("SubscribeAll: %v", err)
-	}
-	defer unsub()
-
-	if err := ch.Publish(ctx, "echo", "pong"); err != nil {
-		t.Fatalf("Publish (proves ACK): %v", err)
-	}
-
-	select {
-	case m := <-received:
-		if m.Name != "echo" {
-			t.Errorf("received Name = %q, want %q", m.Name, "echo")
-		}
-		if got, ok := m.Data.(string); !ok || got != "pong" {
-			t.Errorf("received Data = %v, want %q", m.Data, "pong")
-		}
-	case <-ctx.Done():
-		t.Fatalf("publisher did not receive its own publish via NOTIFY round-trip before deadline (%v)", ctx.Err())
-	}
-}
-
-// TestIntegrationClusterFullMesh boots three ably-server instances
+// TestIntegrationClusterMessageFanout boots three ably-server instances
 // against a single shared Postgres schema (i.e. a 3-node cluster),
 // attaches one ably-go SDK client to each, then publishes one message
-// via each WS in sequence. Every client must observe all three
+// from each node in sequence. Every client must observe all three
 // messages exactly once and in the same order — proving cross-node
 // fan-out via LISTEN/NOTIFY plus the commit-order consistency that
 // DESIGN.md §7.2 calls out.
-func TestIntegrationClusterFullMesh(t *testing.T) {
+func TestIntegrationClusterMessageFanout(t *testing.T) {
+	integration.Require(t)
 	const nodes = 3
 
 	pgc := pgtest.Start(t)
@@ -300,10 +208,20 @@ func TestIntegrationClusterFullMesh(t *testing.T) {
 	// publishes keep the timestamp prefix of each channelSerial
 	// monotonic across nodes, so the global commit order is the
 	// publish order — which is what we assert all clients see.
+	//
+	// The first goes over REST rather than its node's WebSocket. A REST
+	// publish reaches the other nodes by the same NOTIFY round trip as a
+	// realtime one (DESIGN.md §7.2), so this covers the route in with no
+	// publishing connection behind it.
 	wantOrder := make([]string, nodes)
 	for i := range nodes {
 		name := nameFor(i)
 		wantOrder[i] = name
+		if i == 0 {
+			postPublish(t, addrs[i], "mesh",
+				fmt.Sprintf(`{"name":%q,"data":%q}`, name, dataFor(i)))
+			continue
+		}
 		if err := clients[i].Channels.Get("mesh").Publish(ctx, name, dataFor(i)); err != nil {
 			t.Fatalf("node %d Publish: %v", i, err)
 		}
@@ -358,91 +276,5 @@ func TestIntegrationClusterFullMesh(t *testing.T) {
 	}
 }
 
-// TestIntegrationClusterRESTPublishObservedAcrossNodes boots two
-// servers on one shared schema; a WS subscriber on server B receives
-// a publish issued via the REST endpoint on server A. Proves the
-// cross-protocol cross-node path: REST → A's storage.Store → NOTIFY
-// → B's LISTEN goroutine → B's Appender → B's Channel → B's WS
-// attachment.
-func TestIntegrationClusterRESTPublishObservedAcrossNodes(t *testing.T) {
-	pgc := pgtest.Start(t)
-	dsn := pgc.FreshSchemaDSN(t)
-
-	addrA := startServerOnDSN(t, dsn)
-	addrB := startServerOnDSN(t, dsn)
-
-	ctx, cancel := testCtx(t)
-	defer cancel()
-
-	clientB := newClient(t, addrB)
-	connect(t, clientB)
-	chB := clientB.Channels.Get("cross")
-	received := make(chan *ably.Message, 4)
-	unsub, err := chB.SubscribeAll(ctx, func(m *ably.Message) {
-		received <- m
-	})
-	if err != nil {
-		t.Fatalf("client B SubscribeAll: %v", err)
-	}
-	defer unsub()
-
-	postPublish(t, addrA, "cross", `{"name":"x","data":"hi"}`)
-
-	select {
-	case m := <-received:
-		if m.Name != "x" {
-			t.Errorf("Name = %q, want %q", m.Name, "x")
-		}
-		if got, ok := m.Data.(string); !ok || got != "hi" {
-			t.Errorf("Data = %v, want %q", m.Data, "hi")
-		}
-	case <-ctx.Done():
-		t.Fatalf("client B did not observe REST publish to server A before deadline (%v)", ctx.Err())
-	}
-}
-
 func nameFor(i int) string { return "from-" + strconv.Itoa(i) }
 func dataFor(i int) string { return "payload-" + strconv.Itoa(i) }
-
-// TestIntegrationBatchPublishSDK publishes a multi-message batch via the
-// SDK's PublishMultiple. A single frame is acked with count=1; reporting
-// the inner-message count would over-ack and panic ably-go's pending
-// emitter. All messages must round-trip to a subscriber.
-func TestIntegrationBatchPublishSDK(t *testing.T) {
-	addr := startServer(t)
-	client := newClient(t, addr)
-	connect(t, client)
-
-	ctx, cancel := testCtx(t)
-	defer cancel()
-
-	ch := client.Channels.Get("batch")
-	received := make(chan *ably.Message, 8)
-	unsub, err := ch.SubscribeAll(ctx, func(m *ably.Message) { received <- m })
-	if err != nil {
-		t.Fatalf("SubscribeAll: %v", err)
-	}
-	defer unsub()
-
-	// Must not error or panic the SDK connection goroutine.
-	if err := ch.PublishMultiple(ctx, []*ably.Message{
-		{Name: "a", Data: "1"}, {Name: "b", Data: "2"}, {Name: "c", Data: "3"},
-	}); err != nil {
-		t.Fatalf("PublishMultiple: %v", err)
-	}
-
-	got := map[string]bool{}
-	for range 3 {
-		select {
-		case m := <-received:
-			got[m.Name] = true
-		case <-ctx.Done():
-			t.Fatalf("only received %d/3 batch messages: %v", len(got), got)
-		}
-	}
-	for _, n := range []string{"a", "b", "c"} {
-		if !got[n] {
-			t.Errorf("missing batch message %q (got %v)", n, got)
-		}
-	}
-}

@@ -1,9 +1,7 @@
-//go:build integration
-
 // Package pgtest is the shared testcontainer harness for tests that
-// need a real PostgreSQL. It is intentionally build-tagged
-// `integration` so its heavy testcontainers-go dependency only lands
-// in test binaries that opt in via `go test -tags=integration`.
+// need a real PostgreSQL. It carries no build constraint, so the tests
+// using it compile in every build; whether they run is decided at run
+// time by internal/integration.Enabled (DESIGN.md §18).
 //
 // Typical use:
 //
